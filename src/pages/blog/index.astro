@@ -1,0 +1,133 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+
+const posts = (await getCollection('blog', ({ data }) => !data.draft)).sort(
+  (a, b) => b.data.date.valueOf() - a.data.date.valueOf(),
+);
+
+const tags = [...new Set(posts.flatMap((p) => p.data.tags))].sort();
+const fmt = (d: Date) =>
+  d.toLocaleDateString('zh-CN', { year: 'numeric', month: 'short', day: 'numeric' });
+---
+
+<BaseLayout title="博客" description="文章与笔记">
+  <h1 data-reveal>博客</h1>
+
+  {
+    tags.length > 0 && (
+      <div class="filters" data-reveal>
+        <button class="tag active" data-tag="">
+          全部
+        </button>
+        {tags.map((t) => (
+          <button class="tag" data-tag={t}>
+            {t}
+          </button>
+        ))}
+      </div>
+    )
+  }
+
+  <ul class="list">
+    {
+      posts.map((post) => (
+        <li data-reveal data-tags={post.data.tags.join(',')}>
+          <a href={`/blog/${post.id}`} class="card">
+            <time datetime={post.data.date.toISOString()}>{fmt(post.data.date)}</time>
+            <h2>{post.data.title}</h2>
+            {post.data.description && <p>{post.data.description}</p>}
+          </a>
+        </li>
+      ))
+    }
+  </ul>
+
+  {posts.length === 0 && <p class="empty">还没有文章。</p>}
+</BaseLayout>
+
+<script>
+  // 标签筛选：纯前端，无需重新构建
+  function setupFilter() {
+    const buttons = document.querySelectorAll<HTMLButtonElement>('.filters .tag');
+    const items = document.querySelectorAll<HTMLLIElement>('.list li');
+    if (!buttons.length) return;
+
+    buttons.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const tag = btn.dataset.tag ?? '';
+        buttons.forEach((b) => b.classList.toggle('active', b === btn));
+        items.forEach((li) => {
+          const tags = (li.dataset.tags ?? '').split(',').filter(Boolean);
+          li.hidden = tag !== '' && !tags.includes(tag);
+        });
+      });
+    });
+
+    // 支持 /blog?tag=xxx 直接进入某个标签
+    const wanted = new URLSearchParams(location.search).get('tag');
+    if (wanted) {
+      document
+        .querySelector<HTMLButtonElement>(`.filters .tag[data-tag="${CSS.escape(wanted)}"]`)
+        ?.click();
+    }
+  }
+
+  setupFilter();
+  document.addEventListener('astro:page-load', setupFilter);
+</script>
+
+<style>
+  .filters {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin: 1.8rem 0 2.5rem;
+  }
+  .tag {
+    padding: 0.25rem 0.75rem;
+    border: 1px solid var(--rule);
+    border-radius: 999px;
+    background: transparent;
+    font: inherit;
+    font-size: 0.83rem;
+    color: var(--ink-muted);
+    cursor: pointer;
+    transition: all 0.22s var(--ease);
+  }
+  .tag:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .tag.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--bg);
+  }
+
+  .list {
+    display: grid;
+    gap: 1rem;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    max-width: var(--measure);
+  }
+  .list time {
+    font-size: 0.8rem;
+    color: var(--ink-faint);
+    letter-spacing: 0.02em;
+  }
+  .list h2 {
+    margin: 0.35rem 0 0;
+    font-size: 1.16rem;
+  }
+  .list p {
+    margin: 0.45rem 0 0;
+    font-size: 0.92rem;
+    color: var(--ink-muted);
+  }
+  .empty {
+    color: var(--ink-faint);
+  }
+</style>

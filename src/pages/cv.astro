@@ -1,0 +1,138 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+
+// CV 内容集中在这里，改数据即可，不用动排版。
+const cv = {
+  name: '姓名',
+  email: 'you@example.com',
+  pdf: '/media/cv.pdf',
+  sections: [
+    {
+      title: '教育经历',
+      items: [
+        { when: '2024 – 至今', what: '博士研究生，某某专业', where: '某某大学', note: '导师：某某教授' },
+        { when: '2020 – 2024', what: '工学学士，某某专业', where: '某某大学', note: '' },
+      ],
+    },
+    {
+      title: '研究方向',
+      items: [
+        { when: '', what: '无人机自主导航与状态估计', where: '', note: '视觉惯性里程计、流形上的滤波' },
+        { when: '', what: '受限算力下的实时规划', where: '', note: '机载轨迹重规划与避障' },
+      ],
+    },
+    {
+      title: '经历',
+      items: [{ when: '2025 夏', what: '研究实习生', where: '某某实验室', note: '' }],
+    },
+    {
+      title: '奖励',
+      items: [{ when: '2025', what: '某某奖学金', where: '', note: '' }],
+    },
+  ],
+};
+---
+
+<BaseLayout title="CV" description={`${cv.name} 的简历`}>
+  <header class="cv-head" data-reveal>
+    <h1>CV</h1>
+    <div class="actions">
+      <a href={cv.pdf} class="pdf-link">下载 PDF ↓</a>
+      <a href={`mailto:${cv.email}`}>{cv.email}</a>
+    </div>
+  </header>
+
+  {
+    cv.sections.map((section) => (
+      <section class="cv-section" data-reveal>
+        <h2>{section.title}</h2>
+        <ul>
+          {section.items.map((item) => (
+            <li>
+              <span class="when">{item.when}</span>
+              <div class="what">
+                <p class="line1">
+                  {item.what}
+                  {item.where && <span class="where">，{item.where}</span>}
+                </p>
+                {item.note && <p class="note">{item.note}</p>}
+              </div>
+            </li>
+          ))}
+        </ul>
+      </section>
+    ))
+  }
+</BaseLayout>
+
+<style>
+  .cv-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 1rem;
+    padding-bottom: 1.2rem;
+    border-bottom: 1px solid var(--rule);
+  }
+  .cv-head h1 {
+    margin: 0;
+  }
+  .actions {
+    display: flex;
+    gap: 1.3rem;
+    font-size: 0.9rem;
+  }
+  .pdf-link {
+    font-weight: 600;
+  }
+
+  .cv-section {
+    margin-top: 2.8rem;
+    max-width: var(--measure);
+  }
+  .cv-section h2 {
+    margin: 0 0 1.1rem;
+    font-family: var(--font-sans);
+    font-size: 0.82rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    color: var(--ink-faint);
+  }
+  .cv-section ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: grid;
+    gap: 1.2rem;
+  }
+  .cv-section li {
+    display: grid;
+    grid-template-columns: 8rem 1fr;
+    gap: 1rem;
+  }
+  .when {
+    font-size: 0.85rem;
+    color: var(--ink-faint);
+    font-variant-numeric: tabular-nums;
+  }
+  .line1 {
+    margin: 0;
+    font-size: 1rem;
+  }
+  .where {
+    color: var(--ink-muted);
+  }
+  .note {
+    margin: 0.2rem 0 0;
+    font-size: 0.88rem;
+    color: var(--ink-faint);
+  }
+
+  @media (max-width: 560px) {
+    .cv-section li {
+      grid-template-columns: 1fr;
+      gap: 0.2rem;
+    }
+  }
+</style>

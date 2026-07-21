@@ -1,0 +1,71 @@
+---
+interface Props {
+  title: string;
+  /** 默认展开 */
+  open?: boolean;
+}
+
+const { title, open = false } = Astro.props;
+---
+
+{/* 用原生 <details>：零 JS，可被浏览器内搜索命中，键盘可访问 */}
+<details class="collapsible" open={open}>
+  <summary>
+    <svg class="chev" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+      <path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"></path>
+    </svg>
+    <span>{title}</span>
+  </summary>
+  <div class="collapsible-body">
+    <slot />
+  </div>
+</details>
+
+<style>
+  .collapsible {
+    margin: 1.5rem 0;
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+    background: var(--bg-raised);
+    overflow: hidden;
+  }
+  summary {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.75rem 1.1rem;
+    cursor: pointer;
+    font-size: 0.93rem;
+    font-weight: 600;
+    color: var(--ink-muted);
+    list-style: none;
+    transition: color 0.2s var(--ease), background-color 0.2s var(--ease);
+  }
+  summary::-webkit-details-marker { display: none; }
+  summary:hover {
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 5%, transparent);
+  }
+  .chev {
+    flex: none;
+    transition: transform 0.28s var(--ease);
+  }
+  .collapsible[open] .chev {
+    transform: rotate(90deg);
+  }
+  .collapsible-body {
+    padding: 0.2rem 1.1rem 1.1rem;
+    font-size: 0.97rem;
+  }
+  .collapsible-body > :global(*:first-child) { margin-top: 0; }
+  .collapsible-body > :global(*:last-child) { margin-bottom: 0; }
+
+  /* 展开时内容淡入（层 1 微交互） */
+  .collapsible[open] .collapsible-body {
+    animation: unfold 0.32s var(--ease);
+  }
+  @keyframes unfold {
+    from { opacity: 0; transform: translateY(-6px); }
+    to { opacity: 1; transform: none; }
+  }
+</style>

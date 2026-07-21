@@ -1,0 +1,93 @@
+---
+import { getCollection, render } from 'astro:content';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import * as MDX from '../../components/mdx';
+import Annotatable from '../../components/Annotatable.astro';
+
+const logs = (await getCollection('logs')).sort(
+  (a, b) => b.data.date.valueOf() - a.data.date.valueOf(),
+);
+
+// 日志条目短，直接在时间线上全文渲染，不做详情页
+const rendered = await Promise.all(
+  logs.map(async (log) => ({ log, Content: (await render(log)).Content })),
+);
+
+const fmt = (d: Date) =>
+  d.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' });
+---
+
+<BaseLayout title="日志" description="研究日志">
+  <h1 data-reveal>日志</h1>
+  <p class="intro" data-reveal>记录在做什么、卡在哪、想通了什么。</p>
+
+  <ol class="timeline">
+    {
+      rendered.map(({ log, Content }) => (
+        <li data-reveal>
+          <div class="marker" aria-hidden="true" />
+          <time datetime={log.data.date.toISOString()}>{fmt(log.data.date)}</time>
+          <h2>{log.data.title}</h2>
+          <Annotatable docId={`logs/${log.id}`} class="log-body">
+            <Content components={MDX} />
+          </Annotatable>
+        </li>
+      ))
+    }
+  </ol>
+
+  {logs.length === 0 && <p class="empty">还没有日志。</p>}
+</BaseLayout>
+
+<style>
+  .intro {
+    margin: 0.5rem 0 2.5rem;
+    color: var(--ink-muted);
+  }
+  .timeline {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    max-width: var(--measure);
+    border-left: 1.5px solid var(--rule);
+  }
+  .timeline li {
+    position: relative;
+    padding: 0 0 2.5rem 1.7rem;
+  }
+  .marker {
+    position: absolute;
+    left: -5.5px;
+    top: 0.55rem;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--bg);
+    border: 2px solid var(--indigo-soft);
+    transition: background-color 0.25s var(--ease), border-color 0.25s var(--ease),
+      transform 0.25s var(--ease);
+  }
+  .timeline li:hover .marker {
+    background: var(--accent);
+    border-color: var(--accent);
+    transform: scale(1.25);
+  }
+  .timeline time {
+    font-size: 0.79rem;
+    color: var(--ink-faint);
+    letter-spacing: 0.03em;
+  }
+  .timeline h2 {
+    margin: 0.25rem 0 0.5rem;
+    font-size: 1.06rem;
+  }
+  /* .log-body 是 Annotatable 的根元素；用后代 :global 给它加样式，限定在 timeline 内不外泄。
+     首尾 margin 重置已由 Annotatable 统一处理，这里不再重复。 */
+  .timeline :global(.log-body) {
+    font-size: 0.94rem;
+    color: var(--ink-muted);
+  }
+  .empty {
+    color: var(--ink-faint);
+  }
+</style>

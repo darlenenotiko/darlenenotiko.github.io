@@ -1,0 +1,78 @@
+---
+interface Props {
+  /** 定理名，如「最优性」 */
+  name?: string;
+  /** 类型，决定标签文字和配色 */
+  type?: 'theorem' | 'lemma' | 'definition' | 'proposition' | 'corollary';
+}
+
+const { name, type = 'theorem' } = Astro.props;
+
+const LABEL = {
+  theorem: '定理',
+  lemma: '引理',
+  definition: '定义',
+  proposition: '命题',
+  corollary: '推论',
+} as const;
+---
+
+<div class="knot" data-type={type}>
+  <div class="knot-head">
+    <span class="knot-label">{LABEL[type]}</span>
+    {name && <span class="knot-name">{name}</span>}
+  </div>
+  <div class="knot-body">
+    <slot />
+  </div>
+</div>
+
+<style>
+  /* Loom 的「织结」定理框：左侧一条经线，顶部标签压在边框上 */
+  .knot {
+    position: relative;
+    margin: 1.8rem 0;
+    padding: 1.1rem 1.3rem 1.1rem 1.5rem;
+    background: color-mix(in srgb, var(--accent) 4%, var(--bg-raised));
+    border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--rule));
+    border-left: 3px solid var(--accent);
+    border-radius: 0 10px 10px 0;
+  }
+  .knot[data-type='definition'] {
+    --accent: var(--weld);
+  }
+  .knot[data-type='lemma'],
+  .knot[data-type='corollary'] {
+    --accent: var(--indigo-soft);
+  }
+  .knot[data-type='proposition'] {
+    --accent: var(--madder);
+  }
+
+  .knot-head {
+    display: flex;
+    align-items: baseline;
+    gap: 0.55rem;
+    margin-bottom: 0.5rem;
+  }
+  .knot-label {
+    font-family: var(--font-serif);
+    font-size: 0.82rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    color: var(--accent);
+    text-transform: uppercase;
+  }
+  .knot-name {
+    font-family: var(--font-serif);
+    font-style: italic;
+    font-size: 0.95rem;
+    color: var(--ink-muted);
+  }
+  .knot-body > :global(*:first-child) {
+    margin-top: 0;
+  }
+  .knot-body > :global(*:last-child) {
+    margin-bottom: 0;
+  }
+</style>

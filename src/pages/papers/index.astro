@@ -1,0 +1,189 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+
+const papers = (await getCollection('papers')).sort((a, b) => b.data.year - a.data.year);
+
+// 按年份倒序分组
+const byYear = new Map<number, typeof papers>();
+for (const p of papers) {
+  const list = byYear.get(p.data.year) ?? [];
+  list.push(p);
+  byYear.set(p.data.year, list);
+}
+const years = [...byYear.keys()].sort((a, b) => b - a);
+
+const TYPE_LABEL: Record<string, string> = {
+  conference: '会议',
+  journal: '期刊',
+  preprint: '预印本',
+  workshop: 'Workshop',
+  thesis: '学位论文',
+};
+---
+
+<BaseLayout title="论文" description="发表的论文与成果">
+  <h1 data-reveal>论文</h1>
+
+  {
+    years.map((year) => (
+      <section class="year-block" data-reveal>
+        <h2 class="year">{year}</h2>
+        <ul>
+          {byYear.get(year)!.map((p) => (
+            <li class="paper">
+              <div class="title-row">
+                <h3>{p.data.title}</h3>
+                {p.data.award && <span class="award">{p.data.award}</span>}
+              </div>
+              <p class="authors">{p.data.authors.join(', ')}</p>
+              <p class="venue">
+                <span class="type">{TYPE_LABEL[p.data.type] ?? p.data.type}</span>
+                {p.data.venue}
+              </p>
+              <div class="links">
+                {p.data.pdf && <a href={p.data.pdf}>PDF</a>}
+                {p.data.code && <a href={p.data.code}>代码</a>}
+                {p.data.page && <a href={p.data.page}>项目主页</a>}
+                {p.data.video && <a href={p.data.video}>视频</a>}
+                {p.data.bibtex && (
+                  <button class="bib-btn" data-bibtex={p.data.bibtex}>
+                    BibTeX
+                  </button>
+                )}
+              </div>
+            </li>
+          ))}
+        </ul>
+      </section>
+    ))
+  }
+
+  {papers.length === 0 && <p class="empty">还没有论文条目。</p>}
+</BaseLayout>
+
+<script>
+  // BibTeX 一键复制
+  function setupBibtex() {
+    document.querySelectorAll<HTMLButtonElement>('.bib-btn').forEach((btn) => {
+      if (btn.dataset.bound) return;
+      btn.dataset.bound = 'true';
+      btn.addEventListener('click', async () => {
+        const text = btn.dataset.bibtex ?? '';
+        try {
+          await navigator.clipboard.writeText(text);
+          const original = btn.textContent;
+          btn.textContent = '已复制 ✓';
+          btn.classList.add('copied');
+          setTimeout(() => {
+            btn.textContent = original;
+            btn.classList.remove('copied');
+          }, 1600);
+        } catch {
+          // 剪贴板不可用（非 HTTPS 等）时退回到手动选择
+          window.prompt('复制 BibTeX：', text);
+        }
+      });
+    });
+  }
+
+  setupBibtex();
+  document.addEventListener('astro:page-load', setupBibtex);
+</script>
+
+<style>
+  .year-block {
+    margin-top: 3rem;
+  }
+  .year {
+    margin: 0 0 1.2rem;
+    font-size: 0.85rem;
+    font-family: var(--font-sans);
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    color: var(--ink-faint);
+  }
+  .year-block ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: grid;
+    gap: 2rem;
+  }
+  .paper {
+    max-width: var(--measure);
+    padding-left: 1.1rem;
+    border-left: 2px solid var(--rule);
+    transition: border-color 0.25s var(--ease);
+  }
+  .paper:hover {
+    border-left-color: var(--accent);
+  }
+  .title-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+  }
+  .paper h3 {
+    margin: 0;
+    font-size: 1.06rem;
+    line-height: 1.45;
+  }
+  .award {
+    padding: 0.05rem 0.5rem;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--weld) 20%, transparent);
+    color: color-mix(in srgb, var(--weld) 70%, var(--ink));
+    font-size: 0.73rem;
+    font-weight: 650;
+  }
+  .authors {
+    margin: 0.35rem 0 0;
+    font-size: 0.9rem;
+    color: var(--ink-muted);
+  }
+  .venue {
+    margin: 0.2rem 0 0;
+    font-size: 0.88rem;
+    color: var(--ink-faint);
+    font-style: italic;
+  }
+  .type {
+    display: inline-block;
+    margin-right: 0.5rem;
+    padding: 0.02rem 0.45rem;
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    font-size: 0.72rem;
+    font-style: normal;
+    letter-spacing: 0.03em;
+  }
+  .links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.9rem;
+    margin-top: 0.6rem;
+    font-size: 0.85rem;
+  }
+  .bib-btn {
+    padding: 0;
+    border: none;
+    background: none;
+    font: inherit;
+    font-size: 0.85rem;
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline;
+    text-decoration-color: color-mix(in srgb, var(--accent) 35%, transparent);
+    text-underline-offset: 3px;
+    transition: color 0.2s var(--ease);
+  }
+  .bib-btn:hover,
+  .bib-btn.copied {
+    color: var(--accent-hover);
+  }
+  .empty {
+    color: var(--ink-faint);
+  }
+</style>

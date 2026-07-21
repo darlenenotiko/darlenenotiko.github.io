@@ -1,0 +1,144 @@
+---
+import { getCollection, render } from 'astro:content';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import * as MDX from '../../components/mdx';
+import Annotatable from '../../components/Annotatable.astro';
+
+export async function getStaticPaths() {
+  const posts = await getCollection('blog', ({ data }) => !data.draft);
+  return posts.map((post) => ({ params: { slug: post.id }, props: { post } }));
+}
+
+const { post } = Astro.props;
+const { Content, headings } = await render(post);
+
+const fmt = (d: Date) =>
+  d.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' });
+---
+
+<BaseLayout title={post.data.title} description={post.data.description}>
+  <article class="prose">
+    <header class="post-head">
+      <h1>{post.data.title}</h1>
+      <div class="meta">
+        <time datetime={post.data.date.toISOString()}>{fmt(post.data.date)}</time>
+        {
+          post.data.tags.length > 0 && (
+            <span class="tags">
+              {post.data.tags.map((t) => (
+                <a href={`/blog?tag=${encodeURIComponent(t)}`} class="tag">
+                  {t}
+                </a>
+              ))}
+            </span>
+          )
+        }
+      </div>
+    </header>
+
+    {
+      headings.filter((h) => h.depth <= 3).length > 2 && (
+        <nav class="toc" data-reveal>
+          <span class="toc-title">目录</span>
+          <ul>
+            {headings
+              .filter((h) => h.depth <= 3)
+              .map((h) => (
+                <li data-depth={h.depth}>
+                  <a href={`#${h.slug}`}>{h.text}</a>
+                </li>
+              ))}
+          </ul>
+        </nav>
+      )
+    }
+
+    {/* 组件在这里注入 —— MDX 文件内直接写 <Theorem> 即可，无需 import */}
+    <Annotatable docId={`blog/${post.id}`}>
+      <Content components={MDX} />
+    </Annotatable>
+  </article>
+
+  <a href="/blog" class="back">← 回到博客</a>
+</BaseLayout>
+
+<style>
+  .post-head {
+    margin-bottom: 2.5rem;
+    padding-bottom: 1.5rem;
+    border-bottom: 1px solid var(--rule);
+  }
+  .post-head h1 {
+    margin: 0 0 0.7rem;
+  }
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.9rem;
+    font-size: 0.87rem;
+    color: var(--ink-faint);
+  }
+  .tags {
+    display: flex;
+    gap: 0.45rem;
+  }
+  .tag {
+    padding: 0.1rem 0.55rem;
+    border: 1px solid var(--rule);
+    border-radius: 999px;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    text-decoration: none;
+    transition: border-color 0.2s var(--ease), color 0.2s var(--ease);
+  }
+  .tag:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+
+  .toc {
+    margin: 0 0 2.5rem;
+    padding: 1rem 1.2rem;
+    background: var(--bg-sunken);
+    border-radius: 10px;
+    font-size: 0.9rem;
+  }
+  .toc-title {
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--ink-faint);
+    text-transform: uppercase;
+  }
+  .toc ul {
+    margin: 0.6rem 0 0;
+    padding: 0;
+    list-style: none;
+  }
+  .toc li {
+    padding: 0.16rem 0;
+  }
+  .toc li[data-depth='3'] {
+    padding-left: 1.1rem;
+    font-size: 0.86rem;
+  }
+  .toc a {
+    color: var(--ink-muted);
+    text-decoration: none;
+  }
+  .toc a:hover {
+    color: var(--accent);
+  }
+
+  .back {
+    display: inline-block;
+    margin-top: 3.5rem;
+    font-size: 0.9rem;
+    color: var(--ink-muted);
+    text-decoration: none;
+  }
+  .back:hover {
+    color: var(--accent);
+  }
+</style>

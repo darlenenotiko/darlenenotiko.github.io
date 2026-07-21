@@ -1,0 +1,25 @@
+{
+  "name": "personal_website",
+  "type": "module",
+  "version": "0.0.1",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "astro": "astro",
+    "verify": "node scripts/check-boundary.mjs",
+    "test:anchor": "esbuild scripts/test-anchor.ts --bundle --platform=node --format=esm --external:happy-dom | node --input-type=module"
+  },
+  "dependencies": {
+    "@astrojs/mdx": "^7.0.3",
+    "@astrojs/rss": "^4.0.19",
+    "approx-string-match": "^2.0.0",
+    "astro": "^7.1.1"
+  },
+  "devDependencies": {
+    "happy-dom": "^20.11.0"
+  }
+}

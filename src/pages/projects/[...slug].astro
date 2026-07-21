@@ -1,0 +1,64 @@
+---
+import { getCollection, render } from 'astro:content';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import * as MDX from '../../components/mdx';
+import Annotatable from '../../components/Annotatable.astro';
+
+export async function getStaticPaths() {
+  const projects = await getCollection('projects', ({ data }) => !data.draft);
+  return projects.map((p) => ({ params: { slug: p.id }, props: { project: p } }));
+}
+
+const { project } = Astro.props;
+const { Content } = await render(project);
+---
+
+<BaseLayout title={project.data.title} description={project.data.description}>
+  <article class="prose">
+    <header class="head">
+      <h1>{project.data.title}</h1>
+      <p class="lede">{project.data.description}</p>
+      <div class="links">
+        {project.data.code && <a href={project.data.code}>代码</a>}
+        {project.data.demo && <a href={project.data.demo}>在线演示</a>}
+      </div>
+    </header>
+    <Annotatable docId={`projects/${project.id}`}>
+      <Content components={MDX} />
+    </Annotatable>
+  </article>
+
+  <a href="/projects" class="back">← 回到项目</a>
+</BaseLayout>
+
+<style>
+  .head {
+    margin-bottom: 2.5rem;
+    padding-bottom: 1.5rem;
+    border-bottom: 1px solid var(--rule);
+  }
+  .head h1 {
+    margin: 0 0 0.6rem;
+  }
+  .lede {
+    margin: 0;
+    font-size: 1.05rem;
+    color: var(--ink-muted);
+  }
+  .links {
+    display: flex;
+    gap: 1rem;
+    margin-top: 0.9rem;
+    font-size: 0.9rem;
+  }
+  .back {
+    display: inline-block;
+    margin-top: 3.5rem;
+    font-size: 0.9rem;
+    color: var(--ink-muted);
+    text-decoration: none;
+  }
+  .back:hover {
+    color: var(--accent);
+  }
+</style>

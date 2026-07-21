@@ -1,0 +1,27 @@
+---
+// 批注系统的统一容器。
+// 三个渲染页（blog / projects / logs）都用它包裹 <Content>，
+// 好让批注客户端有一个稳定的选择器 [data-annotate-root] 限定可批注区域。
+// docId 用「集合/条目id」，与 private/annotations.json 里的 doc 字段对应。
+interface Props {
+  /** 集合/条目 id，如 blog/kalman-geometry */
+  docId: string;
+  /** 透传给根元素的额外 class，保留各页自己的排版差异 */
+  class?: string;
+}
+const { docId, class: className } = Astro.props;
+---
+
+<div class:list={['mdx-body', className]} data-annotate-root data-doc-id={docId}>
+  <slot />
+</div>
+
+<style>
+  /* 所有 MDX 正文容器统一的首尾外边距重置 */
+  .mdx-body > :global(*:first-child) {
+    margin-top: 0;
+  }
+  .mdx-body > :global(*:last-child) {
+    margin-bottom: 0;
+  }
+</style>

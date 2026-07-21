@@ -1,0 +1,59 @@
+---
+interface Props {
+  type?: 'note' | 'tip' | 'warning' | 'insight';
+  title?: string;
+}
+
+const { type = 'note', title } = Astro.props;
+
+const META = {
+  note: { label: '注', icon: 'M12 8h.01M11 12h1v4h1' },
+  tip: { label: '技巧', icon: 'M9 18h6M10 22h4M12 2a7 7 0 00-4 12.7V17h8v-2.3A7 7 0 0012 2z' },
+  warning: { label: '注意', icon: 'M12 9v4m0 4h.01M10.3 3.9L1.8 18a2 2 0 001.7 3h17a2 2 0 001.7-3L14.7 3.9a2 2 0 00-3.4 0z' },
+  insight: { label: '洞察', icon: 'M12 3v2m0 14v2M3 12h2m14 0h2M5.6 5.6l1.4 1.4m10 10l1.4 1.4m0-12.8l-1.4 1.4m-10 10l-1.4 1.4' },
+} as const;
+
+const { label, icon } = META[type];
+---
+
+<aside class="callout" data-type={type}>
+  <div class="callout-head">
+    <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+      <path d={icon} fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
+    </svg>
+    <span>{title ?? label}</span>
+  </div>
+  <div class="callout-body">
+    <slot />
+  </div>
+</aside>
+
+<style>
+  .callout {
+    --tone: var(--indigo);
+    margin: 1.6rem 0;
+    padding: 1rem 1.2rem;
+    background: color-mix(in srgb, var(--tone) 6%, var(--bg-raised));
+    border: 1px solid color-mix(in srgb, var(--tone) 25%, transparent);
+    border-radius: 10px;
+  }
+  .callout[data-type='tip'] { --tone: #3f7a5a; }
+  .callout[data-type='warning'] { --tone: var(--madder); }
+  .callout[data-type='insight'] { --tone: var(--weld); }
+
+  .callout-head {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    margin-bottom: 0.45rem;
+    font-size: 0.84rem;
+    font-weight: 650;
+    letter-spacing: 0.02em;
+    color: var(--tone);
+  }
+  .callout-body {
+    font-size: 0.97rem;
+  }
+  .callout-body > :global(*:first-child) { margin-top: 0; }
+  .callout-body > :global(*:last-child) { margin-bottom: 0; }
+</style>

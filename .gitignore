@@ -1,0 +1,38 @@
+# ─────────────────────────────────────────────────────────────
+# 隐私边界 —— 不要删除这一段
+#
+# _inbox/   原始素材（草稿、截图、录音转录、未公开的 PDF）
+# private/  待办、日程、私人笔记
+#
+# 这两个目录永远不进版本库，也永远不是构建输入。
+# 发布是显式动作：确认后把内容移进 src/content/，而不是自动扫描。
+# ─────────────────────────────────────────────────────────────
+_inbox/*
+!_inbox/README.md
+private/*
+!private/README.md
+
+# build output
+dist/
+# generated types
+.astro/
+
+# dependencies
+node_modules/
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+
+# environment variables
+.env
+.env.production
+
+# macOS-specific files
+.DS_Store
+
+# jetbrains setting folder
+.idea/
