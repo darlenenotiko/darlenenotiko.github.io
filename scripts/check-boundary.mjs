@@ -8,7 +8,7 @@
  *
  * 每次发布前跑一次：npm run verify
  */
-import { execFileSync } from 'node:child_process';
+import { execSync } from 'node:child_process';
 import { mkdirSync, writeFileSync, rmSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -33,7 +33,8 @@ try {
   }
 
   console.log('→ 构建中…');
-  execFileSync('npx', ['astro', 'build'], { stdio: 'inherit' });
+  // 用 execSync（走 shell）而非 execFileSync('npx')：后者在 Windows 上找不到 npx.cmd
+  execSync('npx astro build', { stdio: 'inherit' });
 
   const leaked = walk('dist').filter((f) => {
     try {
