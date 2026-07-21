@@ -282,27 +282,16 @@ pre:hover .code-bar,
   .code-bar { opacity: 1; }
 }
 
-/* ── 数学公式（KaTeX）与中文混排 ────────────────────────────── */
-/* KaTeX 默认把公式放大到 1.21em，在拉丁正文里合适，但和中文宋体混排会显得
-   过大、撑鼓行高。缩到与正文等大，行内公式才和中文协调。 */
-.katex {
-  font-size: 1em;
+/* ── 数学公式（Temml / MathML）与中文混排 ──────────────────── */
+/* 行内公式与中文之间留一点气口（中文排版的「盘古之白」） */
+:where(p, li, td, dd) math {
+  margin: 0 0.12em;
 }
-/* 行内公式与中文之间留一点气口（中文排版的「盘古之白」），
-   缓解数学符号紧贴汉字造成的拥挤。独立公式不受影响。 */
-:where(p, li, td, dd) .katex {
-  margin: 0 0.14em;
-}
-/* 独立公式稍大一点更稳重，并允许长公式独立横向滚动而非撑破页面 */
-.katex-display {
+/* 独立公式：上下留白，长公式独立横向滚动而非撑破页面 */
+math[display='block'] {
   margin: 1.4em 0;
-  padding: 0.15em 0;
   overflow-x: auto;
   overflow-y: hidden;
-}
-.katex-display > .katex {
-  margin: 0;
-  font-size: 1.15em;
 }
 
 hr {
