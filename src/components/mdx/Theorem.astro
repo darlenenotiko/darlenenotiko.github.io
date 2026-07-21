@@ -3,7 +3,7 @@ interface Props {
   /** 定理名，如「最优性」 */
   name?: string;
   /** 类型，决定标签文字和配色 */
-  type?: 'theorem' | 'lemma' | 'definition' | 'proposition' | 'corollary';
+  type?: 'theorem' | 'lemma' | 'definition' | 'proposition' | 'corollary' | 'example';
 }
 
 const { name, type = 'theorem' } = Astro.props;
@@ -14,13 +14,15 @@ const LABEL = {
   definition: '定义',
   proposition: '命题',
   corollary: '推论',
+  example: '例',
 } as const;
 ---
 
 <div class="knot" data-type={type}>
+  <span class="knot-tile" aria-hidden="true"></span>
   <div class="knot-head">
     <span class="knot-label">{LABEL[type]}</span>
-    {name && <span class="knot-name">{name}</span>}
+    {name && <span class="knot-name">（{name}）</span>}
   </div>
   <div class="knot-body">
     <slot />
@@ -28,40 +30,52 @@ const LABEL = {
 </div>
 
 <style>
-  /* Loom 的「织结」定理框：左侧一条经线，顶部标签压在边框上 */
+  /* Loom 的「织结」：一条经线绑住左缘，一枚织结方块挂在左上角外侧，压在 rail 上。
+     直角、无外框、亚麻染底 —— 结构靠颜色和那枚方块，而不是边框。 */
   .knot {
+    --accent: var(--indigo); /* 定理 / 引理 / 命题 / 推论 */
     position: relative;
-    margin: 1.8rem 0;
-    padding: 1.1rem 1.3rem 1.1rem 1.5rem;
-    background: color-mix(in srgb, var(--accent) 4%, var(--bg-raised));
-    border: 1px solid color-mix(in srgb, var(--accent) 22%, var(--rule));
-    border-left: 3px solid var(--accent);
-    border-radius: 0 10px 10px 0;
+    margin: 1.9rem 0;
+    padding: 1rem 1.3rem 1rem 1.5rem;
+    background: color-mix(in srgb, var(--accent) 6%, var(--linen));
+    border-left: 2.2px solid var(--accent);
   }
   .knot[data-type='definition'] {
+    --accent: var(--madder);
+  }
+  .knot[data-type='example'] {
     --accent: var(--weld);
   }
-  .knot[data-type='lemma'],
-  .knot[data-type='corollary'] {
-    --accent: var(--indigo-soft);
-  }
-  .knot[data-type='proposition'] {
-    --accent: var(--madder);
+
+  /* 挂在左上角外的织结方块（2×2 双色平纹） */
+  .knot-tile {
+    position: absolute;
+    left: -7px;
+    top: -7px;
+    width: 13px;
+    height: 13px;
+    --tile: var(--accent);
+    background: conic-gradient(
+      var(--tile) 0 25%,
+      color-mix(in srgb, var(--tile) 28%, var(--linen)) 25% 50%,
+      var(--tile) 50% 75%,
+      color-mix(in srgb, var(--tile) 28%, var(--linen)) 75%
+    );
   }
 
   .knot-head {
     display: flex;
     align-items: baseline;
-    gap: 0.55rem;
-    margin-bottom: 0.5rem;
+    gap: 0.4rem;
+    margin-bottom: 0.45rem;
   }
   .knot-label {
-    font-family: var(--font-serif);
-    font-size: 0.82rem;
+    font-family: var(--font-sans);
+    font-size: 0.8rem;
     font-weight: 700;
-    letter-spacing: 0.06em;
-    color: var(--accent);
+    letter-spacing: 0.08em;
     text-transform: uppercase;
+    color: var(--accent);
   }
   .knot-name {
     font-family: var(--font-serif);

@@ -29,26 +29,29 @@ const { label, icon } = META[type];
 </aside>
 
 <style>
+  /* strand 风：一条经线绑左缘 + 亚麻染底，直角。不用四周边框。 */
   .callout {
     --tone: var(--indigo);
     margin: 1.6rem 0;
-    padding: 1rem 1.2rem;
-    background: color-mix(in srgb, var(--tone) 6%, var(--bg-raised));
-    border: 1px solid color-mix(in srgb, var(--tone) 25%, transparent);
-    border-radius: 10px;
+    padding: 0.85rem 1.2rem;
+    background: color-mix(in srgb, var(--tone) 6%, var(--linen));
+    border-left: 2px solid var(--tone);
   }
-  .callout[data-type='tip'] { --tone: #3f7a5a; }
+  /* tip 的「蓝草绿」= 靛蓝×黄檗调出的植物绿，仍属草木染系 */
+  .callout[data-type='tip'] { --tone: #5e7a52; }
   .callout[data-type='warning'] { --tone: var(--madder); }
   .callout[data-type='insight'] { --tone: var(--weld); }
 
   .callout-head {
     display: flex;
     align-items: center;
-    gap: 0.45rem;
-    margin-bottom: 0.45rem;
-    font-size: 0.84rem;
-    font-weight: 650;
-    letter-spacing: 0.02em;
+    gap: 0.4rem;
+    margin-bottom: 0.4rem;
+    font-family: var(--font-sans);
+    font-size: 0.76rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
     color: var(--tone);
   }
   .callout-body {
