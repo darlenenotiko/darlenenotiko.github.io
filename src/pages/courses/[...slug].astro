@@ -1,0 +1,220 @@
+---
+import { getCollection, render } from 'astro:content';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import * as MDX from '../../components/mdx';
+import Annotatable from '../../components/Annotatable.astro';
+
+export async function getStaticPaths() {
+  const notes = await getCollection('courses', ({ data }) => !data.draft);
+  // 同一门课内按讲次排序，好算上一讲 / 下一讲
+  const sorted = [...notes].sort((a, b) =>
+    a.data.course === b.data.course
+      ? a.data.lecture - b.data.lecture
+      : a.data.course.localeCompare(b.data.course),
+  );
+  return sorted.map((note, i) => {
+    const prev = sorted[i - 1]?.data.course === note.data.course ? sorted[i - 1] : undefined;
+    const next = sorted[i + 1]?.data.course === note.data.course ? sorted[i + 1] : undefined;
+    return {
+      params: { slug: note.id },
+      props: {
+        note,
+        prev: prev && { id: prev.id, title: prev.data.title, lecture: prev.data.lecture },
+        next: next && { id: next.id, title: next.data.title, lecture: next.data.lecture },
+      },
+    };
+  });
+}
+
+const { note, prev, next } = Astro.props;
+const { Content, headings } = await render(note);
+
+const fmt = (d: Date) =>
+  d.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' });
+---
+
+<BaseLayout title={note.data.title} description={note.data.description}>
+  <article class="prose">
+    <header class="post-head">
+      <a href="/courses" class="course-name">{note.data.courseTitle}</a>
+      <h1>第 {note.data.lecture} 讲 · {note.data.title}</h1>
+      <div class="meta">
+        {note.data.speaker && <span>主讲 {note.data.speaker}</span>}
+        <time datetime={note.data.date.toISOString()}>{fmt(note.data.date)}</time>
+        {
+          note.data.tags.length > 0 && (
+            <span class="tags">
+              {note.data.tags.map((t) => (
+                <span class="tag">{t}</span>
+              ))}
+            </span>
+          )
+        }
+      </div>
+    </header>
+
+    {
+      headings.filter((h) => h.depth <= 3).length > 2 && (
+        <nav class="toc" data-reveal>
+          <span class="toc-title">目录</span>
+          <ul>
+            {headings
+              .filter((h) => h.depth <= 3)
+              .map((h) => (
+                <li data-depth={h.depth}>
+                  <a href={`#${h.slug}`}>{h.text}</a>
+                </li>
+              ))}
+          </ul>
+        </nav>
+      )
+    }
+
+    {/* 组件在这里注入 —— MDX 文件内直接写 <Theorem> / <BpeTrainer> 即可，无需 import */}
+    <Annotatable docId={`courses/${note.id}`}>
+      <Content components={MDX} />
+    </Annotatable>
+
+    {
+      note.data.slides && (
+        <p class="source">讲义据课件与课堂录音字幕整理，原始课件：{note.data.slides}</p>
+      )
+    }
+  </article>
+
+  <nav class="pager">
+    {
+      prev ? (
+        <a href={`/courses/${prev.id}`} class="pager-link prev">
+          <span>← 上一讲</span>
+          <strong>
+            第 {prev.lecture} 讲 · {prev.title}
+          </strong>
+        </a>
+      ) : (
+        <span />
+      )
+    }
+    {
+      next && (
+        <a href={`/courses/${next.id}`} class="pager-link next">
+          <span>下一讲 →</span>
+          <strong>
+            第 {next.lecture} 讲 · {next.title}
+          </strong>
+        </a>
+      )
+    }
+  </nav>
+</BaseLayout>
+
+<style>
+  .post-head {
+    margin-bottom: 2.5rem;
+    padding-bottom: 1.5rem;
+    border-bottom: 1px solid var(--rule);
+  }
+  .course-name {
+    font-size: 0.83rem;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+    text-decoration: none;
+  }
+  .course-name:hover {
+    color: var(--accent);
+  }
+  .post-head h1 {
+    margin: 0.5rem 0 0.7rem;
+  }
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.9rem;
+    font-size: 0.87rem;
+    color: var(--ink-faint);
+  }
+  .tags {
+    display: flex;
+    gap: 0.45rem;
+  }
+  .tag {
+    padding: 0.1rem 0.55rem;
+    border: 1px solid var(--rule);
+    border-radius: 999px;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+  }
+
+  .toc {
+    margin: 0 0 2.5rem;
+    padding: 1rem 1.2rem;
+    background: var(--bg-sunken);
+    border-radius: 10px;
+    font-size: 0.9rem;
+  }
+  .toc-title {
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--ink-faint);
+    text-transform: uppercase;
+  }
+  .toc ul {
+    margin: 0.6rem 0 0;
+    padding: 0;
+    list-style: none;
+  }
+  .toc li {
+    padding: 0.16rem 0;
+  }
+  .toc li[data-depth='3'] {
+    padding-left: 1.1rem;
+    font-size: 0.86rem;
+  }
+  .toc a {
+    color: var(--ink-muted);
+    text-decoration: none;
+  }
+  .toc a:hover {
+    color: var(--accent);
+  }
+
+  .source {
+    margin-top: 3rem;
+    padding-top: 1.2rem;
+    border-top: 1px solid var(--rule);
+    font-size: 0.83rem;
+    color: var(--ink-faint);
+  }
+
+  .pager {
+    display: flex;
+    justify-content: space-between;
+    gap: 1.5rem;
+    margin-top: 3rem;
+  }
+  .pager-link {
+    display: block;
+    max-width: 46%;
+    text-decoration: none;
+    font-size: 0.88rem;
+  }
+  .pager-link.next {
+    text-align: right;
+    margin-left: auto;
+  }
+  .pager-link span {
+    color: var(--ink-faint);
+  }
+  .pager-link strong {
+    display: block;
+    margin-top: 0.3rem;
+    font-weight: 400;
+    color: var(--ink-muted);
+    transition: color 0.2s var(--ease);
+  }
+  .pager-link:hover strong {
+    color: var(--accent);
+  }
+</style>

@@ -9,8 +9,9 @@ export async function GET(context: APIContext) {
 
   const blog = await getCollection('blog', ({ data }) => !data.draft);
   const projects = await getCollection('projects', ({ data }) => !data.draft);
+  const courses = await getCollection('courses', ({ data }) => !data.draft);
 
-  const staticPages = ['/', '/papers/', '/blog/', '/projects/', '/logs/', '/cv/'];
+  const staticPages = ['/', '/papers/', '/blog/', '/courses/', '/projects/', '/logs/', '/cv/'];
 
   const entries: { loc: string; lastmod?: string }[] = [
     ...staticPages.map((p) => ({ loc: url(p) })),
@@ -21,6 +22,10 @@ export async function GET(context: APIContext) {
     ...projects.map((p) => ({
       loc: url(`/projects/${p.id}/`),
       lastmod: p.data.date.toISOString(),
+    })),
+    ...courses.map((c) => ({
+      loc: url(`/courses/${c.id}/`),
+      lastmod: c.data.date.toISOString(),
     })),
   ];
 

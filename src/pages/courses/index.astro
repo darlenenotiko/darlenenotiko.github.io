@@ -1,0 +1,97 @@
+---
+import { getCollection } from 'astro:content';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+
+const notes = await getCollection('courses', ({ data }) => !data.draft);
+
+// 按课程分组，组内按讲次升序。分组顺序按各课最新一讲的日期倒序。
+const byCourse = new Map<string, typeof notes>();
+for (const n of notes) {
+  const list = byCourse.get(n.data.course) ?? [];
+  list.push(n);
+  byCourse.set(n.data.course, list);
+}
+const groups = [...byCourse.values()]
+  .map((list) => list.sort((a, b) => a.data.lecture - b.data.lecture))
+  .sort((a, b) => {
+    const last = (g: typeof notes) => Math.max(...g.map((n) => n.data.date.valueOf()));
+    return last(b) - last(a);
+  });
+---
+
+<BaseLayout title="课程" description="课程讲义">
+  <h1 data-reveal>课程</h1>
+  <p class="lede" data-reveal>逐讲整理的中文讲义，配可交互的演示。</p>
+
+  {
+    groups.map((lectures) => (
+      <section class="course" data-reveal>
+        <h2>{lectures[0].data.courseTitle}</h2>
+        <ol class="list">
+          {lectures.map((n) => (
+            <li>
+              <a href={`/courses/${n.id}`} class="card">
+                <span class="num">第 {n.data.lecture} 讲</span>
+                <h3>{n.data.title}</h3>
+                {n.data.description && <p>{n.data.description}</p>}
+              </a>
+            </li>
+          ))}
+        </ol>
+      </section>
+    ))
+  }
+
+  {groups.length === 0 && <p class="empty">还没有讲义。</p>}
+</BaseLayout>
+
+<style>
+  .lede {
+    max-width: var(--measure);
+    color: var(--ink-muted);
+    margin-bottom: 2.6rem;
+  }
+  .course {
+    margin-bottom: 3rem;
+    max-width: var(--measure);
+  }
+  .course h2 {
+    margin: 0 0 1.2rem;
+    padding-bottom: 0.6rem;
+    border-bottom: 1px solid var(--rule);
+    font-size: 1.24rem;
+  }
+  .list {
+    display: grid;
+    gap: 0.9rem;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+  .card {
+    display: block;
+    text-decoration: none;
+    color: inherit;
+  }
+  .num {
+    font-size: 0.78rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .card h3 {
+    margin: 0.3rem 0 0;
+    font-size: 1.08rem;
+    transition: color 0.2s var(--ease);
+  }
+  .card:hover h3 {
+    color: var(--accent);
+  }
+  .card p {
+    margin: 0.4rem 0 0;
+    font-size: 0.9rem;
+    color: var(--ink-muted);
+  }
+  .empty {
+    color: var(--ink-faint);
+  }
+</style>

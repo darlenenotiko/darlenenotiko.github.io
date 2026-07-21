@@ -5,3 +5,8 @@ export { default as Theorem } from './Theorem.astro';
 export { default as Callout } from './Callout.astro';
 export { default as Figure } from './Figure.astro';
 export { default as Collapsible } from './Collapsible.astro';
+
+// 交互演示（src/components/demo/）。只有真正用到的页面才会打包它们的脚本。
+export { default as Utf8Explorer } from '../demo/Utf8Explorer.astro';
+export { default as TokenizerLab } from '../demo/TokenizerLab.astro';
+export { default as BpeTrainer } from '../demo/BpeTrainer.astro';

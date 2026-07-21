@@ -1,0 +1,504 @@
+---
+// BPE 单步演示。左边「训练」：在一小段语料上一次合并一次地跑 BPE，
+// 每步显示相邻对的频次表、选中哪一对、合并后序列如何变短。
+// 右边「编码」：拿训练学到的合并表，按学到的顺序一条条套到一句新文本上。
+interface Props {
+  /** 训练语料 */
+  corpus?: string;
+  /** 编码时用的新句子 */
+  sample?: string;
+}
+const { corpus = 'the cat in the hat', sample = 'the quick brown fox' } = Astro.props;
+---
+
+<div class="demo" data-demo="bpe">
+  <div class="tabs">
+    <button data-tab="train" class="on">训练</button>
+    <button data-tab="encode">用它来编码</button>
+  </div>
+
+  <!-- ── 训练 ─────────────────────────────────────────── -->
+  <section data-panel="train">
+    <label class="lab">
+      训练语料
+      <input type="text" data-corpus value={corpus} spellcheck="false" />
+    </label>
+
+    <div class="ctrl">
+      <button data-step>下一次合并 →</button>
+      <button data-auto>自动跑到底</button>
+      <button data-reset class="ghost">重置</button>
+      <span class="tally" data-tally></span>
+    </div>
+
+    <div class="block">
+      <h4>当前序列</h4>
+      <div class="toks" data-seq></div>
+    </div>
+
+    <div class="two">
+      <div class="block">
+        <h4>相邻对出现次数（下一步合并次数最多的那一对）</h4>
+        <table data-counts><tbody></tbody></table>
+      </div>
+      <div class="block">
+        <h4>已学到的合并表</h4>
+        <ol class="merges" data-merges></ol>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── 编码 ─────────────────────────────────────────── -->
+  <section data-panel="encode" hidden>
+    <label class="lab">
+      要编码的新文本
+      <input type="text" data-sample value={sample} spellcheck="false" />
+    </label>
+
+    <div class="ctrl">
+      <button data-enc-step>套用下一条合并 →</button>
+      <button data-enc-all>全部套完</button>
+      <button data-enc-reset class="ghost">回到字节</button>
+      <span class="tally" data-enc-tally></span>
+    </div>
+
+    <div class="block">
+      <h4>当前序列</h4>
+      <div class="toks" data-enc-seq></div>
+    </div>
+    <p class="hint" data-enc-hint></p>
+  </section>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+
+  .tabs {
+    display: flex;
+    gap: 0.4rem;
+    margin-bottom: 1rem;
+    border-bottom: 1px solid var(--rule);
+  }
+  .tabs button {
+    padding: 0.4rem 0.85rem;
+    font: inherit;
+    font-size: 0.87rem;
+    color: var(--ink-muted);
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    margin-bottom: -1px;
+  }
+  .tabs button.on {
+    color: var(--indigo);
+    border-bottom-color: var(--indigo);
+  }
+
+  .lab {
+    display: block;
+    font-size: 0.78rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .lab input {
+    display: block;
+    width: 100%;
+    margin-top: 0.4rem;
+    padding: 0.45rem 0.6rem;
+    font: inherit;
+    font-size: 0.95rem;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .lab input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.9rem 0 0.2rem;
+  }
+  .ctrl button {
+    padding: 0.32rem 0.75rem;
+    font: inherit;
+    font-size: 0.83rem;
+    color: var(--bg);
+    background: var(--indigo);
+    border: 1px solid var(--indigo);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: opacity 0.2s var(--ease);
+  }
+  .ctrl button:hover {
+    opacity: 0.85;
+  }
+  .ctrl button:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+  .ctrl button.ghost {
+    color: var(--ink-muted);
+    background: transparent;
+    border-color: var(--rule);
+  }
+  .tally {
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .block {
+    margin-top: 1rem;
+  }
+  .block h4 {
+    margin: 0 0 0.45rem;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+  .two {
+    display: grid;
+    gap: 1rem;
+  }
+  @media (min-width: 640px) {
+    .two {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+
+  .toks {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+    padding: 0.5rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    min-height: 2.4rem;
+  }
+  .toks :global(.tok) {
+    padding: 2px 5px;
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    line-height: 1.7;
+    border-radius: 3px;
+    /* pre-wrap 而不是 pre：合并出来的 token 可以很长，用 pre 会撑出横向滚动条 */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-width: 100%;
+    background: color-mix(in srgb, var(--indigo) 13%, transparent);
+    transition: background 0.25s var(--ease);
+  }
+  .toks :global(.tok.hit) {
+    background: color-mix(in srgb, var(--madder) 32%, transparent);
+  }
+  .toks :global(.tok.fresh) {
+    background: color-mix(in srgb, var(--weld) 42%, transparent);
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+  }
+  table :global(td) {
+    padding: 0.22rem 0.4rem;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-muted);
+  }
+  table :global(tr.top td) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+  table :global(td.pair) {
+    font-family: var(--font-mono);
+    overflow-wrap: anywhere;
+  }
+  table :global(td.n) {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .merges {
+    margin: 0;
+    padding-left: 1.3rem;
+    font-size: 0.82rem;
+    color: var(--ink-muted);
+  }
+  .merges :global(li) {
+    padding: 0.12rem 0;
+  }
+  .merges :global(li) {
+    overflow-wrap: anywhere;
+  }
+  .merges :global(code) {
+    font-family: var(--font-mono);
+    color: var(--indigo);
+  }
+  .empty {
+    font-size: 0.82rem;
+    color: var(--ink-faint);
+  }
+  .hint {
+    margin: 0.7rem 0 0;
+    font-size: 0.82rem;
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupBpe() {
+    document.querySelectorAll<HTMLElement>('[data-demo="bpe"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const enc = new TextEncoder();
+      const dec = new TextDecoder('utf-8', { fatal: false });
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+
+      // 一个 token 的字节串怎么显示出来。合并出来的 token 可能横跨字符边界，
+      // 解码结果里会带 �（表示这里含着半个字符）—— 只要还解出了别的字符就照常显示；
+      // 整段都解不出来（比如单个字节）才退回十六进制。
+      const show = (bytes: number[]) => {
+        const s = dec.decode(new Uint8Array(bytes));
+        if (!s.includes('�')) return s.replace(/ /g, '␣');
+        const hasReadable = [...s].some((ch) => ch !== '�');
+        return hasReadable
+          ? s.replace(/ /g, '␣')
+          : bytes.map((b) => '<' + b.toString(16).padStart(2, '0') + '>').join('');
+      };
+
+      type Merge = { a: number; b: number; nid: number; text: string; count: number };
+
+      // ── 状态 ──
+      let ids: number[] = [];
+      let vocab = new Map<number, number[]>();
+      let merges: Merge[] = [];
+      let lastNew = -1; // 上一步新造出来的 token 编号，用来高亮
+      let timer: number | undefined;
+
+      let encIds: number[] = [];
+      let encApplied = 0;
+
+      function reset() {
+        clearInterval(timer);
+        timer = undefined;
+        vocab = new Map();
+        for (let i = 0; i < 256; i++) vocab.set(i, [i]);
+        ids = Array.from(enc.encode($<HTMLInputElement>('[data-corpus]').value));
+        merges = [];
+        lastNew = -1;
+        resetEncode();
+        draw();
+      }
+
+      function countPairs(seq: number[]) {
+        const m = new Map<string, number>();
+        for (let i = 0; i + 1 < seq.length; i++) {
+          const k = seq[i] + ',' + seq[i + 1];
+          m.set(k, (m.get(k) ?? 0) + 1);
+        }
+        return [...m.entries()]
+          .map(([k, n]) => {
+            const [a, b] = k.split(',').map(Number);
+            return { a, b, n };
+          })
+          .sort((x, y) => y.n - x.n);
+      }
+
+      function step(): boolean {
+        const pairs = countPairs(ids);
+        // 全都只出现一次就停：再合并学不到任何「常见组合」
+        if (!pairs.length || pairs[0].n < 2) return false;
+        const { a, b, n } = pairs[0];
+        const nid = 256 + merges.length;
+        vocab.set(nid, [...vocab.get(a)!, ...vocab.get(b)!]);
+        merges.push({ a, b, nid, text: show(vocab.get(nid)!), count: n });
+        const out: number[] = [];
+        for (let i = 0; i < ids.length; ) {
+          if (i + 1 < ids.length && ids[i] === a && ids[i + 1] === b) {
+            out.push(nid);
+            i += 2;
+          } else {
+            out.push(ids[i]);
+            i += 1;
+          }
+        }
+        ids = out;
+        lastNew = nid;
+        return true;
+      }
+
+      function drawSeq(el: HTMLElement, seq: number[], highlight: number) {
+        el.replaceChildren();
+        for (const id of seq) {
+          const sp = document.createElement('span');
+          sp.className = 'tok' + (id === highlight ? ' fresh' : '');
+          sp.textContent = show(vocab.get(id) ?? [id]);
+          el.append(sp);
+        }
+      }
+
+      function draw() {
+        const corpus = $<HTMLInputElement>('[data-corpus]').value;
+        const numBytes = enc.encode(corpus).length;
+        drawSeq($('[data-seq]'), ids, lastNew);
+
+        $('[data-tally]').textContent =
+          `已合并 ${merges.length} 次　·　序列长度 ${numBytes} → ${ids.length}　·　压缩率 ` +
+          (ids.length ? (numBytes / ids.length).toFixed(2) : '0') +
+          ' 字节/token';
+
+        // 频次表
+        const pairs = countPairs(ids).slice(0, 6);
+        const tbody = $('[data-counts] tbody');
+        tbody.replaceChildren();
+        if (!pairs.length || pairs[0].n < 2) {
+          const tr = document.createElement('tr');
+          const td = document.createElement('td');
+          td.colSpan = 2;
+          td.textContent = '没有出现两次以上的相邻对了，训练到此为止。';
+          tr.append(td);
+          tbody.append(tr);
+          $<HTMLButtonElement>('[data-step]').disabled = true;
+          $<HTMLButtonElement>('[data-auto]').disabled = true;
+        } else {
+          $<HTMLButtonElement>('[data-step]').disabled = false;
+          $<HTMLButtonElement>('[data-auto]').disabled = false;
+          pairs.forEach((p, i) => {
+            const tr = document.createElement('tr');
+            if (i === 0) tr.className = 'top';
+            const a = document.createElement('td');
+            a.className = 'pair';
+            a.textContent = `${show(vocab.get(p.a)!)} + ${show(vocab.get(p.b)!)}`;
+            const b = document.createElement('td');
+            b.className = 'n';
+            b.textContent = p.n + ' 次';
+            tr.append(a, b);
+            tbody.append(tr);
+          });
+        }
+
+        // 合并表
+        const ol = $('[data-merges]');
+        ol.replaceChildren();
+        if (!merges.length) {
+          const li = document.createElement('li');
+          li.className = 'empty';
+          li.textContent = '还没有合并。点「下一次合并」开始。';
+          li.style.listStyle = 'none';
+          li.style.marginLeft = '-1.3rem';
+          ol.append(li);
+        }
+        for (const m of merges) {
+          const li = document.createElement('li');
+          li.innerHTML = `<code>${show(vocab.get(m.a)!)}</code> + <code>${show(
+            vocab.get(m.b)!,
+          )}</code> → <code>${m.text}</code>　编号 ${m.nid}（当时出现 ${m.count} 次）`;
+          ol.append(li);
+        }
+      }
+
+      // ── 编码面板 ──
+      function resetEncode() {
+        encIds = Array.from(enc.encode($<HTMLInputElement>('[data-sample]').value));
+        encApplied = 0;
+        drawEncode();
+      }
+
+      function encStep(): boolean {
+        if (encApplied >= merges.length) return false;
+        const m = merges[encApplied];
+        const out: number[] = [];
+        for (let i = 0; i < encIds.length; ) {
+          if (i + 1 < encIds.length && encIds[i] === m.a && encIds[i + 1] === m.b) {
+            out.push(m.nid);
+            i += 2;
+          } else {
+            out.push(encIds[i]);
+            i += 1;
+          }
+        }
+        encIds = out;
+        encApplied++;
+        return true;
+      }
+
+      function drawEncode() {
+        const last = encApplied > 0 ? merges[encApplied - 1] : undefined;
+        drawSeq($('[data-enc-seq]'), encIds, last ? last.nid : -1);
+        const numBytes = enc.encode($<HTMLInputElement>('[data-sample]').value).length;
+        $('[data-enc-tally]').textContent = `套用了 ${encApplied} / ${merges.length} 条合并　·　序列长度 ${numBytes} → ${encIds.length}`;
+        const hint = $('[data-enc-hint]');
+        if (!merges.length) {
+          hint.textContent = '合并表还是空的 —— 先回「训练」那一栏跑几步。';
+        } else if (encApplied < merges.length) {
+          const m = merges[encApplied];
+          hint.textContent = `下一条要套用的是第 ${encApplied + 1} 条：${show(
+            vocab.get(m.a)!,
+          )} + ${show(vocab.get(m.b)!)} → ${m.text}。注意顺序是固定的，必须按训练时学到的先后来套。`;
+        } else {
+          hint.textContent = '合并表已经全部套完，这就是这段文本最终的 token 序列。';
+        }
+        $<HTMLButtonElement>('[data-enc-step]').disabled = encApplied >= merges.length;
+        $<HTMLButtonElement>('[data-enc-all]').disabled = encApplied >= merges.length;
+      }
+
+      // ── 事件 ──
+      $('[data-step]').addEventListener('click', () => {
+        if (step()) draw();
+      });
+      $('[data-auto]').addEventListener('click', () => {
+        clearInterval(timer);
+        timer = window.setInterval(() => {
+          if (!step()) {
+            clearInterval(timer);
+            timer = undefined;
+          }
+          draw();
+        }, 550);
+      });
+      $('[data-reset]').addEventListener('click', reset);
+      $('[data-corpus]').addEventListener('input', reset);
+
+      $('[data-enc-step]').addEventListener('click', () => {
+        if (encStep()) drawEncode();
+      });
+      $('[data-enc-all]').addEventListener('click', () => {
+        while (encStep());
+        drawEncode();
+      });
+      $('[data-enc-reset]').addEventListener('click', resetEncode);
+      $('[data-sample]').addEventListener('input', resetEncode);
+
+      root.querySelectorAll<HTMLButtonElement>('.tabs button').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          root.querySelectorAll('.tabs button').forEach((b) => b.classList.toggle('on', b === btn));
+          root.querySelectorAll<HTMLElement>('[data-panel]').forEach((p) => {
+            p.hidden = p.dataset.panel !== btn.dataset.tab;
+          });
+          if (btn.dataset.tab === 'encode') drawEncode();
+        });
+      });
+
+      reset();
+    });
+  }
+
+  setupBpe();
+  document.addEventListener('astro:page-load', setupBpe);
+</script>

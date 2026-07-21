@@ -1,0 +1,293 @@
+---
+// 四种分词器的实时对比：字符 / 字节 / 词 / BPE。
+// 同一段输入，四行并排，每行显示切出来的 token、词表大小、压缩率（字节数 ÷ token 数）。
+// BPE 是在输入文本本身上现场训练的，合并次数可拖动。
+interface Props {
+  /** 初始文本 */
+  initial?: string;
+  /** BPE 初始合并次数 */
+  merges?: number;
+}
+const {
+  initial = 'the cat in the hat. the cat in the hat. 你好，你好！Hello, 🌍!',
+  merges = 20,
+} = Astro.props;
+---
+
+<div class="demo" data-demo="toklab">
+  <div class="bar">
+    <label class="txt">
+      输入文本
+      <textarea data-input rows="2" spellcheck="false">{initial}</textarea>
+    </label>
+    <label class="rng">
+      BPE 合并次数：<b data-mval>{merges}</b>
+      <input type="range" data-merges min="0" max="60" value={merges} />
+    </label>
+  </div>
+
+  <div class="rows" data-rows></div>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1.1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .bar {
+    display: grid;
+    gap: 0.9rem;
+  }
+  .bar label {
+    display: block;
+    font-size: 0.78rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .bar textarea {
+    display: block;
+    width: 100%;
+    margin-top: 0.4rem;
+    padding: 0.45rem 0.6rem;
+    font: inherit;
+    font-size: 0.95rem;
+    line-height: 1.6;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    resize: vertical;
+  }
+  .bar textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .rng b {
+    color: var(--indigo);
+    font-variant-numeric: tabular-nums;
+  }
+  .rng input {
+    display: block;
+    width: 100%;
+    margin-top: 0.35rem;
+    accent-color: var(--indigo);
+  }
+
+  .rows {
+    margin-top: 1.2rem;
+    display: grid;
+    gap: 0.9rem;
+  }
+  .rows :global(.row) {
+    padding: 0.7rem 0.8rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+  }
+  .rows :global(.head) {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.9rem;
+    margin-bottom: 0.5rem;
+  }
+  .rows :global(.name) {
+    font-weight: 700;
+    font-size: 0.92rem;
+    color: var(--indigo);
+  }
+  .rows :global(.stat) {
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .rows :global(.stat em) {
+    font-style: normal;
+    color: var(--madder);
+  }
+  .rows :global(.toks) {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+    max-height: 11rem;
+    overflow-y: auto;
+  }
+  .rows :global(.tok) {
+    padding: 1px 4px;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.7;
+    color: var(--ink);
+    border-radius: 3px;
+    /* pre-wrap 而不是 pre：既保留 token 里的空白形状，又允许长 token 换行。
+       BPE 在长语料上能合出很长的 token，用 pre 会把窄屏撑出横向滚动条。 */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-width: 100%;
+  }
+  .rows :global(.tok:nth-child(4n + 1)) {
+    background: color-mix(in srgb, var(--indigo) 16%, transparent);
+  }
+  .rows :global(.tok:nth-child(4n + 2)) {
+    background: color-mix(in srgb, var(--madder) 15%, transparent);
+  }
+  .rows :global(.tok:nth-child(4n + 3)) {
+    background: color-mix(in srgb, var(--weld) 22%, transparent);
+  }
+  .rows :global(.tok:nth-child(4n)) {
+    background: color-mix(in srgb, var(--ink) 10%, transparent);
+  }
+</style>
+
+<script>
+  type Tokenizing = { tokens: string[]; vocab: string; note?: string };
+
+  function setupTokLab() {
+    document.querySelectorAll<HTMLElement>('[data-demo="toklab"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const input = root.querySelector<HTMLTextAreaElement>('[data-input]')!;
+      const slider = root.querySelector<HTMLInputElement>('[data-merges]')!;
+      const mval = root.querySelector<HTMLElement>('[data-mval]')!;
+      const rows = root.querySelector<HTMLElement>('[data-rows]')!;
+      const enc = new TextEncoder();
+      const dec = new TextDecoder('utf-8', { fatal: false });
+
+      // 把一段字节渲染成看得见的东西。
+      // 注意 BPE 合并出来的 token 可能横跨字符边界（比如「你好」加上「，」的前两个字节），
+      // 这时解码结果里会有 �。只要还解出了别的字符就照常显示 —— 那个 � 恰好说明
+      // 这个 token 里含着半个字符。整段都解不出来（比如单个字节）才退回十六进制。
+      function showBytes(bytes: number[]): string {
+        const s = dec.decode(new Uint8Array(bytes));
+        if (!s.includes('�')) return s.replace(/\n/g, '⏎');
+        const hasReadable = [...s].some((ch) => ch !== '�');
+        return hasReadable
+          ? s.replace(/\n/g, '⏎')
+          : bytes.map((b) => '<' + b.toString(16).padStart(2, '0') + '>').join('');
+      }
+
+      // 字符分词：一个 Unicode 码点一个 token
+      function charTok(text: string): Tokenizing {
+        return {
+          tokens: Array.from(text),
+          vocab: '≈ 150,000（全部 Unicode 字符）',
+        };
+      }
+
+      // 字节分词：UTF-8 编码后一个字节一个 token
+      function byteTok(text: string): Tokenizing {
+        return {
+          tokens: Array.from(enc.encode(text)).map((b) => showBytes([b])),
+          vocab: '256',
+        };
+      }
+
+      // 词分词：课件里用的正则 \w+|. —— 连续的字母数字算一个词，其余每个字符各成一块。
+      // 注意：Python 的 regex 模块里 \w 是 Unicode 的，JS 的 \w 只认 ASCII。
+      // 这里写成 [\p{L}\p{N}_]+ 来对齐 Python 的行为，否则中文会被逐字拆开，
+      // 和上面那段 Python 代码对不上。
+      function wordTok(text: string): Tokenizing {
+        const chunks = text.match(/[\p{L}\p{N}_]+|[\s\S]/gu) ?? [];
+        const distinct = new Set(chunks).size;
+        return {
+          tokens: chunks,
+          vocab: `本例 ${distinct} 个不同片段（真实语料上不封顶）`,
+        };
+      }
+
+      // BPE：在这段文本上现场训练 numMerges 次，再用学到的合并切它自己
+      function bpeTok(text: string, numMerges: number): Tokenizing {
+        let ids = Array.from(enc.encode(text));
+        const vocab = new Map<number, number[]>();
+        for (let i = 0; i < 256; i++) vocab.set(i, [i]);
+
+        for (let step = 0; step < numMerges; step++) {
+          const counts = new Map<string, number>();
+          for (let i = 0; i + 1 < ids.length; i++) {
+            const k = ids[i] + ',' + ids[i + 1];
+            counts.set(k, (counts.get(k) ?? 0) + 1);
+          }
+          if (!counts.size) break;
+          let best = '';
+          let bestN = 0;
+          for (const [k, n] of counts) if (n > bestN) (best = k), (bestN = n);
+          if (bestN < 2) break; // 没有重复出现的相邻对了，再合并没有意义
+          const [a, b] = best.split(',').map(Number);
+          const nid = 256 + step;
+          vocab.set(nid, [...vocab.get(a)!, ...vocab.get(b)!]);
+          const out: number[] = [];
+          for (let i = 0; i < ids.length; ) {
+            if (i + 1 < ids.length && ids[i] === a && ids[i + 1] === b) {
+              out.push(nid);
+              i += 2;
+            } else {
+              out.push(ids[i]);
+              i += 1;
+            }
+          }
+          ids = out;
+        }
+        const used = Math.min(numMerges, vocab.size - 256);
+        return {
+          tokens: ids.map((id) => showBytes(vocab.get(id)!)),
+          vocab: `256 + ${used} = ${256 + used}`,
+          note: used < numMerges ? '（这段文本上已经没有重复出现的相邻对，提前停了）' : undefined,
+        };
+      }
+
+      function row(name: string, r: Tokenizing, numBytes: number) {
+        const el = document.createElement('div');
+        el.className = 'row';
+
+        const head = document.createElement('div');
+        head.className = 'head';
+        const n = document.createElement('span');
+        n.className = 'name';
+        n.textContent = name;
+        const s = document.createElement('span');
+        s.className = 'stat';
+        const ratio = r.tokens.length ? numBytes / r.tokens.length : 0;
+        s.innerHTML =
+          `token 数 <em>${r.tokens.length}</em>　·　词表大小 ${r.vocab}　·　压缩率 <em>${ratio.toFixed(2)}</em> 字节/token` +
+          (r.note ? `　${r.note}` : '');
+        head.append(n, s);
+
+        const toks = document.createElement('div');
+        toks.className = 'toks';
+        for (const t of r.tokens) {
+          const sp = document.createElement('span');
+          sp.className = 'tok';
+          sp.textContent = t === ' ' ? '␣' : t;
+          toks.append(sp);
+        }
+
+        el.append(head, toks);
+        return el;
+      }
+
+      function render() {
+        const text = input.value;
+        const numBytes = enc.encode(text).length;
+        const m = Number(slider.value);
+        mval.textContent = String(m);
+        rows.replaceChildren(
+          row('字符分词', charTok(text), numBytes),
+          row('字节分词', byteTok(text), numBytes),
+          row('词分词', wordTok(text), numBytes),
+          row('BPE', bpeTok(text, m), numBytes),
+        );
+      }
+
+      input.addEventListener('input', render);
+      slider.addEventListener('input', render);
+      render();
+    });
+  }
+
+  setupTokLab();
+  document.addEventListener('astro:page-load', setupTokLab);
+</script>

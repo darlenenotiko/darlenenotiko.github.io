@@ -1,0 +1,160 @@
+---
+// UTF-8 字节浏览器：输入任意文字，逐字符看它的 Unicode 码点和 UTF-8 字节。
+// 用来说明「一个字符不等于一个字节」——英文 1 字节，中文 3 字节，emoji 4 字节。
+interface Props {
+  /** 初始文本 */
+  initial?: string;
+}
+const { initial = 'Hi 你好 🌍' } = Astro.props;
+---
+
+<div class="demo" data-demo="utf8">
+  <div class="bar">
+    <label>
+      输入文字
+      <input type="text" data-input value={initial} spellcheck="false" />
+    </label>
+  </div>
+
+  <div class="cells" data-cells></div>
+
+  <p class="sum" data-sum></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1.1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .bar label {
+    display: block;
+    font-size: 0.78rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .bar input {
+    display: block;
+    width: 100%;
+    margin-top: 0.4rem;
+    padding: 0.45rem 0.6rem;
+    font: inherit;
+    font-size: 1rem;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .bar input:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  .cells {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-top: 1rem;
+  }
+  .cells :global(.cell) {
+    min-width: 4.2rem;
+    padding: 0.45rem 0.5rem;
+    text-align: center;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .cells :global(.ch) {
+    display: block;
+    font-size: 1.3rem;
+    line-height: 1.4;
+    color: var(--ink);
+  }
+  .cells :global(.cp) {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--indigo);
+  }
+  .cells :global(.by) {
+    display: block;
+    margin-top: 0.2rem;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--madder);
+    word-break: break-all;
+  }
+  .cells :global(.n) {
+    display: block;
+    font-size: 0.68rem;
+    color: var(--ink-faint);
+  }
+
+  .sum {
+    margin: 1rem 0 0;
+    font-size: 0.86rem;
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupUtf8() {
+    document.querySelectorAll<HTMLElement>('[data-demo="utf8"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const input = root.querySelector<HTMLInputElement>('[data-input]')!;
+      const cells = root.querySelector<HTMLElement>('[data-cells]')!;
+      const sum = root.querySelector<HTMLElement>('[data-sum]')!;
+      const enc = new TextEncoder();
+
+      function render() {
+        const text = input.value;
+        // Array.from 按码点切，不会把 emoji 的代理对拆成两半
+        const chars = Array.from(text);
+        cells.replaceChildren();
+        let total = 0;
+
+        for (const ch of chars) {
+          const bytes = Array.from(enc.encode(ch));
+          total += bytes.length;
+          const cp = ch.codePointAt(0)!.toString(16).toUpperCase().padStart(4, '0');
+
+          const cell = document.createElement('div');
+          cell.className = 'cell';
+
+          const a = document.createElement('span');
+          a.className = 'ch';
+          a.textContent = ch === ' ' ? '␣' : ch;
+
+          const b = document.createElement('span');
+          b.className = 'cp';
+          b.textContent = 'U+' + cp;
+
+          const c = document.createElement('span');
+          c.className = 'by';
+          c.textContent = bytes.join(' ');
+
+          const d = document.createElement('span');
+          d.className = 'n';
+          d.textContent = bytes.length + ' 字节';
+
+          cell.append(a, b, c, d);
+          cells.append(cell);
+        }
+
+        sum.textContent = `共 ${chars.length} 个字符，${total} 个字节。平均每个字符 ${
+          chars.length ? (total / chars.length).toFixed(2) : '0'
+        } 字节。`;
+      }
+
+      input.addEventListener('input', render);
+      render();
+    });
+  }
+
+  setupUtf8();
+  document.addEventListener('astro:page-load', setupUtf8);
+</script>

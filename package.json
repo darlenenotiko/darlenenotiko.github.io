@@ -11,6 +11,7 @@
     "preview": "astro preview",
     "astro": "astro",
     "verify": "node scripts/check-boundary.mjs",
+    "test:demos": "node scripts/test-demos.mjs",
     "test:anchor": "esbuild scripts/test-anchor.ts --bundle --platform=node --format=esm --external:happy-dom | node --input-type=module"
   },
   "dependencies": {

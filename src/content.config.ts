@@ -61,4 +61,27 @@ const logs = defineCollection({
   }),
 });
 
-export const collections = { papers, blog, projects, logs };
+// 课程讲义：一门课一个子目录，条目 id 形如 cs336/lecture-01。
+// 讲次靠 lecture 字段排序，不靠文件名 —— 文件名只决定 URL。
+const courses = defineCollection({
+  loader: glob({ pattern: '**/*.{md,mdx}', base: './src/content/courses' }),
+  schema: z.object({
+    /** 课程标识，同时是 URL 的第一段，如 cs336 */
+    course: z.string(),
+    /** 课程全名，列表页分组标题用 */
+    courseTitle: z.string(),
+    /** 第几讲，列表页排序与上下讲导航用 */
+    lecture: z.number(),
+    title: z.string(),
+    date: z.date(),
+    description: z.string().optional(),
+    /** 主讲人 */
+    speaker: z.string().optional(),
+    /** 原始课件出处，页脚标注 */
+    slides: z.string().optional(),
+    tags: z.array(z.string()).default([]),
+    draft: z.boolean().default(false),
+  }),
+});
+
+export const collections = { papers, blog, projects, logs, courses };
