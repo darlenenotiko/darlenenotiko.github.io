@@ -288,6 +288,11 @@ pre:hover .code-bar,
 .katex {
   font-size: 1em;
 }
+/* 行内公式与中文之间留一点气口（中文排版的「盘古之白」），
+   缓解数学符号紧贴汉字造成的拥挤。独立公式不受影响。 */
+:where(p, li, td, dd) .katex {
+  margin: 0 0.14em;
+}
 /* 独立公式稍大一点更稳重，并允许长公式独立横向滚动而非撑破页面 */
 .katex-display {
   margin: 1.4em 0;
@@ -296,6 +301,7 @@ pre:hover .code-bar,
   overflow-y: hidden;
 }
 .katex-display > .katex {
+  margin: 0;
   font-size: 1.15em;
 }
 
