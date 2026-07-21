@@ -4,7 +4,7 @@ import { defineConfig } from 'astro/config';
 import mdx from '@astrojs/mdx';
 import annotate from './src/integrations/annotate.mjs';
 import remarkMath from 'remark-math';
-import rehypeKatex from 'rehype-katex';
+import rehypeMathml from '@daiji256/rehype-mathml';
 
 // https://astro.build/config
 export default defineConfig({
@@ -16,10 +16,11 @@ export default defineConfig({
   integrations: [mdx(), annotate()],
 
   markdown: {
-    // 数学公式：$...$ 行内、$$...$$ 独立。KaTeX 服务端渲染成静态 HTML，
-    // 浏览器端零 JS；样式与字体由 BaseLayout 引入的 katex.min.css 提供（self-host）。
+    // 数学公式：$...$ 行内、$$...$$ 独立。Temml 在构建时渲染成静态 MathML，
+    // 浏览器端零 JS；用 Libertinus Math 字体（与正文 Libertinus 同源），
+    // 样式与字体由 BaseLayout 引入的 temml-libertinus.css 提供（self-host）。
     remarkPlugins: [remarkMath],
-    rehypePlugins: [rehypeKatex],
+    rehypePlugins: [rehypeMathml],
     shikiConfig: {
       themes: { light: 'github-light', dark: 'github-dark' },
       wrap: false,

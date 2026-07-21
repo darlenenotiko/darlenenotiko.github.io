@@ -16,10 +16,9 @@
   "dependencies": {
     "@astrojs/mdx": "^7.0.3",
     "@astrojs/rss": "^4.0.19",
+    "@daiji256/rehype-mathml": "^1.2.2",
     "approx-string-match": "^2.0.0",
     "astro": "^7.1.1",
-    "katex": "^0.18.1",
-    "rehype-katex": "^7.0.1",
     "remark-math": "^6.0.0"
   },
   "devDependencies": {
