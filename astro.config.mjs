@@ -8,8 +8,8 @@ import rehypeKatex from 'rehype-katex';
 
 // https://astro.build/config
 export default defineConfig({
-  // RSS 和 sitemap 需要绝对地址。换域名时改这一处即可。
-  site: 'https://example.com',
+  // 站点绝对地址（RSS / sitemap / OG 用）。GitHub Pages 用户主页，根路径无需 base。
+  site: 'https://darlenenotiko.github.io',
 
   // annotate() 是 dev-only 批注系统：只在 astro dev 注入客户端 + 挂写盘端点，
   // build/preview 时完全不参与 —— 生产构建里没有任何批注代码。
