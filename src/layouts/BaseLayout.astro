@@ -1,6 +1,7 @@
 ---
 import { ClientRouter } from 'astro:transitions';
 import '../styles/global.css';
+import 'katex/dist/katex.min.css'; // 数学公式样式 + self-host 字体（Vite 打包 fonts）
 
 interface Props {
   title: string;
@@ -137,12 +138,53 @@ const path = Astro.url.pathname;
           (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
       }
 
+      // 代码块：加语言标签 + 复制按钮（渐进增强，纯前端）
+      function enhanceCodeBlocks() {
+        document.querySelectorAll('pre').forEach((pre) => {
+          if (pre.dataset.enhanced) return;
+          pre.dataset.enhanced = 'true';
+          const code = pre.querySelector('code');
+          if (!code) return;
+
+          const lang = pre.getAttribute('data-language');
+          const bar = document.createElement('div');
+          bar.className = 'code-bar';
+          if (lang && lang !== 'plaintext' && lang !== 'text') {
+            const tag = document.createElement('span');
+            tag.className = 'code-lang';
+            tag.textContent = lang;
+            bar.appendChild(tag);
+          }
+          const btn = document.createElement('button');
+          btn.className = 'code-copy';
+          btn.type = 'button';
+          btn.textContent = '复制';
+          btn.addEventListener('click', async () => {
+            try {
+              await navigator.clipboard.writeText(code.textContent ?? '');
+              btn.textContent = '已复制';
+              btn.classList.add('is-done');
+              setTimeout(() => {
+                btn.textContent = '复制';
+                btn.classList.remove('is-done');
+              }, 1500);
+            } catch {
+              btn.textContent = '复制失败';
+            }
+          });
+          bar.appendChild(btn);
+          pre.appendChild(bar);
+        });
+      }
+
       setupReveal();
       setupTheme();
+      enhanceCodeBlocks();
       document.addEventListener('astro:after-swap', applyTheme);
       document.addEventListener('astro:page-load', () => {
         setupReveal();
         setupTheme();
+        enhanceCodeBlocks();
       });
     </script>
 

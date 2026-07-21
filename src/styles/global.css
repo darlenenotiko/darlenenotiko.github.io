@@ -224,6 +224,7 @@ code {
   border-radius: 3px;
 }
 pre {
+  position: relative;
   padding: 1.1rem 1.3rem;
   border-radius: 4px;
   overflow-x: auto;
@@ -236,6 +237,49 @@ pre code {
   background: none;
   padding: 0;
   font-size: inherit;
+}
+
+/* 代码块的语言标签 + 复制按钮（enhanceCodeBlocks 注入） */
+.code-bar {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.6rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  opacity: 0;
+  transition: opacity 0.2s var(--ease);
+}
+pre:hover .code-bar,
+.code-bar:focus-within {
+  opacity: 1;
+}
+.code-lang {
+  font-family: var(--font-sans);
+  font-size: 0.66rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--selvage);
+}
+.code-copy {
+  font-family: var(--font-sans);
+  font-size: 0.7rem;
+  padding: 0.15rem 0.55rem;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--bg) 85%, transparent);
+  color: var(--ink-muted);
+  cursor: pointer;
+  transition: color 0.2s var(--ease), border-color 0.2s var(--ease);
+}
+.code-copy:hover,
+.code-copy.is-done {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+/* 触屏无 hover：小屏常显 */
+@media (hover: none) {
+  .code-bar { opacity: 1; }
 }
 
 hr {
