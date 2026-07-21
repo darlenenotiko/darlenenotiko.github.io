@@ -28,9 +28,10 @@ tags: [state-estimation, SLAM]
   更新后，状态与协方差同步收缩：
 
   $$
-  \hat{x} = \hat{x}^- + K\!\left(z - \hat{x}^-\right) = (2.4,\, 0.8)^\top,
-  \qquad
-  P = (I - K)\,P^- = 0.8\,I.
+  \begin{aligned}
+  \hat{x} &= \hat{x}^- + K\!\left(z - \hat{x}^-\right) = (2.4,\, 0.8)^\top, \\[2pt]
+  P &= (I - K)\,P^- = 0.8\,I.
+  \end{aligned}
   $$
 
   几何上：估计点落在先验 $(0,0)$ 与观测 $(3,1)$ 的连线上、偏向观测 $0.8$ 处 ——
