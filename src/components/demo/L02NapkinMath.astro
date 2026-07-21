@@ -1,0 +1,300 @@
+---
+// 第 2 讲开场那两道「餐巾纸估算」题的核算器。
+// 左：给定参数量 / token 数 / GPU 数 / MFU，用 6ND 算训练要多少天。
+// 右：给定显存和优化器，用「每参数多少字节」算最大能训多大的模型。
+// 默认值就是课上的两道题，答案分别是 143.9 天 和 533 亿参数。
+---
+
+<div class="demo" data-demo="l02-napkin">
+  <div class="tabs">
+    <button data-tab="time" class="on">要训多久</button>
+    <button data-tab="size">能训多大</button>
+  </div>
+
+  <!-- ── 训练时间 ─────────────────────────────────── -->
+  <section data-panel="time">
+    <div class="grid">
+      <label class="lab">
+        参数量 N（十亿）
+        <input type="number" data-n value="70" min="0.1" step="1" />
+      </label>
+      <label class="lab">
+        训练 token 数 D（万亿）
+        <input type="number" data-d value="15" min="0.01" step="1" />
+      </label>
+      <label class="lab">
+        GPU 张数
+        <input type="number" data-gpus value="1024" min="1" step="1" />
+      </label>
+      <label class="lab">
+        GPU 型号（bf16 稠密算力）
+        <select data-hw>
+          <option value="989.5e12" selected>H100 · 989.5 TFLOP/s</option>
+          <option value="312e12">A100 · 312 TFLOP/s</option>
+          <option value="2.25e15">B200 · 2250 TFLOP/s</option>
+        </select>
+      </label>
+      <label class="lab">
+        MFU（实际 ÷ 标称）
+        <input type="range" data-mfu min="0.05" max="1" step="0.05" value="0.5" />
+        <span class="rv" data-mfu-v>0.50</span>
+      </label>
+    </div>
+
+    <table class="out" data-time-out><tbody></tbody></table>
+    <p class="hint">
+      课上的原题是「1024 张 H100、700 亿参数、15 万亿 token、MFU 0.5」，答案 143.9 天。
+      把 MFU 从 0.5 拖到 0.25 看看天数怎么变 —— 这就是为什么效率值钱。
+    </p>
+  </section>
+
+  <!-- ── 最大模型 ─────────────────────────────────── -->
+  <section data-panel="size" hidden>
+    <div class="grid">
+      <label class="lab">
+        GPU 张数
+        <input type="number" data-s-gpus value="8" min="1" step="1" />
+      </label>
+      <label class="lab">
+        单卡显存（GB）
+        <input type="number" data-s-mem value="80" min="1" step="8" />
+      </label>
+      <label class="lab">
+        参数与梯度精度
+        <select data-s-prec>
+          <option value="2" selected>bf16 / fp16 · 2 字节</option>
+          <option value="4">fp32 · 4 字节</option>
+        </select>
+      </label>
+      <label class="lab">
+        优化器状态
+        <select data-s-opt>
+          <option value="8" selected>AdamW · 一阶+二阶矩，fp32，8 字节</option>
+          <option value="4">AdaGrad / RMSProp · 二阶矩，fp32，4 字节</option>
+          <option value="0">SGD（无动量）· 0 字节</option>
+        </select>
+      </label>
+    </div>
+
+    <table class="out" data-size-out><tbody></tbody></table>
+    <p class="hint">
+      注意这是个<strong>上界</strong>：激活值完全没算进去，而激活值取决于批大小和序列长度。
+      把优化器换成 SGD 会看到能训的模型大一倍还多 —— 优化器状态确实占了大头。
+    </p>
+  </section>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .tabs {
+    display: flex;
+    gap: 0.4rem;
+    margin-bottom: 1rem;
+    border-bottom: 1px solid var(--rule);
+  }
+  .tabs button {
+    padding: 0.4rem 0.85rem;
+    font: inherit;
+    font-size: 0.87rem;
+    color: var(--ink-muted);
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    margin-bottom: -1px;
+  }
+  .tabs button.on {
+    color: var(--indigo);
+    border-bottom-color: var(--indigo);
+  }
+
+  .grid {
+    display: grid;
+    gap: 0.8rem;
+  }
+  @media (min-width: 640px) {
+    .grid {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+
+  .lab {
+    display: block;
+    font-size: 0.78rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .lab input,
+  .lab select {
+    display: block;
+    width: 100%;
+    margin-top: 0.35rem;
+    padding: 0.4rem 0.55rem;
+    font: inherit;
+    font-size: 0.9rem;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .lab input:focus,
+  .lab select:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+  .lab input[type='range'] {
+    padding: 0;
+    accent-color: var(--indigo);
+    background: transparent;
+    border: none;
+  }
+  .rv {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    color: var(--indigo);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .out {
+    width: 100%;
+    margin-top: 1.1rem;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+  }
+  .out :global(td) {
+    padding: 0.32rem 0.4rem;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-muted);
+    vertical-align: baseline;
+  }
+  .out :global(td.k) {
+    white-space: nowrap;
+  }
+  .out :global(td.v) {
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    overflow-wrap: anywhere;
+  }
+  .out :global(tr.big td) {
+    color: var(--madder);
+    font-weight: 700;
+    font-size: 0.95rem;
+  }
+  .out :global(td.note) {
+    font-size: 0.78rem;
+    color: var(--ink-faint);
+  }
+
+  .hint {
+    margin: 0.9rem 0 0;
+    font-size: 0.82rem;
+    line-height: 1.7;
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupL02Napkin() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l02-napkin"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+
+      // 科学计数法，写成 6.30 × 10^24 的样子
+      const sci = (x: number, digits = 2) => {
+        if (!isFinite(x) || x === 0) return '0';
+        const e = Math.floor(Math.log10(Math.abs(x)));
+        const m = x / Math.pow(10, e);
+        return `${m.toFixed(digits)} × 10^${e}`;
+      };
+
+      const num = (sel: string) => parseFloat($<HTMLInputElement>(sel).value) || 0;
+
+      function row(tbody: HTMLElement, k: string, v: string, cls = '') {
+        const tr = document.createElement('tr');
+        if (cls) tr.className = cls;
+        const a = document.createElement('td');
+        a.className = 'k';
+        a.textContent = k;
+        const b = document.createElement('td');
+        b.className = 'v';
+        b.textContent = v;
+        tr.append(a, b);
+        tbody.append(tr);
+      }
+
+      function drawTime() {
+        const N = num('[data-n]') * 1e9;
+        const D = num('[data-d]') * 1e12;
+        const gpus = num('[data-gpus]');
+        const perGpu = parseFloat($<HTMLSelectElement>('[data-hw]').value);
+        const mfu = num('[data-mfu]');
+        $('[data-mfu-v]').textContent = mfu.toFixed(2);
+
+        const totalFlops = 6 * N * D;
+        const flopsPerSec = perGpu * mfu * gpus;
+        const flopsPerDay = flopsPerSec * 60 * 60 * 24;
+        const days = totalFlops / flopsPerDay;
+
+        const tb = $('[data-time-out] tbody');
+        tb.replaceChildren();
+        row(tb, '总计算量　6 × N × D', sci(totalFlops) + ' FLOPs');
+        row(tb, '集群实际吞吐　单卡 × MFU × 张数', sci(flopsPerSec) + ' FLOP/s');
+        row(tb, '每天能做的运算', sci(flopsPerDay) + ' FLOPs');
+        row(tb, '训练耗时', days.toFixed(1) + ' 天', 'big');
+        row(tb, '', '合 ' + (days / 30.44).toFixed(1) + ' 个月');
+      }
+
+      function drawSize() {
+        const gpus = num('[data-s-gpus]');
+        const memGB = num('[data-s-mem]');
+        const prec = parseFloat($<HTMLSelectElement>('[data-s-prec]').value);
+        const opt = parseFloat($<HTMLSelectElement>('[data-s-opt]').value);
+
+        const bytesPerParam = prec + prec + opt;
+        const totalBytes = gpus * memGB * 1e9;
+        const params = bytesPerParam > 0 ? totalBytes / bytesPerParam : Infinity;
+
+        const tb = $('[data-size-out] tbody');
+        tb.replaceChildren();
+        row(tb, '总显存　张数 × 单卡容量', sci(totalBytes) + ' 字节');
+        row(
+          tb,
+          '每个参数占的字节数',
+          `${prec}（参数）+ ${prec}（梯度）+ ${opt}（优化器）= ${bytesPerParam}`,
+        );
+        row(tb, '最多能放下的参数量', sci(params) + ' 个参数', 'big');
+        row(tb, '', (params / 1e9).toFixed(1) + ' 十亿（B）');
+      }
+
+      root.querySelectorAll<HTMLElement>('[data-panel="time"] input, [data-panel="time"] select')
+        .forEach((el) => el.addEventListener('input', drawTime));
+      root.querySelectorAll<HTMLElement>('[data-panel="size"] input, [data-panel="size"] select')
+        .forEach((el) => el.addEventListener('input', drawSize));
+
+      root.querySelectorAll<HTMLButtonElement>('.tabs button').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          root.querySelectorAll('.tabs button').forEach((b) => b.classList.toggle('on', b === btn));
+          root.querySelectorAll<HTMLElement>('[data-panel]').forEach((p) => {
+            p.hidden = p.dataset.panel !== btn.dataset.tab;
+          });
+        });
+      });
+
+      drawTime();
+      drawSize();
+    });
+  }
+
+  setupL02Napkin();
+  document.addEventListener('astro:page-load', setupL02Napkin);
+</script>

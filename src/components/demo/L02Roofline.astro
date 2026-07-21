@@ -1,0 +1,485 @@
+---
+// 算术强度与 roofline。选一个工作负载（ReLU / GELU / 点积 / 矩阵-向量 / 矩阵-矩阵），
+// 逐项列出搬了多少字节、做了多少 FLOPs、两边各花多长时间、算术强度是多少，
+// 并把它画在 roofline 图上（横轴算术强度，纵轴实际能跑出的 FLOP/s，都是对数刻度）。
+// 默认值就是课上算的那五个例子：0.25 / 5 / 0.5 / 1 / 341，加速器强度 295。
+---
+
+<div class="demo" data-demo="l02-roofline">
+  <div class="ctrl">
+    <span class="tag">工作负载</span>
+    <button data-wl="relu" class="on">ReLU</button>
+    <button data-wl="gelu">GELU</button>
+    <button data-wl="dot">点积</button>
+    <button data-wl="matvec">矩阵 × 向量</button>
+    <button data-wl="matmul">矩阵 × 矩阵</button>
+  </div>
+
+  <div class="ctrl">
+    <span class="tag">硬件</span>
+    <select data-hw>
+      <option value="h100" selected>H100（989.5 TFLOP/s，3.35 TB/s）</option>
+      <option value="b200">B200（2250 TFLOP/s，8 TB/s）</option>
+    </select>
+    <span class="tag">规模 n</span>
+    <select data-n></select>
+  </div>
+
+  <p class="formula" data-formula></p>
+
+  <div class="two">
+    <table class="out" data-out><tbody></tbody></table>
+    <div class="plot" data-plot></div>
+  </div>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.45rem;
+    margin-bottom: 0.6rem;
+  }
+  .tag {
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .ctrl button {
+    padding: 0.28rem 0.7rem;
+    font: inherit;
+    font-size: 0.82rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .ctrl button.on {
+    color: var(--bg);
+    background: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .ctrl select {
+    padding: 0.26rem 0.4rem;
+    font: inherit;
+    font-size: 0.82rem;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+  }
+
+  .formula {
+    margin: 0.9rem 0 0.2rem;
+    padding: 0.5rem 0.7rem;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    line-height: 1.8;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    overflow-x: auto;
+  }
+
+  .two {
+    display: grid;
+    gap: 1rem;
+    margin-top: 0.9rem;
+    align-items: start;
+  }
+  @media (min-width: 720px) {
+    .two {
+      grid-template-columns: 1fr 1.15fr;
+    }
+  }
+
+  .out {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+  }
+  .out :global(td) {
+    padding: 0.28rem 0.35rem;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-muted);
+  }
+  .out :global(td.v) {
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    overflow-wrap: anywhere;
+  }
+  .out :global(tr.hi td) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+
+  .plot {
+    overflow-x: auto;
+  }
+  .plot :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 320px;
+    height: auto;
+  }
+  .plot :global(.axis) {
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .plot :global(.grid) {
+    stroke: var(--rule);
+    stroke-width: 0.6;
+    stroke-dasharray: 2 3;
+  }
+  .plot :global(.roof) {
+    fill: none;
+    stroke: var(--indigo);
+    stroke-width: 2;
+  }
+  .plot :global(.roof.dim) {
+    stroke: var(--ink-faint);
+    stroke-width: 1.2;
+    stroke-dasharray: 4 3;
+  }
+  .plot :global(.kink) {
+    fill: none;
+    stroke: var(--weld);
+    stroke-width: 1.2;
+    stroke-dasharray: 3 3;
+  }
+  .plot :global(.pt) {
+    fill: var(--madder);
+  }
+  .plot :global(.ghost) {
+    fill: none;
+    stroke: var(--ink-faint);
+    stroke-width: 1;
+  }
+  .plot :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 9px;
+  }
+  .plot :global(text.lbl) {
+    fill: var(--madder);
+    font-size: 10px;
+    font-weight: 700;
+  }
+  .plot :global(text.roofname) {
+    fill: var(--indigo);
+    font-size: 10px;
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL02Roofline() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l02-roofline"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+
+      const HW = {
+        h100: { name: 'H100', flops: 1979e12 / 2, bw: 3.35e12 },
+        b200: { name: 'B200', flops: 4.5e15 / 2, bw: 8e12 },
+      };
+
+      // 每个工作负载：默认 n、字节数、FLOPs，以及一行「这些数是怎么来的」
+      const WL: Record<
+        string,
+        {
+          name: string;
+          n: number;
+          bytes: (n: number) => number;
+          flops: (n: number) => number;
+          how: (n: number) => string;
+        }
+      > = {
+        relu: {
+          name: 'ReLU（逐元素）',
+          n: 1024 * 1024,
+          bytes: (n) => 4 * n,
+          flops: (n) => n,
+          how: (n) =>
+            `y = max(x, 0)，x 是长度 ${n} 的 bf16 向量\n` +
+            `字节 = 读 x (2n) + 写 y (2n) = 4n\n` +
+            `FLOPs = 每个元素和 0 比一次 = n`,
+        },
+        gelu: {
+          name: 'GELU（逐元素）',
+          n: 1024 * 1024,
+          bytes: (n) => 4 * n,
+          flops: (n) => 20 * n,
+          how: (n) =>
+            `y = 0.5·x·(1 + tanh(sqrt(2/pi)·(x + 0.044715·x^3)))，长度 ${n}\n` +
+            `字节 = 读 x (2n) + 写 y (2n) = 4n　（和 ReLU 一模一样）\n` +
+            `FLOPs ≈ 每个元素 20 次运算（tanh 用多项式近似）= 20n`,
+        },
+        dot: {
+          name: '点积',
+          n: 1024 * 1024,
+          bytes: (n) => 2 * n + 2 * n + 2,
+          flops: (n) => 2 * n - 1,
+          how: (n) =>
+            `y = x · w，x 和 w 都是长度 ${n} 的 bf16 向量，y 是标量\n` +
+            `字节 = 读 x (2n) + 读 w (2n) + 写 y (2) = 4n + 2\n` +
+            `FLOPs = n 次乘法 + (n-1) 次加法 = 2n - 1`,
+        },
+        matvec: {
+          name: '矩阵 × 向量',
+          n: 1024,
+          bytes: (n) => 2 * n + 2 * n * n + 2 * n,
+          flops: (n) => n * (2 * n - 1),
+          how: (n) =>
+            `y = x @ W，x 长度 ${n}，W 是 ${n}×${n} 的 bf16 矩阵\n` +
+            `字节 = 读 x (2n) + 读 W (2n²) + 写 y (2n)\n` +
+            `FLOPs = n 个点积 = n · (2n - 1)`,
+        },
+        matmul: {
+          name: '矩阵 × 矩阵',
+          n: 1024,
+          bytes: (n) => 2 * n * n + 2 * n * n + 2 * n * n,
+          flops: (n) => n * n * (2 * n - 1),
+          how: (n) =>
+            `Y = X @ W，X 和 W 都是 ${n}×${n} 的 bf16 矩阵\n` +
+            `字节 = 读 X (2n²) + 读 W (2n²) + 写 Y (2n²) = 6n²\n` +
+            `FLOPs = n² 个点积 = n² · (2n - 1)`,
+        },
+      };
+
+      let cur = 'relu';
+
+      // n 的候选值
+      const nSel = $<HTMLSelectElement>('[data-n]');
+      const N_CHOICES = [64, 256, 1024, 4096, 16384, 65536, 262144, 1048576];
+      for (const v of N_CHOICES) {
+        const o = document.createElement('option');
+        o.value = String(v);
+        o.textContent = v.toLocaleString('en-US');
+        nSel.append(o);
+      }
+
+      const fmt = (x: number, d = 2) => {
+        if (!isFinite(x) || x === 0) return '0';
+        if (Math.abs(x) >= 1e5 || Math.abs(x) < 1e-3) {
+          const e = Math.floor(Math.log10(Math.abs(x)));
+          return `${(x / Math.pow(10, e)).toFixed(d)} × 10^${e}`;
+        }
+        return x.toLocaleString('en-US', { maximumFractionDigits: 3 });
+      };
+      const secs = (t: number) => {
+        if (t >= 1) return t.toFixed(3) + ' s';
+        if (t >= 1e-3) return (t * 1e3).toFixed(3) + ' 毫秒';
+        if (t >= 1e-6) return (t * 1e6).toFixed(3) + ' 微秒';
+        return (t * 1e9).toFixed(3) + ' 纳秒';
+      };
+
+      function row(tb: HTMLElement, k: string, v: string, cls = '') {
+        const tr = document.createElement('tr');
+        if (cls) tr.className = cls;
+        const a = document.createElement('td');
+        a.textContent = k;
+        const b = document.createElement('td');
+        b.className = 'v';
+        b.textContent = v;
+        tr.append(a, b);
+        tb.append(tr);
+      }
+
+      // ── roofline 图（log-log SVG）──
+      const X0 = 1e-1,
+        X1 = 1e4,
+        Y0 = 1e11,
+        Y1 = 1e16;
+      const W = 420,
+        H = 280,
+        ML = 52,
+        MR = 12,
+        MT = 14,
+        MB = 34;
+      const px = (x: number) =>
+        ML + ((Math.log10(x) - Math.log10(X0)) / (Math.log10(X1) - Math.log10(X0))) * (W - ML - MR);
+      const py = (y: number) =>
+        H - MB - ((Math.log10(y) - Math.log10(Y0)) / (Math.log10(Y1) - Math.log10(Y0))) * (H - MT - MB);
+      const clampY = (y: number) => Math.min(Math.max(y, Y0), Y1);
+
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+
+      function drawPlot(ai: number, hwKey: string) {
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+
+        // 网格 + 刻度
+        for (let e = -1; e <= 4; e++) {
+          const x = px(Math.pow(10, e));
+          svg.append(svgEl('line', { class: 'grid', x1: x, y1: MT, x2: x, y2: H - MB }));
+          svg.append(
+            svgEl('text', { x, y: H - MB + 13, 'text-anchor': 'middle' }, `10^${e}`),
+          );
+        }
+        for (let e = 11; e <= 16; e++) {
+          const y = py(Math.pow(10, e));
+          svg.append(svgEl('line', { class: 'grid', x1: ML, y1: y, x2: W - MR, y2: y }));
+          svg.append(svgEl('text', { x: ML - 5, y: y + 3, 'text-anchor': 'end' }, `10^${e}`));
+        }
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: H - MB, x2: W - MR, y2: H - MB }));
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: MT, x2: ML, y2: H - MB }));
+        svg.append(
+          svgEl('text', { x: (ML + W - MR) / 2, y: H - 4, 'text-anchor': 'middle' }, '算术强度（FLOPs / 字节）'),
+        );
+        svg.append(
+          svgEl(
+            'text',
+            { x: 10, y: (MT + H - MB) / 2, 'text-anchor': 'middle', transform: `rotate(-90 10 ${(MT + H - MB) / 2})` },
+            '实际 FLOP/s',
+          ),
+        );
+
+        // 两条硬件屋顶线
+        for (const [key, hw] of Object.entries(HW)) {
+          const kink = hw.flops / hw.bw;
+          const pts = [
+            [X0, clampY(hw.bw * X0)],
+            [kink, hw.flops],
+            [X1, hw.flops],
+          ] as [number, number][];
+          svg.append(
+            svgEl('polyline', {
+              class: 'roof' + (key === hwKey ? '' : ' dim'),
+              points: pts.map(([x, y]) => `${px(x)},${py(y)}`).join(' '),
+            }),
+          );
+          if (key === hwKey) {
+            // 折点：从内存受限转到计算受限的那个位置
+            svg.append(
+              svgEl('line', { class: 'kink', x1: px(kink), y1: py(hw.flops), x2: px(kink), y2: H - MB }),
+            );
+            svg.append(
+              svgEl(
+                'text',
+                { class: 'roofname', x: px(kink) + 4, y: py(hw.flops) - 5 },
+                `${hw.name} 折点 ${kink.toFixed(0)}`,
+              ),
+            );
+          } else {
+            svg.append(
+              svgEl('text', { x: W - MR - 2, y: py(hw.flops) - 4, 'text-anchor': 'end' }, hw.name),
+            );
+          }
+        }
+
+        // 当前工作负载的点
+        const hw = HW[hwKey as keyof typeof HW];
+        const achieved = Math.min(hw.flops, hw.bw * ai);
+        const cx = px(Math.min(Math.max(ai, X0), X1));
+        const cy = py(clampY(achieved));
+        svg.append(svgEl('line', { class: 'ghost', x1: cx, y1: cy, x2: cx, y2: H - MB }));
+        svg.append(svgEl('circle', { class: 'pt', cx, cy, r: 4.5 }));
+        svg.append(
+          svgEl(
+            'text',
+            { class: 'lbl', x: Math.min(cx + 7, W - MR - 60), y: cy - 7 },
+            `强度 ${ai < 1 ? ai.toFixed(2) : ai.toFixed(0)}`,
+          ),
+        );
+
+        $('[data-plot]').replaceChildren(svg);
+      }
+
+      function draw() {
+        const wl = WL[cur];
+        const hwKey = $<HTMLSelectElement>('[data-hw]').value;
+        const hw = HW[hwKey as keyof typeof HW];
+        const n = parseInt(nSel.value, 10);
+
+        const bytes = wl.bytes(n);
+        const flops = wl.flops(n);
+        const ai = flops / bytes;
+        const accelAi = hw.flops / hw.bw;
+        const commT = bytes / hw.bw;
+        const compT = flops / hw.flops;
+        const total = Math.max(commT, compT);
+        const memBound = ai < accelAi;
+
+        $('[data-formula]').textContent = wl.how(n);
+
+        const tb = $('[data-out] tbody');
+        tb.replaceChildren();
+        row(tb, '搬运字节数', fmt(bytes) + ' 字节');
+        row(tb, '运算次数', fmt(flops) + ' FLOPs');
+        row(tb, '通信时间　字节 ÷ 带宽', secs(commT));
+        row(tb, '计算时间　FLOPs ÷ 算力', secs(compT));
+        row(tb, '总时间　二者取大（假设完全重叠）', secs(total));
+        row(tb, '算术强度　FLOPs ÷ 字节', ai < 1 ? ai.toFixed(4) : ai.toFixed(2), 'hi');
+        row(tb, `加速器强度　${hw.name} 算力 ÷ 带宽`, accelAi.toFixed(1));
+        row(tb, '这一步最多能跑出的 MFU', Math.min(1, ai / accelAi).toFixed(3));
+
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        const strong = document.createElement('strong');
+        strong.textContent = memBound ? '内存受限（memory-bound）' : '计算受限（compute-bound）';
+        v.append(document.createTextNode(`${wl.name}：算术强度 `));
+        v.append(document.createTextNode(ai < 1 ? ai.toFixed(2) : ai.toFixed(0)));
+        v.append(document.createTextNode(memBound ? ' 小于 ' : ' 大于 '));
+        v.append(document.createTextNode(`加速器强度 ${accelAi.toFixed(0)}，所以是 `));
+        v.append(strong);
+        v.append(
+          document.createTextNode(
+            memBound
+              ? '。绝大部分时间花在等数据从显存搬过来，算力是闲着的 —— 这时候把运算做得更省也没用。'
+              : '。数据搬得过来，算力被喂饱了 —— 这正是我们希望 Transformer 处于的状态。',
+          ),
+        );
+
+        drawPlot(ai, hwKey);
+      }
+
+      root.querySelectorAll<HTMLButtonElement>('[data-wl]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          cur = btn.dataset.wl!;
+          root.querySelectorAll('[data-wl]').forEach((b) => b.classList.toggle('on', b === btn));
+          nSel.value = String(WL[cur].n);
+          draw();
+        });
+      });
+      $('[data-hw]').addEventListener('change', draw);
+      nSel.addEventListener('change', draw);
+
+      nSel.value = String(WL[cur].n);
+      draw();
+    });
+  }
+
+  setupL02Roofline();
+  document.addEventListener('astro:page-load', setupL02Roofline);
+</script>

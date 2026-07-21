@@ -1,0 +1,405 @@
+---
+// 第 4 讲演示 1：注意力的代价。
+// 上半部分：同一个 QK^T V，两种加括号顺序的矩阵形状和乘加次数。
+// 下半部分：完整注意力 / 线性注意力 / DSA 稀疏注意力，代价随序列长度的曲线（双对数）。
+---
+
+<div class="demo" data-demo="l04-cost">
+  <div class="knobs">
+    <label>
+      <span>序列长度 <code data-out="n"></code></span>
+      <input type="range" data-k="n" min="7" max="22" step="1" value="13" />
+    </label>
+    <label>
+      <span>每头维度 <code data-out="d"></code>（d_k = d_v）</span>
+      <input type="range" data-k="d" min="4" max="9" step="1" value="7" />
+    </label>
+    <label>
+      <span>DSA 每个查询保留 <code data-out="topk"></code> 个键</span>
+      <input type="range" data-k="topk" min="5" max="12" step="1" value="9" />
+    </label>
+  </div>
+
+  <div class="block">
+    <h4>一、把括号挪一挪</h4>
+    <div class="orders">
+      <div class="order">
+        <div class="tag">原始顺序 <code>(Q Kᵀ) V</code></div>
+        <div class="steps" data-order-a></div>
+        <div class="total" data-total-a></div>
+      </div>
+      <div class="order">
+        <div class="tag alt">重排之后 <code>Q (Kᵀ V)</code></div>
+        <div class="steps" data-order-b></div>
+        <div class="total" data-total-b></div>
+      </div>
+    </div>
+    <p class="verdict" data-verdict></p>
+  </div>
+
+  <div class="block">
+    <h4>二、三条曲线（双对数坐标，纵轴是乘加次数）</h4>
+    <canvas data-canvas height="300"></canvas>
+    <div class="legend">
+      <span class="sw a"></span>完整注意力 <code>n²(d_k+d_v)</code>
+      <span class="sw b"></span>线性注意力 <code>2 n d_k d_v</code>
+      <span class="sw c"></span>DSA <code>索引器 n²d' + 主注意力 2 n k d</code>
+    </div>
+    <p class="verdict" data-verdict2></p>
+  </div>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+
+  .knobs {
+    display: grid;
+    gap: 0.7rem;
+  }
+  @media (min-width: 640px) {
+    .knobs {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  }
+  .knobs label {
+    display: block;
+    font-size: 0.78rem;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+  }
+  .knobs label span {
+    display: block;
+    margin-bottom: 0.25rem;
+  }
+  .knobs code {
+    font-family: var(--font-mono);
+    color: var(--indigo);
+    font-size: 0.85rem;
+  }
+  .knobs input[type='range'] {
+    width: 100%;
+    accent-color: var(--indigo);
+  }
+
+  .block {
+    margin-top: 1.3rem;
+  }
+  .block h4 {
+    margin: 0 0 0.55rem;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+
+  .orders {
+    display: grid;
+    gap: 0.7rem;
+  }
+  @media (min-width: 640px) {
+    .orders {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  .order {
+    padding: 0.6rem 0.75rem 0.7rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 7px;
+  }
+  .tag {
+    font-size: 0.8rem;
+    color: var(--madder);
+    margin-bottom: 0.45rem;
+  }
+  .tag.alt {
+    color: var(--indigo);
+  }
+  .tag code {
+    font-family: var(--font-mono);
+  }
+  .steps :global(div) {
+    font-family: var(--font-mono);
+    font-size: 0.79rem;
+    line-height: 1.85;
+    color: var(--ink-muted);
+    overflow-wrap: anywhere;
+  }
+  .steps :global(b) {
+    color: var(--ink);
+    font-weight: 600;
+  }
+  .steps :global(.big) {
+    color: var(--madder);
+  }
+  .total {
+    margin-top: 0.45rem;
+    padding-top: 0.4rem;
+    border-top: 1px solid var(--rule);
+    font-size: 0.82rem;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .verdict {
+    margin: 0.75rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(b) {
+    color: var(--ink);
+  }
+
+  canvas {
+    display: block;
+    width: 100%;
+    height: 300px;
+    margin-top: 0.2rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 7px;
+  }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.35rem 0.9rem;
+    margin-top: 0.5rem;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+  }
+  .legend code {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+  }
+  .sw {
+    display: inline-block;
+    width: 16px;
+    height: 3px;
+    border-radius: 2px;
+  }
+  .sw.a {
+    background: var(--madder);
+  }
+  .sw.b {
+    background: var(--indigo);
+  }
+  .sw.c {
+    background: var(--weld);
+  }
+</style>
+
+<script>
+  function setupL04Cost() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l04-cost"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const canvas = $<HTMLCanvasElement>('[data-canvas]');
+      const ctx = canvas.getContext('2d')!;
+
+      // 滑块存的是以 2 为底的指数，读出来再取 2 的幂 —— 这样滑动是等比的
+      const val = (k: string) => 2 ** Number($<HTMLInputElement>(`[data-k="${k}"]`).value);
+
+      const fmt = (x: number) => {
+        if (x >= 1e12) return (x / 1e12).toFixed(2) + '×10¹²';
+        if (x >= 1e9) return (x / 1e9).toFixed(2) + '×10⁹';
+        if (x >= 1e6) return (x / 1e6).toFixed(2) + '×10⁶';
+        if (x >= 1e3) return (x / 1e3).toFixed(2) + '×10³';
+        return x.toFixed(0);
+      };
+      const cn = (x: number) => x.toLocaleString('en-US');
+
+      const css = (name: string) =>
+        getComputedStyle(root).getPropertyValue(name).trim() || '#888';
+
+      // ── 三种方案的乘加次数 ──
+      // 完整注意力：QK^T 是 n²d_k，(权重矩阵)V 是 n²d_v
+      const costFull = (n: number, d: number) => n * n * (d + d);
+      // 线性注意力：K^T V 是 n·d_k·d_v，Q(·) 也是 n·d_k·d_v
+      const costLinear = (n: number, d: number) => 2 * n * d * d;
+      // DSA：索引器在低维 d/4 上做完整的 n² 打分，主注意力只在 min(k,n) 个键上做
+      const costDsa = (n: number, d: number, k: number) => {
+        const dIdx = Math.max(8, d / 4);
+        const kk = Math.min(k, n);
+        return n * n * dIdx + n * kk * (d + d);
+      };
+
+      function drawShapes() {
+        const n = val('n');
+        const d = val('d');
+        const k = val('topk');
+
+        $('[data-out="n"]').textContent = cn(n);
+        $('[data-out="d"]').textContent = cn(d);
+        $('[data-out="topk"]').textContent = cn(k);
+
+        const a1 = n * n * d;
+        const a2 = n * n * d;
+        const b1 = n * d * d;
+        const b2 = n * d * d;
+
+        $('[data-order-a]').innerHTML =
+          `<div>① <b>Q Kᵀ</b>：(${cn(n)}×${d}) · (${d}×${cn(n)}) → <span class="big">${cn(n)}×${cn(n)}</span><br>&nbsp;&nbsp;&nbsp;= ${fmt(a1)} 次乘加</div>` +
+          `<div>② <b>· V</b>：(${cn(n)}×${cn(n)}) · (${cn(n)}×${d}) → ${cn(n)}×${d}<br>&nbsp;&nbsp;&nbsp;= ${fmt(a2)} 次乘加</div>`;
+        $('[data-order-b]').innerHTML =
+          `<div>① <b>Kᵀ V</b>：(${d}×${cn(n)}) · (${cn(n)}×${d}) → <b>${d}×${d}</b>（不含 n）<br>&nbsp;&nbsp;&nbsp;= ${fmt(b1)} 次乘加</div>` +
+          `<div>② <b>Q ·</b>：(${cn(n)}×${d}) · (${d}×${d}) → ${cn(n)}×${d}<br>&nbsp;&nbsp;&nbsp;= ${fmt(b2)} 次乘加</div>`;
+
+        const ta = a1 + a2;
+        const tb = b1 + b2;
+        $('[data-total-a]').textContent = `合计 ${fmt(ta)}`;
+        $('[data-total-b]').textContent = `合计 ${fmt(tb)}`;
+
+        const ratio = ta / tb;
+        const cross = d; // d_k = d_v = d 时的临界点就是 n = d
+        $('[data-verdict]').innerHTML =
+          ratio >= 1
+            ? `重排之后便宜 <b>${ratio.toFixed(1)} 倍</b>。因为 d_k = d_v = d，这个倍数正好等于 <b>n / d = ${cn(n)} / ${d}</b>。临界点在 <b>n = d = ${cn(cross)}</b>：序列比隐藏维度长，重排就赚。`
+            : `这里 <b>n = ${cn(n)} 比 d = ${cn(d)} 还小</b>，所以重排反而更贵（贵 ${(1 / ratio).toFixed(1)} 倍）。线性注意力只在长序列上有意义。`;
+
+        const cf = costFull(n, d);
+        const cl = costLinear(n, d);
+        const cd = costDsa(n, d, k);
+        $('[data-verdict2]').innerHTML =
+          `当前这一点：完整 <b>${fmt(cf)}</b>，线性 <b>${fmt(cl)}</b>，DSA <b>${fmt(cd)}</b>。` +
+          `DSA 那条曲线仍然是平方的（索引器必须看过所有位置），但它的常数因子小得多：` +
+          `索引器只在 <b>${Math.max(8, d / 4)}</b> 维上打分，而后面真正的注意力每行只剩 <b>${cn(Math.min(k, n))}</b> 个键。`;
+      }
+
+      function drawCurve() {
+        const dpr = window.devicePixelRatio || 1;
+        const w = canvas.clientWidth;
+        const h = 300;
+        canvas.width = w * dpr;
+        canvas.height = h * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, w, h);
+
+        const d = val('d');
+        const k = val('topk');
+        const nNow = val('n');
+
+        const pad = { l: 52, r: 12, t: 14, b: 30 };
+        const x0 = pad.l,
+          x1 = w - pad.r,
+          y0 = h - pad.b,
+          y1 = pad.t;
+
+        const nMin = 2 ** 7,
+          nMax = 2 ** 22;
+        const lx = (n: number) =>
+          x0 + ((Math.log2(n) - Math.log2(nMin)) / (Math.log2(nMax) - Math.log2(nMin))) * (x1 - x0);
+
+        // 纵轴范围由三条曲线在 nMax 处的最大值决定
+        const yMax = costFull(nMax, d);
+        const yMin = costLinear(nMin, d);
+        const ly = (v: number) =>
+          y0 - ((Math.log10(v) - Math.log10(yMin)) / (Math.log10(yMax) - Math.log10(yMin))) * (y0 - y1);
+
+        const rule = css('--rule');
+        const faint = css('--ink-faint');
+
+        // 网格
+        ctx.strokeStyle = rule;
+        ctx.fillStyle = faint;
+        ctx.lineWidth = 1;
+        ctx.font = '10px ui-monospace, monospace';
+        ctx.textAlign = 'center';
+        for (let e = 7; e <= 22; e += 3) {
+          const n = 2 ** e;
+          const x = lx(n);
+          ctx.beginPath();
+          ctx.moveTo(x, y1);
+          ctx.lineTo(x, y0);
+          ctx.stroke();
+          const lbl = n >= 1 << 20 ? n / (1 << 20) + 'M' : n >= 1024 ? n / 1024 + 'K' : String(n);
+          ctx.fillText(lbl, x, y0 + 14);
+        }
+        ctx.textAlign = 'right';
+        const p0 = Math.ceil(Math.log10(yMin));
+        const p1 = Math.floor(Math.log10(yMax));
+        const stepP = Math.max(1, Math.ceil((p1 - p0) / 6));
+        for (let p = p0; p <= p1; p += stepP) {
+          const y = ly(10 ** p);
+          ctx.beginPath();
+          ctx.moveTo(x0, y);
+          ctx.lineTo(x1, y);
+          ctx.stroke();
+          ctx.fillText('10^' + p, x0 - 6, y + 3);
+        }
+
+        const line = (f: (n: number) => number, color: string) => {
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          for (let px = 0; px <= x1 - x0; px++) {
+            const t = px / (x1 - x0);
+            const n = 2 ** (Math.log2(nMin) + t * (Math.log2(nMax) - Math.log2(nMin)));
+            const v = Math.max(f(n), yMin);
+            const y = Math.max(y1, Math.min(y0, ly(v)));
+            px === 0 ? ctx.moveTo(x0 + px, y) : ctx.lineTo(x0 + px, y);
+          }
+          ctx.stroke();
+        };
+
+        line((n) => costFull(n, d), css('--madder'));
+        line((n) => costLinear(n, d), css('--indigo'));
+        line((n) => costDsa(n, d, k), css('--weld'));
+
+        // 当前 n 的竖线
+        const xn = lx(nNow);
+        ctx.strokeStyle = css('--ink-faint');
+        ctx.setLineDash([3, 3]);
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(xn, y1);
+        ctx.lineTo(xn, y0);
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // 交叉点 n = d
+        if (d >= nMin && d <= nMax) {
+          const xc = lx(d);
+          ctx.fillStyle = css('--ink-faint');
+          ctx.textAlign = 'left';
+          ctx.fillText('n = d', xc + 4, y1 + 12);
+          ctx.strokeStyle = css('--rule');
+          ctx.beginPath();
+          ctx.moveTo(xc, y1);
+          ctx.lineTo(xc, y0);
+          ctx.stroke();
+        }
+      }
+
+      function redraw() {
+        drawShapes();
+        drawCurve();
+      }
+
+      root.querySelectorAll<HTMLInputElement>('input[type="range"]').forEach((el) =>
+        el.addEventListener('input', redraw),
+      );
+      window.addEventListener('resize', drawCurve);
+      // 深色 / 浅色切换时重画，否则 canvas 里的颜色不会跟着变
+      new MutationObserver(drawCurve).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-theme'],
+      });
+
+      redraw();
+    });
+  }
+
+  setupL04Cost();
+  document.addEventListener('astro:page-load', setupL04Cost);
+</script>

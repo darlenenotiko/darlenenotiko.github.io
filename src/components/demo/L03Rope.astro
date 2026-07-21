@@ -1,0 +1,346 @@
+---
+// CS336 第 3 讲：RoPE 的旋转可视化。
+// 取一个 8 维的 query 和 key，拆成 4 个二维对，每一对按 位置 × 该对的角速度 θ_i 旋转。
+// 核心可玩点：勾上「锁定相对距离」后一起拖 m 和 n —— 两个向量都在转，
+// 但内积那个数字一动不动，因为它只依赖 m − n。
+---
+
+<div class="demo" data-demo="l03-rope">
+  <div class="row">
+    <label class="sld">
+      query 位置 m = <span data-m-val>3</span>
+      <input type="range" data-m min="0" max="64" step="1" value="3" />
+    </label>
+    <label class="sld">
+      key 位置 n = <span data-n-val>1</span>
+      <input type="range" data-n min="0" max="64" step="1" value="1" />
+    </label>
+    <label class="chk"><input type="checkbox" data-lock /> 锁定相对距离 m − n</label>
+  </div>
+
+  <canvas data-canvas width="760" height="230"></canvas>
+
+  <div class="readout">
+    <div class="big">
+      <span class="k">相对距离 m − n</span>
+      <span class="v" data-delta>2</span>
+    </div>
+    <div class="big">
+      <span class="k">内积 ⟨RoPE(q, m), RoPE(k, n)⟩</span>
+      <span class="v" data-dot>—</span>
+    </div>
+    <div class="big">
+      <span class="k">不加 RoPE 时的内积 ⟨q, k⟩</span>
+      <span class="v" data-dot0>—</span>
+    </div>
+  </div>
+
+  <p class="hint" data-hint></p>
+
+  <h4>四个坐标对各自的角速度（base = 10000，d = 8）</h4>
+  <table>
+    <thead>
+      <tr><th>坐标对 i</th><th>θ_i = 10000^(−2i/d)</th><th>每前进一个位置转多少度</th><th>转满一圈需要多少个位置</th></tr>
+    </thead>
+    <tbody data-freq></tbody>
+  </table>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem 1.3rem;
+    margin-bottom: 0.9rem;
+  }
+  .sld,
+  .chk {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.83rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .sld input[type='range'] {
+    width: 160px;
+    accent-color: var(--indigo);
+  }
+  .chk input {
+    accent-color: var(--indigo);
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .readout {
+    display: grid;
+    gap: 0.6rem;
+    margin-top: 1rem;
+  }
+  @media (min-width: 640px) {
+    .readout {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  }
+  .big {
+    padding: 0.5rem 0.7rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .big .k {
+    display: block;
+    font-size: 0.74rem;
+    color: var(--ink-faint);
+  }
+  .big .v {
+    display: block;
+    margin-top: 0.2rem;
+    font-family: var(--font-mono);
+    font-size: 1.05rem;
+    color: var(--indigo);
+    font-variant-numeric: tabular-nums;
+  }
+  .hint {
+    margin: 0.9rem 0 0;
+    font-size: 0.84rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  h4 {
+    margin: 1.4rem 0 0.5rem;
+    font-size: 0.79rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+  }
+  table :global(th) {
+    padding: 0.25rem 0.4rem;
+    text-align: left;
+    font-weight: 700;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+  }
+  table :global(td) {
+    padding: 0.22rem 0.4rem;
+    color: var(--ink-muted);
+    border-bottom: 1px solid var(--rule);
+    font-family: var(--font-mono);
+  }
+</style>
+
+<script>
+  function setupL03Rope() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l03-rope"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const cv = $<HTMLCanvasElement>('[data-canvas]');
+      const ctx = cv.getContext('2d')!;
+
+      const D = 8; // 演示维度，拆成 4 个二维对
+      const PAIRS = D / 2;
+      const BASE = 10000;
+      const theta = (i: number) => Math.pow(BASE, (-2 * i) / D);
+
+      // 固定的 q / k，写死是为了每次刷新看到的数字一样
+      const q = [0.9, 0.4, -0.6, 0.8, 1.1, -0.3, 0.5, 0.7];
+      const k = [0.5, -0.9, 1.0, 0.2, -0.4, 0.6, 0.8, -0.5];
+
+      function rot(v: number[], pos: number) {
+        const out = new Array(D).fill(0);
+        for (let i = 0; i < PAIRS; i++) {
+          const a = pos * theta(i);
+          const c = Math.cos(a);
+          const s = Math.sin(a);
+          const x0 = v[2 * i];
+          const x1 = v[2 * i + 1];
+          out[2 * i] = x0 * c - x1 * s;
+          out[2 * i + 1] = x0 * s + x1 * c;
+        }
+        return out;
+      }
+      const dot = (a: number[], b: number[]) => a.reduce((s, v, i) => s + v * b[i], 0);
+
+      const css = (n: string) =>
+        getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+      let lastDelta = 2;
+
+      function arrow(cx: number, cy: number, R: number, vx: number, vy: number, color: string, w: number) {
+        const len = Math.hypot(vx, vy) || 1;
+        const ux = (vx / len) * R;
+        const uy = (-vy / len) * R; // canvas 的 y 轴朝下，翻一下才符合数学习惯
+        ctx.strokeStyle = color;
+        ctx.fillStyle = color;
+        ctx.lineWidth = w;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(cx + ux, cy + uy);
+        ctx.stroke();
+        const ang = Math.atan2(uy, ux);
+        ctx.beginPath();
+        ctx.moveTo(cx + ux, cy + uy);
+        ctx.lineTo(cx + ux - 7 * Math.cos(ang - 0.4), cy + uy - 7 * Math.sin(ang - 0.4));
+        ctx.lineTo(cx + ux - 7 * Math.cos(ang + 0.4), cy + uy - 7 * Math.sin(ang + 0.4));
+        ctx.closePath();
+        ctx.fill();
+      }
+
+      function draw() {
+        const m = parseInt($<HTMLInputElement>('[data-m]').value, 10);
+        const n = parseInt($<HTMLInputElement>('[data-n]').value, 10);
+        const W = cv.width;
+        const H = cv.height;
+        ctx.clearRect(0, 0, W, H);
+
+        const qr = rot(q, m);
+        const kr = rot(k, n);
+
+        const slot = W / PAIRS;
+        const R = 62;
+        const cy = 108;
+        const indigo = css('--indigo');
+        const madder = css('--madder');
+        const rule = css('--rule');
+        const faint = css('--ink-faint');
+
+        ctx.font = '11px system-ui, sans-serif';
+        ctx.textAlign = 'center';
+
+        for (let i = 0; i < PAIRS; i++) {
+          const cx = slot * (i + 0.5);
+          // 圆
+          ctx.strokeStyle = rule;
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.arc(cx, cy, R, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.moveTo(cx - R, cy);
+          ctx.lineTo(cx + R, cy);
+          ctx.moveTo(cx, cy - R);
+          ctx.lineTo(cx, cy + R);
+          ctx.stroke();
+
+          arrow(cx, cy, R * 0.86, qr[2 * i], qr[2 * i + 1], indigo, 2.2);
+          arrow(cx, cy, R * 0.62, kr[2 * i], kr[2 * i + 1], madder, 2.2);
+
+          ctx.fillStyle = faint;
+          ctx.fillText(`坐标对 ${i}（维度 ${2 * i}, ${2 * i + 1}）`, cx, cy + R + 20);
+          const deg = (((m - n) * theta(i) * 180) / Math.PI) % 360;
+          ctx.fillText(`本对的夹角变化 ${deg.toFixed(1)}°`, cx, cy + R + 36);
+          ctx.fillText(`θ_${i} = ${theta(i)}`, cx, cy - R - 10);
+        }
+
+        // 图例
+        ctx.textAlign = 'left';
+        ctx.fillStyle = indigo;
+        ctx.fillRect(10, 12, 14, 3);
+        ctx.fillText(`query 转了 m = ${m} 个位置`, 30, 17);
+        ctx.fillStyle = madder;
+        ctx.fillRect(10, 28, 14, 3);
+        ctx.fillText(`key 转了 n = ${n} 个位置`, 30, 33);
+
+        const dm = m - n;
+        $('[data-m-val]').textContent = String(m);
+        $('[data-n-val]').textContent = String(n);
+        $('[data-delta]').textContent = String(dm);
+        $('[data-dot]').textContent = dot(qr, kr).toFixed(6);
+        $('[data-dot0]').textContent = dot(q, k).toFixed(6);
+
+        $('[data-hint]').textContent =
+          `两个向量各自的绝对朝向一直在变，但每一对的两根箭头之间的夹角只由 m − n = ${dm} 决定。` +
+          `勾上「锁定相对距离」再拖任意一个滑块：两根箭头一起转圈，而上面那个内积数字一位小数都不变 —— ` +
+          `这就是 RoPE 想要的性质。`;
+        lastDelta = dm;
+      }
+
+      function freq() {
+        const tb = $('[data-freq]');
+        tb.replaceChildren();
+        for (let i = 0; i < PAIRS; i++) {
+          const t = theta(i);
+          const tr = document.createElement('tr');
+          for (const v of [
+            String(i),
+            t.toString(),
+            ((t * 180) / Math.PI).toFixed(3) + '°',
+            ((2 * Math.PI) / t).toFixed(1),
+          ]) {
+            const td = document.createElement('td');
+            td.textContent = v;
+            tr.append(td);
+          }
+          tb.append(tr);
+        }
+      }
+
+      const mEl = $<HTMLInputElement>('[data-m]');
+      const nEl = $<HTMLInputElement>('[data-n]');
+      const lockEl = $<HTMLInputElement>('[data-lock]');
+
+      function clampLocked(moved: 'm' | 'n') {
+        if (!lockEl.checked) return;
+        const lo = 0;
+        const hi = 64;
+        if (moved === 'm') {
+          const want = parseInt(mEl.value, 10) - lastDelta;
+          if (want < lo || want > hi) {
+            mEl.value = String(parseInt(nEl.value, 10) + lastDelta);
+          } else {
+            nEl.value = String(want);
+          }
+        } else {
+          const want = parseInt(nEl.value, 10) + lastDelta;
+          if (want < lo || want > hi) {
+            nEl.value = String(parseInt(mEl.value, 10) - lastDelta);
+          } else {
+            mEl.value = String(want);
+          }
+        }
+      }
+
+      mEl.addEventListener('input', () => {
+        clampLocked('m');
+        draw();
+      });
+      nEl.addEventListener('input', () => {
+        clampLocked('n');
+        draw();
+      });
+      lockEl.addEventListener('input', draw);
+
+      new MutationObserver(draw).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-theme'],
+      });
+
+      freq();
+      draw();
+    });
+  }
+
+  setupL03Rope();
+  document.addEventListener('astro:page-load', setupL03Rope);
+</script>

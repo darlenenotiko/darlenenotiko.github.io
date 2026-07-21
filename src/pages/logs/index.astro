@@ -14,7 +14,7 @@ const rendered = await Promise.all(
 );
 
 const fmt = (d: Date) =>
-  d.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' });
+  d.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' });
 ---
 
 <BaseLayout title="日志" description="研究日志">

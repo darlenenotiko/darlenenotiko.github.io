@@ -30,7 +30,7 @@ const { note, prev, next } = Astro.props;
 const { Content, headings } = await render(note);
 
 const fmt = (d: Date) =>
-  d.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' });
+  d.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' });
 ---
 
 <BaseLayout title={note.data.title} description={note.data.description}>

@@ -1,0 +1,262 @@
+---
+// CS336 第 3 讲：LayerNorm 与 RMSNorm 对同一组数值的处理对比。
+// 关键演示：拖「整体平移」滑块 —— LayerNorm 的输出纹丝不动（它先减了均值），
+// RMSNorm 的输出会跟着变（它不减均值）。这就是「LayerNorm 更有表达力」的具体含义。
+---
+
+<div class="demo" data-demo="l03-norm">
+  <label class="lab">
+    输入向量 x（逗号分隔，就当它是某个 token 在 d_model 上的激活值）
+    <input type="text" data-x value="2, -1, 4, 3" spellcheck="false" />
+  </label>
+
+  <div class="row">
+    <label class="sld">
+      整体平移 c = <span data-shift-val>0.0</span>
+      <input type="range" data-shift min="-6" max="6" step="0.5" value="0" />
+    </label>
+    <span class="note">给 x 的每一个分量都加上 c，然后再做归一化。</span>
+  </div>
+
+  <table class="stats">
+    <tbody data-stats></tbody>
+  </table>
+
+  <div class="two">
+    <div class="panel">
+      <h4>LayerNorm：先减均值，再除标准差</h4>
+      <canvas data-ln width="360" height="150"></canvas>
+      <div class="nums" data-ln-nums></div>
+    </div>
+    <div class="panel">
+      <h4>RMSNorm：不减均值，直接除均方根</h4>
+      <canvas data-rms width="360" height="150"></canvas>
+      <div class="nums" data-rms-nums></div>
+    </div>
+  </div>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .lab {
+    display: block;
+    font-size: 0.78rem;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+  .lab input {
+    display: block;
+    width: 100%;
+    margin-top: 0.4rem;
+    padding: 0.45rem 0.6rem;
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: 0.9rem;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .lab input:focus {
+    outline: none;
+    border-color: var(--indigo);
+  }
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1rem;
+    margin: 0.9rem 0 0.2rem;
+  }
+  .sld {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.83rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .sld input[type='range'] {
+    width: 170px;
+    accent-color: var(--indigo);
+  }
+  .note {
+    font-size: 0.79rem;
+    color: var(--ink-faint);
+  }
+  table.stats {
+    width: 100%;
+    margin-top: 0.9rem;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+  }
+  table.stats :global(td) {
+    padding: 0.22rem 0.4rem;
+    color: var(--ink-muted);
+    border-bottom: 1px solid var(--rule);
+  }
+  table.stats :global(td.k) {
+    width: 12rem;
+    color: var(--ink-faint);
+  }
+  table.stats :global(td.v) {
+    font-family: var(--font-mono);
+  }
+  .two {
+    display: grid;
+    gap: 1rem;
+    margin-top: 1.1rem;
+  }
+  @media (min-width: 640px) {
+    .two {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  .panel h4 {
+    margin: 0 0 0.5rem;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .nums {
+    margin-top: 0.4rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    overflow-wrap: anywhere;
+  }
+  .verdict {
+    margin: 1.1rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupL03Norm() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l03-norm"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const EPS = 1e-5;
+
+      const css = (n: string) =>
+        getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+      function bars(cv: HTMLCanvasElement, vals: number[], color: string) {
+        const ctx = cv.getContext('2d')!;
+        const W = cv.width;
+        const H = cv.height;
+        ctx.clearRect(0, 0, W, H);
+        if (!vals.length) return;
+        const lim = Math.max(2, ...vals.map((v) => Math.abs(v))) * 1.15;
+        const mid = H / 2;
+        // 零线
+        ctx.strokeStyle = css('--rule');
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(0, mid);
+        ctx.lineTo(W, mid);
+        ctx.stroke();
+        const slot = W / vals.length;
+        const bw = Math.min(46, slot * 0.55);
+        ctx.font = '11px system-ui, sans-serif';
+        ctx.textAlign = 'center';
+        vals.forEach((v, i) => {
+          const cx = slot * (i + 0.5);
+          const h = (v / lim) * (H / 2 - 16);
+          ctx.fillStyle = color;
+          ctx.fillRect(cx - bw / 2, mid - Math.max(h, 0), bw, Math.abs(h));
+          ctx.fillStyle = css('--ink-muted');
+          ctx.fillText(v.toFixed(2), cx, h >= 0 ? mid - h - 5 : mid - h + 13);
+        });
+      }
+
+      function render() {
+        const raw = $<HTMLInputElement>('[data-x]').value;
+        const shift = parseFloat($<HTMLInputElement>('[data-shift]').value);
+        $('[data-shift-val]').textContent = shift.toFixed(1);
+
+        const x = raw
+          .split(/[,，\s]+/)
+          .map((s) => parseFloat(s))
+          .filter((v) => Number.isFinite(v))
+          .map((v) => v + shift);
+
+        if (!x.length) return;
+        const n = x.length;
+        const mean = x.reduce((a, b) => a + b, 0) / n;
+        const varr = x.reduce((a, b) => a + (b - mean) ** 2, 0) / n;
+        const ms = x.reduce((a, b) => a + b * b, 0) / n;
+        const rms = Math.sqrt(ms);
+
+        const ln = x.map((v) => (v - mean) / Math.sqrt(varr + EPS));
+        const rn = x.map((v) => v / Math.sqrt(ms + EPS));
+
+        const stats: [string, string][] = [
+          ['平移后的 x', x.map((v) => v.toFixed(2)).join(', ')],
+          ['均值 mean(x)', mean.toFixed(4)],
+          ['方差 var(x)', varr.toFixed(4)],
+          ['标准差 √var', Math.sqrt(varr).toFixed(4)],
+          ['均方根 RMS(x)', rms.toFixed(4)],
+        ];
+        const tb = $('[data-stats]');
+        tb.replaceChildren();
+        for (const [k, v] of stats) {
+          const tr = document.createElement('tr');
+          const a = document.createElement('td');
+          a.className = 'k';
+          a.textContent = k;
+          const b = document.createElement('td');
+          b.className = 'v';
+          b.textContent = v;
+          tr.append(a, b);
+          tb.append(tr);
+        }
+
+        bars($<HTMLCanvasElement>('[data-ln]'), ln, css('--indigo'));
+        bars($<HTMLCanvasElement>('[data-rms]'), rn, css('--madder'));
+        $('[data-ln-nums]').textContent = ln.map((v) => v.toFixed(4)).join(', ');
+        $('[data-rms-nums]').textContent = rn.map((v) => v.toFixed(4)).join(', ');
+
+        $('[data-verdict]').textContent =
+          shift === 0
+            ? '现在 c = 0。把滑块拖起来：左边 LayerNorm 的柱子会一动不动，右边 RMSNorm 的柱子会整体变形。'
+            : `c = ${shift.toFixed(1)}：LayerNorm 的输出和 c = 0 时完全一样（它在第一步就把均值减掉了，` +
+              `所以对整体平移免疫）；RMSNorm 的输出变了（它只除以均方根，平移会改变均方根）。` +
+              `这就是「LayerNorm 表达力更强」的确切含义 —— 但实践中语言模型并不需要这份额外的不变性，` +
+              `于是大家换成了更省事的 RMSNorm。`;
+      }
+
+      root.querySelectorAll('input').forEach((el) => el.addEventListener('input', render));
+      new MutationObserver(render).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-theme'],
+      });
+      render();
+    });
+  }
+
+  setupL03Norm();
+  document.addEventListener('astro:page-load', setupL03Norm);
+</script>

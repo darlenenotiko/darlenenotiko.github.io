@@ -1,0 +1,550 @@
+---
+// einops 形状推演器。输入张量形状 + 一条 einops 表达式，它告诉你：
+// 输出形状是什么、哪些维度被求和掉了、写成下标公式长什么样、要花多少 FLOPs。
+// 预设的例子全部来自第 2 讲课件。
+---
+
+<div class="demo" data-demo="l02-einops">
+  <div class="ctrl">
+    <span class="tag">例子</span>
+    <select data-preset></select>
+  </div>
+
+  <p class="desc" data-desc></p>
+
+  <div class="fields">
+    <label class="lab" data-f="shapes">
+      输入张量形状（多个张量用分号隔开，如 <code>3,4 ; 4,3</code>）
+      <input type="text" data-shapes spellcheck="false" />
+    </label>
+    <label class="lab" data-f="pattern">
+      einops 表达式
+      <input type="text" data-pattern spellcheck="false" />
+    </label>
+    <label class="lab" data-f="op" hidden>
+      归约操作
+      <select data-op>
+        <option value="sum">sum（求和）</option>
+        <option value="mean">mean（平均）</option>
+        <option value="max">max（最大）</option>
+        <option value="min">min（最小）</option>
+      </select>
+    </label>
+    <label class="lab" data-f="kw" hidden>
+      指定维度大小（如 <code>heads=2</code>，多个用逗号隔开）
+      <input type="text" data-kw spellcheck="false" />
+    </label>
+  </div>
+
+  <div class="result" data-result></div>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .tag {
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .ctrl select {
+    flex: 1 1 16rem;
+    padding: 0.3rem 0.45rem;
+    font: inherit;
+    font-size: 0.85rem;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+  }
+
+  .desc {
+    margin: 0.8rem 0 0;
+    font-size: 0.83rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+
+  .fields {
+    display: grid;
+    gap: 0.75rem;
+    margin-top: 0.9rem;
+  }
+  .lab {
+    display: block;
+    font-size: 0.78rem;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+  }
+  .lab code {
+    font-family: var(--font-mono);
+    font-size: 0.95em;
+    color: var(--indigo);
+  }
+  .lab input,
+  .lab select {
+    display: block;
+    width: 100%;
+    margin-top: 0.35rem;
+    padding: 0.42rem 0.6rem;
+    font-family: var(--font-mono);
+    font-size: 0.88rem;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .lab input:focus,
+  .lab select:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  .result {
+    margin-top: 1rem;
+  }
+  .result :global(table) {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.83rem;
+  }
+  .result :global(td) {
+    padding: 0.3rem 0.4rem;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-muted);
+    vertical-align: baseline;
+  }
+  .result :global(td.k) {
+    white-space: nowrap;
+    width: 1%;
+  }
+  .result :global(td.v) {
+    font-family: var(--font-mono);
+    color: var(--ink);
+    overflow-wrap: anywhere;
+  }
+  .result :global(tr.hi td.v) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+  .result :global(.err) {
+    padding: 0.55rem 0.7rem;
+    font-size: 0.85rem;
+    color: var(--madder);
+    background: color-mix(in srgb, var(--madder) 10%, transparent);
+    border-radius: 6px;
+  }
+  .result :global(.old) {
+    margin-top: 0.7rem;
+    font-size: 0.8rem;
+    line-height: 1.7;
+    color: var(--ink-faint);
+  }
+  .result :global(.old code) {
+    font-family: var(--font-mono);
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupL02Einops() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l02-einops"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+
+      type Item =
+        | { kind: 'name'; name: string }
+        | { kind: 'group'; names: string[] }
+        | { kind: 'ell' };
+
+      // ── 把 "... (heads hidden1) hidden2" 这样的轴列表拆成结构 ──
+      function parseAxes(src: string): Item[] {
+        const items: Item[] = [];
+        let i = 0;
+        while (i < src.length) {
+          const c = src[i];
+          if (/\s/.test(c)) {
+            i++;
+          } else if (src.startsWith('...', i)) {
+            items.push({ kind: 'ell' });
+            i += 3;
+          } else if (c === '(') {
+            const j = src.indexOf(')', i);
+            if (j < 0) throw new Error('括号没有闭合');
+            const names = src
+              .slice(i + 1, j)
+              .split(/\s+/)
+              .filter(Boolean);
+            if (names.some((n) => !/^[A-Za-z_]\w*$/.test(n)))
+              throw new Error('括号里只能放维度名');
+            items.push({ kind: 'group', names });
+            i = j + 1;
+          } else if (/[A-Za-z_]/.test(c)) {
+            const m = /^[A-Za-z_]\w*/.exec(src.slice(i))!;
+            items.push({ kind: 'name', name: m[0] });
+            i += m[0].length;
+          } else {
+            throw new Error(`看不懂的字符「${c}」`);
+          }
+        }
+        return items;
+      }
+
+      const ELL = (k: number) => `…${k}`;
+
+      // 把轴列表按输入形状展开成一串扁平的维度名，同时把维度大小登记进 sizes
+      function bindAxes(items: Item[], shape: number[], sizes: Map<string, number>): string[] {
+        const nonEll = items.filter((it) => it.kind !== 'ell').length;
+        const hasEll = items.some((it) => it.kind === 'ell');
+        if (!hasEll && nonEll !== shape.length)
+          throw new Error(`表达式写了 ${nonEll} 个维度，但张量是 ${shape.length} 维`);
+        const ellCount = hasEll ? shape.length - nonEll : 0;
+        if (ellCount < 0) throw new Error(`张量只有 ${shape.length} 维，装不下表达式里的维度`);
+
+        const flat: string[] = [];
+        let d = 0;
+        for (const it of items) {
+          if (it.kind === 'ell') {
+            for (let k = 0; k < ellCount; k++) {
+              const nm = ELL(k);
+              put(sizes, nm, shape[d++]);
+              flat.push(nm);
+            }
+          } else if (it.kind === 'name') {
+            put(sizes, it.name, shape[d++]);
+            flat.push(it.name);
+          } else {
+            // 分组：这一个输入维度是组内各维度的乘积
+            const total = shape[d++];
+            const unknown = it.names.filter((n) => !sizes.has(n));
+            if (unknown.length > 1)
+              throw new Error(`(${it.names.join(' ')}) 里有不止一个未知大小，请在下面指定，如 ${unknown[0]}=2`);
+            const known = it.names
+              .filter((n) => sizes.has(n))
+              .reduce((a, n) => a * sizes.get(n)!, 1);
+            if (unknown.length === 1) {
+              if (total % known !== 0)
+                throw new Error(`${total} 除不尽已知维度的乘积 ${known}`);
+              sizes.set(unknown[0], total / known);
+            } else if (known !== total)
+              throw new Error(`(${it.names.join(' ')}) 的乘积是 ${known}，和输入维度 ${total} 对不上`);
+            flat.push(...it.names);
+          }
+        }
+        return flat;
+      }
+
+      function put(sizes: Map<string, number>, name: string, v: number) {
+        const old = sizes.get(name);
+        if (old !== undefined && old !== v)
+          throw new Error(`维度 ${name} 一会儿是 ${old} 一会儿是 ${v}，对不上`);
+        sizes.set(name, v);
+      }
+
+      // 由轴列表和已知维度大小算出输出形状
+      function outShape(items: Item[], sizes: Map<string, number>, ellCount: number): number[] {
+        const out: number[] = [];
+        for (const it of items) {
+          if (it.kind === 'ell') {
+            for (let k = 0; k < ellCount; k++) out.push(sizes.get(ELL(k))!);
+          } else if (it.kind === 'name') {
+            if (!sizes.has(it.name)) throw new Error(`输出里的 ${it.name} 在输入里没出现过`);
+            out.push(sizes.get(it.name)!);
+          } else {
+            let p = 1;
+            for (const n of it.names) {
+              if (!sizes.has(n)) throw new Error(`输出里的 ${n} 在输入里没出现过`);
+              p *= sizes.get(n)!;
+            }
+            out.push(p);
+          }
+        }
+        return out;
+      }
+
+      function flatNames(items: Item[], ellCount: number): string[] {
+        const out: string[] = [];
+        for (const it of items) {
+          if (it.kind === 'ell') for (let k = 0; k < ellCount; k++) out.push(ELL(k));
+          else if (it.kind === 'name') out.push(it.name);
+          else out.push(...it.names);
+        }
+        return out;
+      }
+
+      const parseShapes = (s: string) =>
+        s
+          .split(';')
+          .map((t) => t.trim())
+          .filter(Boolean)
+          .map((t) =>
+            t
+              .split(',')
+              .map((x) => {
+                const v = parseInt(x.trim(), 10);
+                if (!Number.isFinite(v) || v <= 0) throw new Error(`形状「${t}」里有非法数字`);
+                return v;
+              }),
+          );
+
+      // ── 预设 ──
+      type Preset = {
+        label: string;
+        mode: 'einsum' | 'reduce' | 'rearrange';
+        shapes: string;
+        pattern: string;
+        op?: string;
+        kw?: string;
+        desc: string;
+        old: string;
+      };
+      const PRESETS: Preset[] = [
+        {
+          label: 'einsum · 最基本的矩阵乘法',
+          mode: 'einsum',
+          shapes: '3,4 ; 4,3',
+          pattern: 'seq1 hidden, hidden seq2 -> seq1 seq2',
+          desc: '两个矩阵相乘。hidden 只出现在左边、不出现在输出里，所以它被求和掉了 —— 这正是矩阵乘法在做的事。',
+          old: 'z = x @ y',
+        },
+        {
+          label: 'einsum · 带 batch 的注意力打分',
+          mode: 'einsum',
+          shapes: '2,3,4 ; 2,3,4',
+          pattern: 'batch seq1 hidden, batch seq2 hidden -> batch seq1 seq2',
+          desc: 'batch 在两边都出现、也出现在输出里，所以它不被求和，而是逐个 batch 独立算。注意表达式里没有任何转置 —— 转置是靠给维度起名字完成的。',
+          old: 'z = x @ y.transpose(-2, -1)',
+        },
+        {
+          label: 'einsum · 用 ... 代表任意多个前置维度',
+          mode: 'einsum',
+          shapes: '2,3,4 ; 2,3,4',
+          pattern: '... seq1 hidden, ... seq2 hidden -> ... seq1 seq2',
+          desc: '把 batch 换成 ...，同一段代码就能吃下「批 × 序列 × 头」这种任意多层的前置维度。试着把两个形状都改成 5,2,3,4 看看。',
+          old: 'z = x @ y.transpose(-2, -1)',
+        },
+        {
+          label: 'reduce · 沿最后一维求和',
+          mode: 'reduce',
+          shapes: '2,3,4',
+          pattern: '... hidden -> ...',
+          op: 'sum',
+          desc: 'hidden 出现在左边、不出现在右边，于是它被 sum 掉。想换成平均或最大值，只要改归约操作。',
+          old: 'y = x.sum(dim=-1)',
+        },
+        {
+          label: 'rearrange · 把一个维度拆成两个（多头）',
+          mode: 'rearrange',
+          shapes: '3,8',
+          pattern: '... (heads hidden1) -> ... heads hidden1',
+          kw: 'heads=2',
+          desc: '长度 8 的那一维其实是「2 个头 × 每头 4 维」压平出来的。括号表示这一维是组内维度的乘积；8 可以拆成 2×4 也可以拆成 4×2，所以必须指定 heads=2。',
+          old: 'x = x.view(3, 2, 4)',
+        },
+        {
+          label: 'rearrange · 把两个维度合回一个',
+          mode: 'rearrange',
+          shapes: '3,2,4',
+          pattern: '... heads hidden2 -> ... (heads hidden2)',
+          desc: '多头算完之后再压平回去。合并的先后顺序就写在括号里 —— 不用去想什么行优先列优先。',
+          old: 'x = x.reshape(3, 8)',
+        },
+        {
+          label: 'einsum · 反向传播算对输入的梯度',
+          mode: 'einsum',
+          shapes: '1024,256 ; 256,256',
+          pattern: 'batch out, in out -> batch in',
+          desc: 'h1.grad = h2.grad 与 W2 的乘积，沿 out 维度求和。用名字写出来就不会纠结「到底谁转置」。注意 FLOPs 和前向的一次矩阵乘法完全一样。',
+          old: 'h1_grad = h2.grad @ w2.T',
+        },
+        {
+          label: 'einsum · 反向传播算对参数的梯度',
+          mode: 'einsum',
+          shapes: '1024,256 ; 1024,256',
+          pattern: 'batch out, batch in -> in out',
+          desc: 'w2.grad = h2.grad 与 h1 的乘积，这次沿 batch 维度求和。FLOPs 还是同一个数 —— 所以反向刚好是前向的两倍。',
+          old: 'w2_grad = h1.T @ h2.grad',
+        },
+      ];
+
+      const sel = $<HTMLSelectElement>('[data-preset]');
+      PRESETS.forEach((p, i) => {
+        const o = document.createElement('option');
+        o.value = String(i);
+        o.textContent = p.label;
+        sel.append(o);
+      });
+
+      let curMode: Preset['mode'] = 'einsum';
+      let curOld = '';
+      let dirty = false;
+
+      function loadPreset() {
+        const p = PRESETS[parseInt(sel.value, 10)];
+        curMode = p.mode;
+        curOld = p.old;
+        dirty = false;
+        $<HTMLInputElement>('[data-shapes]').value = p.shapes;
+        $<HTMLInputElement>('[data-pattern]').value = p.pattern;
+        $<HTMLSelectElement>('[data-op]').value = p.op ?? 'sum';
+        $<HTMLInputElement>('[data-kw]').value = p.kw ?? '';
+        $('[data-desc]').textContent = p.desc;
+        $('[data-f="op"]').hidden = p.mode !== 'reduce';
+        $('[data-f="kw"]').hidden = p.mode !== 'rearrange';
+        run();
+      }
+
+      const fmtShape = (s: number[]) => '(' + s.join(', ') + ')';
+
+      function run() {
+        const box = $('[data-result]');
+        box.replaceChildren();
+        try {
+          const shapes = parseShapes($<HTMLInputElement>('[data-shapes]').value);
+          const pattern = $<HTMLInputElement>('[data-pattern]').value;
+          const arrow = pattern.indexOf('->');
+          if (arrow < 0) throw new Error('表达式里要有一个 ->');
+          const lhsSrc = pattern.slice(0, arrow);
+          const rhsSrc = pattern.slice(arrow + 2);
+
+          const sizes = new Map<string, number>();
+
+          // rearrange 允许先手工指定某些维度大小
+          if (curMode === 'rearrange') {
+            for (const kv of $<HTMLInputElement>('[data-kw]').value.split(',')) {
+              const t = kv.trim();
+              if (!t) continue;
+              const m = /^([A-Za-z_]\w*)\s*=\s*(\d+)$/.exec(t);
+              if (!m) throw new Error(`「${t}」写法不对，应该像 heads=2`);
+              sizes.set(m[1], parseInt(m[2], 10));
+            }
+          }
+
+          const lhsParts = lhsSrc.split(',').map(parseAxes);
+          if (lhsParts.length !== shapes.length)
+            throw new Error(`表达式左边有 ${lhsParts.length} 个张量，但只给了 ${shapes.length} 个形状`);
+          if (curMode !== 'einsum' && lhsParts.length !== 1)
+            throw new Error(`${curMode} 只接受一个输入张量`);
+
+          let ellCount = 0;
+          const flatIn: string[][] = [];
+          lhsParts.forEach((items, i) => {
+            const nonEll = items.filter((it) => it.kind !== 'ell').length;
+            if (items.some((it) => it.kind === 'ell'))
+              ellCount = Math.max(ellCount, shapes[i].length - nonEll);
+            flatIn.push(bindAxes(items, shapes[i], sizes));
+          });
+
+          const rhs = parseAxes(rhsSrc);
+          const oshape = outShape(rhs, sizes, ellCount);
+          const outNames = new Set(flatNames(rhs, ellCount));
+          const allIn = new Set(flatIn.flat());
+          const gone = [...allIn].filter((n) => !outNames.has(n));
+
+          const tbl = document.createElement('table');
+          const tb = document.createElement('tbody');
+          tbl.append(tb);
+          const row = (k: string, v: string, cls = '') => {
+            const tr = document.createElement('tr');
+            if (cls) tr.className = cls;
+            const a = document.createElement('td');
+            a.className = 'k';
+            a.textContent = k;
+            const b = document.createElement('td');
+            b.className = 'v';
+            b.textContent = v;
+            tr.append(a, b);
+            tb.append(tr);
+          };
+
+          shapes.forEach((s, i) => {
+            row(
+              shapes.length > 1 ? `输入 ${i + 1}` : '输入',
+              `${fmtShape(s)}　→　${flatIn[i].join(' ')}`,
+            );
+          });
+          row('各维度大小', [...sizes.entries()].map(([k, v]) => `${k}=${v}`).join('  '));
+          row('输出形状', fmtShape(oshape), 'hi');
+
+          const verb = curMode === 'reduce' ? $<HTMLSelectElement>('[data-op]').value : '求和';
+          row(
+            gone.length ? `被${curMode === 'reduce' ? '' : '求和'}掉的维度` : '被消掉的维度',
+            gone.length ? gone.join(', ') + (curMode === 'reduce' ? `（用 ${verb}）` : '') : '（没有）',
+          );
+
+          // 下标公式
+          const idx = (names: string[]) => (names.length ? `[${names.join(', ')}]` : '');
+          const outIdx = idx(flatNames(rhs, ellCount));
+          if (curMode === 'einsum') {
+            const prod = flatIn.map((n, i) => `x${i + 1}${idx(n)}`).join(' · ');
+            row(
+              '下标公式',
+              gone.length ? `y${outIdx} = Σ over ${gone.join(', ')} of ${prod}` : `y${outIdx} = ${prod}`,
+            );
+            let total = 1;
+            for (const v of sizes.values()) total *= v;
+            const flops = flatIn.length > 1 ? 2 * total : total;
+            row(
+              '运算量　2 × 所有维度大小的乘积',
+              `${flops.toLocaleString('en-US')} FLOPs`,
+            );
+          } else if (curMode === 'reduce') {
+            row(
+              '下标公式',
+              gone.length
+                ? `y${outIdx} = ${verb} over ${gone.join(', ')} of x${idx(flatIn[0])}`
+                : `y${outIdx} = x${idx(flatIn[0])}`,
+            );
+          } else {
+            row('下标公式', `y${outIdx} = x${idx(flatIn[0])}　（只是搬家，不做算术）`);
+            const a = shapes[0].reduce((x, y) => x * y, 1);
+            const b = oshape.reduce((x, y) => x * y, 1);
+            if (a !== b) throw new Error(`元素个数对不上：输入 ${a} 个，输出 ${b} 个`);
+            row('元素总数', `${a} 个（前后必须相等）`);
+          }
+
+          box.append(tbl);
+          if (!dirty && curOld) {
+            const p = document.createElement('p');
+            p.className = 'old';
+            p.innerHTML = `传统 PyTorch 写法：<code>${curOld}</code>`;
+            box.append(p);
+          }
+        } catch (e) {
+          const d = document.createElement('div');
+          d.className = 'err';
+          d.textContent = (e as Error).message;
+          box.append(d);
+        }
+      }
+
+      sel.addEventListener('change', loadPreset);
+      root.querySelectorAll<HTMLElement>('.fields input, .fields select').forEach((el) => {
+        el.addEventListener('input', () => {
+          dirty = true;
+          run();
+        });
+      });
+
+      sel.value = '0';
+      loadPreset();
+    });
+  }
+
+  setupL02Einops();
+  document.addEventListener('astro:page-load', setupL02Einops);
+</script>

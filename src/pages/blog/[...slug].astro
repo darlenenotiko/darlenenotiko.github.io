@@ -13,7 +13,7 @@ const { post } = Astro.props;
 const { Content, headings } = await render(post);
 
 const fmt = (d: Date) =>
-  d.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' });
+  d.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' });
 ---
 
 <BaseLayout title={post.data.title} description={post.data.description}>

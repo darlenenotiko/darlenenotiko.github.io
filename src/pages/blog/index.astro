@@ -8,7 +8,7 @@ const posts = (await getCollection('blog', ({ data }) => !data.draft)).sort(
 
 const tags = [...new Set(posts.flatMap((p) => p.data.tags))].sort();
 const fmt = (d: Date) =>
-  d.toLocaleDateString('zh-CN', { year: 'numeric', month: 'short', day: 'numeric' });
+  d.toLocaleDateString('zh-CN', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' });
 ---
 
 <BaseLayout title="博客" description="文章与笔记">

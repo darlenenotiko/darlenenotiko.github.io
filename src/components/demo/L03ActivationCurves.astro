@@ -1,0 +1,341 @@
+---
+// CS336 第 3 讲：激活函数对比。
+// 上半：ReLU / GeLU / Swish(β 可调) / 平方 ReLU 的曲线叠在一张图上，
+//       可以看清「GeLU 只是在零点左边多了一个小坑」这句话到底指什么。
+// 下半：门控（GLU）把 FFN 从 2 个矩阵变成 3 个，为什么要把 d_ff 乘 2/3 才能配平参数量。
+---
+
+<div class="demo" data-demo="l03-act">
+  <div class="row">
+    <label class="chk"><input type="checkbox" data-fn="relu" checked /> ReLU</label>
+    <label class="chk"><input type="checkbox" data-fn="gelu" checked /> GeLU</label>
+    <label class="chk"><input type="checkbox" data-fn="swish" checked /> Swish / SiLU</label>
+    <label class="chk"><input type="checkbox" data-fn="relu2" /> 平方 ReLU</label>
+    <label class="chk"><input type="checkbox" data-zoom /> 放大零点附近</label>
+  </div>
+
+  <div class="row">
+    <label class="sld">
+      Swish 的 β = <span data-beta-val>1.00</span>
+      <input type="range" data-beta min="0.2" max="6" step="0.1" value="1" />
+    </label>
+    <span class="note">β → ∞ 时 Swish 会退化成 ReLU；β = 1 就是各家在用的 SiLU。</span>
+  </div>
+
+  <canvas data-canvas width="720" height="380"></canvas>
+
+  <table class="vals">
+    <thead>
+      <tr><th>x</th><th>ReLU</th><th>GeLU</th><th>Swish(β)</th></tr>
+    </thead>
+    <tbody data-vals></tbody>
+  </table>
+
+  <hr />
+
+  <h4>门控为什么要把 d_ff 乘 2/3</h4>
+  <div class="row">
+    <label class="sld">
+      d_model = <span data-dm-val>4096</span>
+      <input type="range" data-dm min="512" max="8192" step="256" value="4096" />
+    </label>
+  </div>
+  <table class="params">
+    <thead>
+      <tr><th>FFN 形式</th><th>矩阵个数</th><th>d_ff</th><th>参数量</th></tr>
+    </thead>
+    <tbody data-params></tbody>
+  </table>
+  <p class="note" data-param-note></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1.1rem;
+    margin-bottom: 0.7rem;
+  }
+  .chk,
+  .sld {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.83rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .chk input {
+    accent-color: var(--indigo);
+  }
+  .sld input[type='range'] {
+    width: 150px;
+    accent-color: var(--indigo);
+  }
+  .note {
+    font-size: 0.79rem;
+    color: var(--ink-faint);
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  hr {
+    margin: 1.4rem 0 1rem;
+    border: none;
+    border-top: 1px solid var(--rule);
+  }
+  h4 {
+    margin: 0 0 0.7rem;
+    font-size: 0.82rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+  table {
+    width: 100%;
+    margin-top: 0.9rem;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+  }
+  table :global(th) {
+    padding: 0.25rem 0.4rem;
+    text-align: left;
+    font-weight: 700;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+  }
+  table :global(td) {
+    padding: 0.22rem 0.4rem;
+    color: var(--ink-muted);
+    border-bottom: 1px solid var(--rule);
+    font-family: var(--font-mono);
+  }
+  table :global(td.name) {
+    font-family: inherit;
+  }
+  p.note {
+    margin: 0.7rem 0 0;
+    line-height: 1.7;
+  }
+</style>
+
+<script>
+  function setupL03Act() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l03-act"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const cv = $<HTMLCanvasElement>('[data-canvas]');
+      const ctx = cv.getContext('2d')!;
+
+      // 误差函数近似（Abramowitz & Stegun 7.1.26），精度约 1e-7，画图足够
+      function erf(x: number) {
+        const s = x < 0 ? -1 : 1;
+        const a = Math.abs(x);
+        const t = 1 / (1 + 0.3275911 * a);
+        const y =
+          1 -
+          ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t +
+            0.254829592) *
+            t *
+            Math.exp(-a * a);
+        return s * y;
+      }
+      const relu = (x: number) => Math.max(0, x);
+      const relu2 = (x: number) => (x > 0 ? x * x : 0);
+      const gelu = (x: number) => x * 0.5 * (1 + erf(x / Math.SQRT2));
+      const swish = (x: number, b: number) => x / (1 + Math.exp(-b * x));
+
+      function css(name: string) {
+        return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+      }
+
+      function draw() {
+        const beta = parseFloat($<HTMLInputElement>('[data-beta]').value);
+        const zoom = $<HTMLInputElement>('[data-zoom]').checked;
+        const on = (k: string) =>
+          root.querySelector<HTMLInputElement>(`[data-fn="${k}"]`)!.checked;
+
+        const W = cv.width;
+        const H = cv.height;
+        const pad = 34;
+        const xMin = zoom ? -3 : -5;
+        const xMax = zoom ? 2 : 5;
+        const yMin = zoom ? -0.5 : -1;
+        const yMax = zoom ? 2 : 5;
+
+        const px = (x: number) => pad + ((x - xMin) / (xMax - xMin)) * (W - 2 * pad);
+        const py = (y: number) => H - pad - ((y - yMin) / (yMax - yMin)) * (H - 2 * pad);
+
+        const ink = css('--ink');
+        const faint = css('--ink-faint');
+        const rule = css('--rule');
+        const indigo = css('--indigo');
+        const madder = css('--madder');
+        const weld = css('--weld');
+
+        ctx.clearRect(0, 0, W, H);
+
+        // 网格
+        ctx.strokeStyle = rule;
+        ctx.lineWidth = 1;
+        ctx.font = '11px system-ui, sans-serif';
+        ctx.fillStyle = faint;
+        for (let x = Math.ceil(xMin); x <= xMax; x++) {
+          ctx.beginPath();
+          ctx.moveTo(px(x), pad);
+          ctx.lineTo(px(x), H - pad);
+          ctx.stroke();
+          ctx.textAlign = 'center';
+          ctx.fillText(String(x), px(x), H - pad + 14);
+        }
+        for (let y = Math.ceil(yMin); y <= yMax; y++) {
+          ctx.beginPath();
+          ctx.moveTo(pad, py(y));
+          ctx.lineTo(W - pad, py(y));
+          ctx.stroke();
+          ctx.textAlign = 'right';
+          ctx.fillText(String(y), pad - 6, py(y) + 4);
+        }
+        // 坐标轴
+        ctx.strokeStyle = faint;
+        ctx.beginPath();
+        ctx.moveTo(px(xMin), py(0));
+        ctx.lineTo(px(xMax), py(0));
+        ctx.moveTo(px(0), py(yMin));
+        ctx.lineTo(px(0), py(yMax));
+        ctx.stroke();
+
+        const curves: [boolean, (x: number) => number, string, string][] = [
+          [on('relu'), relu, indigo, 'ReLU'],
+          [on('gelu'), gelu, madder, 'GeLU'],
+          [on('swish'), (x) => swish(x, beta), weld, `Swish β=${beta.toFixed(1)}`],
+          [on('relu2'), relu2, ink, '平方 ReLU'],
+        ];
+
+        ctx.lineWidth = 2;
+        let legendY = pad + 4;
+        for (const [show, f, color, label] of curves) {
+          if (!show) continue;
+          ctx.strokeStyle = color;
+          ctx.beginPath();
+          for (let i = 0; i <= 600; i++) {
+            const x = xMin + ((xMax - xMin) * i) / 600;
+            const y = f(x);
+            const X = px(x);
+            const Y = py(Math.max(yMin - 1, Math.min(yMax + 1, y)));
+            i === 0 ? ctx.moveTo(X, Y) : ctx.lineTo(X, Y);
+          }
+          ctx.stroke();
+          // 图例
+          ctx.fillStyle = color;
+          ctx.fillRect(W - pad - 110, legendY, 16, 3);
+          ctx.textAlign = 'left';
+          ctx.font = '12px system-ui, sans-serif';
+          ctx.fillText(label, W - pad - 88, legendY + 5);
+          legendY += 18;
+        }
+
+        // 数值表
+        const tb = $('[data-vals]');
+        tb.replaceChildren();
+        for (const x of [-3, -2, -1, -0.5, 0, 0.5, 1, 2]) {
+          const tr = document.createElement('tr');
+          for (const v of [
+            x.toFixed(1),
+            relu(x).toFixed(4),
+            gelu(x).toFixed(4),
+            swish(x, beta).toFixed(4),
+          ]) {
+            const td = document.createElement('td');
+            td.textContent = v;
+            tr.append(td);
+          }
+          tb.append(tr);
+        }
+      }
+
+      function drawParams() {
+        const dm = parseInt($<HTMLInputElement>('[data-dm]').value, 10);
+        $('[data-dm-val]').textContent = String(dm);
+        const rows: [string, string, number, number][] = [
+          ['ReLU / GeLU（2 个矩阵 W1, W2）', '2', 4 * dm, 2 * dm * (4 * dm)],
+          [
+            '门控但不缩（3 个矩阵 W1, V, W2）',
+            '3',
+            4 * dm,
+            3 * dm * (4 * dm),
+          ],
+          [
+            'SwiGLU 标准做法（d_ff 乘 2/3）',
+            '3',
+            Math.round((8 / 3) * dm),
+            3 * dm * Math.round((8 / 3) * dm),
+          ],
+        ];
+        const tb = $('[data-params]');
+        tb.replaceChildren();
+        for (const [name, k, dff, p] of rows) {
+          const tr = document.createElement('tr');
+          const c0 = document.createElement('td');
+          c0.className = 'name';
+          c0.textContent = name;
+          const c1 = document.createElement('td');
+          c1.textContent = k;
+          const c2 = document.createElement('td');
+          c2.textContent = String(dff);
+          const c3 = document.createElement('td');
+          c3.textContent = p.toLocaleString('en-US');
+          tr.append(c0, c1, c2, c3);
+          tb.append(tr);
+        }
+        const base = 2 * dm * (4 * dm);
+        const glu = 3 * dm * Math.round((8 / 3) * dm);
+        $('[data-param-note]').textContent =
+          `第一行和第三行相差 ${(((glu - base) / base) * 100).toFixed(3)}%（只是 8/3 取整的零头）——` +
+          ` 这就是「乘 2/3」的全部用意：多了一个矩阵 V，就把每个矩阵瘦一点，让总参数量保持不变，` +
+          `这样和非门控版本的比较才是公平的。`;
+      }
+
+      function all() {
+        draw();
+        drawParams();
+      }
+
+      root.querySelectorAll('input').forEach((el) =>
+        el.addEventListener('input', () => {
+          $('[data-beta-val]').textContent = parseFloat(
+            $<HTMLInputElement>('[data-beta]').value,
+          ).toFixed(2);
+          all();
+        }),
+      );
+
+      // 深色模式切换后重画（canvas 颜色是读出来的，不会自动跟着变）
+      new MutationObserver(draw).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-theme'],
+      });
+
+      all();
+    });
+  }
+
+  setupL03Act();
+  document.addEventListener('astro:page-load', setupL03Act);
+</script>

@@ -1,0 +1,425 @@
+---
+// 第 4 讲演示 2：top-k 路由与专家坍缩。
+// 模拟「富者愈富」的正反馈：被选中的专家路由权重上升 -> 更容易被选中。
+// 打开负载均衡损失后，热门专家按其占比被压制，两个动力学互相抵消。
+---
+
+<div class="demo" data-demo="l04-router">
+  <div class="knobs">
+    <label>
+      <span>专家数 N = <code data-out="N"></code></span>
+      <input type="range" data-k="N" min="4" max="16" step="1" value="8" />
+    </label>
+    <label>
+      <span>每个 token 选 top-k = <code data-out="K"></code></span>
+      <input type="range" data-k="K" min="1" max="4" step="1" value="1" />
+    </label>
+    <div class="sw">
+      <label class="chk">
+        <input type="checkbox" data-lbl checked />
+        <span>加负载均衡损失（系数 <code data-out="alpha"></code>）</span>
+      </label>
+      <input type="range" data-k="alpha" min="0" max="20" step="1" value="8" />
+    </div>
+  </div>
+
+  <div class="ctrl">
+    <button data-step>训练 1 步 →</button>
+    <button data-run>连续训练</button>
+    <button data-reset class="ghost">重置</button>
+    <span class="tally" data-tally></span>
+  </div>
+
+  <div class="block">
+    <h4>本步各专家分到的 token 比例（虚线是理想的 1/N）</h4>
+    <div class="bars" data-bars></div>
+  </div>
+
+  <div class="block">
+    <h4>历史：每个专家分到的 token 比例随训练步数的变化</h4>
+    <canvas data-canvas height="200"></canvas>
+  </div>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+
+  .knobs {
+    display: grid;
+    gap: 0.7rem;
+  }
+  @media (min-width: 640px) {
+    .knobs {
+      grid-template-columns: 1fr 1fr 1.4fr;
+    }
+  }
+  .knobs label {
+    display: block;
+    font-size: 0.78rem;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+  }
+  .knobs label > span {
+    display: block;
+    margin-bottom: 0.25rem;
+  }
+  .knobs code {
+    font-family: var(--font-mono);
+    color: var(--indigo);
+    font-size: 0.85rem;
+  }
+  .knobs input[type='range'] {
+    width: 100%;
+    accent-color: var(--indigo);
+  }
+  .knobs .sw {
+    font-size: 0.78rem;
+    color: var(--ink-faint);
+  }
+  .knobs .sw .chk {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    cursor: pointer;
+  }
+  .knobs .sw .chk > span {
+    margin-bottom: 0;
+  }
+  .knobs input[type='checkbox'] {
+    accent-color: var(--madder);
+  }
+
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 1rem 0 0.2rem;
+  }
+  .ctrl button {
+    padding: 0.32rem 0.75rem;
+    font: inherit;
+    font-size: 0.83rem;
+    color: var(--bg);
+    background: var(--indigo);
+    border: 1px solid var(--indigo);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: opacity 0.2s var(--ease);
+  }
+  .ctrl button:hover {
+    opacity: 0.85;
+  }
+  .ctrl button.ghost {
+    color: var(--ink-muted);
+    background: transparent;
+    border-color: var(--rule);
+  }
+  .tally {
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .block {
+    margin-top: 1.1rem;
+  }
+  .block h4 {
+    margin: 0 0 0.5rem;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+
+  .bars {
+    display: grid;
+    gap: 3px;
+    padding: 0.55rem 0.6rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 7px;
+  }
+  .bars :global(.row) {
+    display: grid;
+    grid-template-columns: 3.6rem 1fr 3.4rem;
+    align-items: center;
+    gap: 0.5rem;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--ink-muted);
+  }
+  .bars :global(.track) {
+    position: relative;
+    height: 12px;
+    background: color-mix(in srgb, var(--rule) 60%, transparent);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .bars :global(.fill) {
+    position: absolute;
+    inset: 0 auto 0 0;
+    background: var(--indigo);
+    transition: width 0.25s var(--ease), background 0.25s var(--ease);
+  }
+  .bars :global(.fill.hot) {
+    background: var(--madder);
+  }
+  .bars :global(.fill.cold) {
+    background: color-mix(in srgb, var(--ink-faint) 45%, transparent);
+  }
+  .bars :global(.pct) {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  canvas {
+    display: block;
+    width: 100%;
+    height: 200px;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 7px;
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(b) {
+    color: var(--ink);
+  }
+  .verdict :global(.warn) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL04Router() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l04-router"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const canvas = $<HTMLCanvasElement>('[data-canvas]');
+      const cx = canvas.getContext('2d')!;
+      const css = (n: string) => getComputedStyle(root).getPropertyValue(n).trim() || '#888';
+      const num = (k: string) => Number($<HTMLInputElement>(`[data-k="${k}"]`).value);
+
+      const T = 512; // 每步喂 512 个 token
+      let N = 8,
+        K = 1;
+      let bias: number[] = []; // 路由器学到的每专家偏好（就是那个内积打分里专家向量的强度）
+      let hist: number[][] = []; // 历史：每步各专家的 token 占比
+      let step = 0;
+      let timer: number | undefined;
+
+      // 简单的确定性伪随机，保证「重置」后行为可复现
+      let seed = 12345;
+      const rnd = () => {
+        seed = (seed * 1664525 + 1013904223) % 4294967296;
+        return seed / 4294967296;
+      };
+      // 标准正态（Box–Muller）
+      const gauss = () => {
+        const u = Math.max(rnd(), 1e-9);
+        return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rnd());
+      };
+
+      function reset() {
+        clearInterval(timer);
+        timer = undefined;
+        seed = 12345;
+        N = num('N');
+        K = Math.min(num('K'), N);
+        // 初始偏好几乎相同，只有极小的随机差异 —— 坍缩完全是被训练动力学放大出来的
+        bias = Array.from({ length: N }, () => gauss() * 0.01);
+        hist = [];
+        step = 0;
+        render();
+      }
+
+      function trainStep() {
+        const lbl = $<HTMLInputElement>('[data-lbl]').checked;
+        const alpha = num('alpha') / 100;
+
+        const count = new Array(N).fill(0); // 硬计数：每个专家收到多少 token
+        const mass = new Array(N).fill(0); // 软质量：路由器给每个专家的 softmax 概率和
+
+        for (let t = 0; t < T; t++) {
+          // 每个 token 对每个专家有一点内在亲和度（随机），加上路由器学到的偏好
+          const logit = new Array(N);
+          for (let i = 0; i < N; i++) logit[i] = gauss() + bias[i];
+
+          // softmax
+          const m = Math.max(...logit);
+          let z = 0;
+          const p = new Array(N);
+          for (let i = 0; i < N; i++) {
+            p[i] = Math.exp(logit[i] - m);
+            z += p[i];
+          }
+          for (let i = 0; i < N; i++) {
+            p[i] /= z;
+            mass[i] += p[i] / T;
+          }
+
+          // top-k 选择
+          const order = [...logit.keys()].sort((a, b) => logit[b] - logit[a]);
+          for (let j = 0; j < K; j++) count[order[j]] += 1 / T;
+        }
+
+        // f_i：分到专家 i 的 token 占比（这里按「每 token 选 K 个」归一化到和为 1）
+        const f = count.map((c) => c / K);
+
+        for (let i = 0; i < N; i++) {
+          // ① 富者愈富：被选中越多，反向传播越强化这个专家的路由权重
+          bias[i] += 0.6 * f[i];
+          // ② 负载均衡损失的梯度：正比于 f_i，把热门专家的概率质量压下去
+          if (lbl) bias[i] -= alpha * N * f[i] * mass[i] * N;
+        }
+        // 只有相对大小有意义，减去均值防止整体漂移
+        const mean = bias.reduce((a, b) => a + b, 0) / N;
+        for (let i = 0; i < N; i++) bias[i] -= mean;
+
+        hist.push(f);
+        if (hist.length > 240) hist.shift();
+        step++;
+        render();
+      }
+
+      function render() {
+        const f = hist.length ? hist[hist.length - 1] : new Array(N).fill(1 / N);
+        $('[data-out="N"]').textContent = String(N);
+        $('[data-out="K"]').textContent = String(K);
+        $('[data-out="alpha"]').textContent = (num('alpha') / 100).toFixed(2);
+        $('[data-tally]').textContent = `已训练 ${step} 步`;
+
+        const ideal = 1 / N;
+        const max = Math.max(...f, ideal * 1.2);
+        $('[data-bars]').innerHTML = f
+          .map((v, i) => {
+            const cls = v > ideal * 2 ? 'hot' : v < ideal * 0.25 ? 'cold' : '';
+            return (
+              `<div class="row"><span>专家 ${i}</span>` +
+              `<span class="track"><span class="fill ${cls}" style="width:${(v / max) * 100}%"></span></span>` +
+              `<span class="pct">${(v * 100).toFixed(1)}%</span></div>`
+            );
+          })
+          .join('');
+
+        // 有效专家数（熵的指数）：全部均匀时等于 N，全塞给一个时等于 1
+        const H = -f.reduce((a, v) => a + (v > 1e-9 ? v * Math.log(v) : 0), 0);
+        const eff = Math.exp(H);
+        const dead = f.filter((v) => v < ideal * 0.05).length;
+        const lbl = $<HTMLInputElement>('[data-lbl]').checked;
+        $('[data-verdict]').innerHTML =
+          `<b>有效专家数 ${eff.toFixed(2)} / ${N}</b>（把各专家占比的熵取指数：均匀时等于 N，全挤在一个专家上时等于 1）。` +
+          (dead > 0
+            ? ` <span class="warn">有 ${dead} 个专家几乎收不到 token —— 它们的参数在白白浪费。</span>`
+            : ' 所有专家都在干活。') +
+          (lbl
+            ? ' 现在开着负载均衡损失：「有用就强化」的正反馈被「热门就压制」的负反馈抵消掉了。'
+            : ' 现在关着负载均衡损失：可以看到「富者愈富」把 token 全吸到少数几个专家上。');
+
+        drawHist();
+      }
+
+      function drawHist() {
+        const dpr = window.devicePixelRatio || 1;
+        const w = canvas.clientWidth,
+          h = 200;
+        canvas.width = w * dpr;
+        canvas.height = h * dpr;
+        cx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        cx.clearRect(0, 0, w, h);
+
+        const pad = { l: 34, r: 8, t: 10, b: 20 };
+        const x0 = pad.l,
+          x1 = w - pad.r,
+          y0 = h - pad.b,
+          y1 = pad.t;
+        const yMax = 1;
+
+        cx.strokeStyle = css('--rule');
+        cx.fillStyle = css('--ink-faint');
+        cx.font = '10px ui-monospace, monospace';
+        cx.textAlign = 'right';
+        cx.lineWidth = 1;
+        for (const v of [0, 0.25, 0.5, 0.75, 1]) {
+          const y = y0 - (v / yMax) * (y0 - y1);
+          cx.beginPath();
+          cx.moveTo(x0, y);
+          cx.lineTo(x1, y);
+          cx.stroke();
+          cx.fillText((v * 100).toFixed(0) + '%', x0 - 5, y + 3);
+        }
+
+        // 理想线 1/N
+        const yi = y0 - (1 / N) * (y0 - y1);
+        cx.strokeStyle = css('--ink-faint');
+        cx.setLineDash([4, 4]);
+        cx.beginPath();
+        cx.moveTo(x0, yi);
+        cx.lineTo(x1, yi);
+        cx.stroke();
+        cx.setLineDash([]);
+
+        if (hist.length < 2) return;
+        const span = Math.max(hist.length, 60);
+        const colors = [css('--indigo'), css('--madder'), css('--weld'), css('--indigo-soft')];
+        for (let i = 0; i < N; i++) {
+          cx.strokeStyle = colors[i % colors.length];
+          cx.globalAlpha = 0.85;
+          cx.lineWidth = 1.6;
+          cx.beginPath();
+          hist.forEach((f, s) => {
+            const x = x0 + (s / (span - 1)) * (x1 - x0);
+            const y = y0 - (f[i] / yMax) * (y0 - y1);
+            s === 0 ? cx.moveTo(x, y) : cx.lineTo(x, y);
+          });
+          cx.stroke();
+        }
+        cx.globalAlpha = 1;
+      }
+
+      $('[data-step]').addEventListener('click', trainStep);
+      $('[data-run]').addEventListener('click', () => {
+        if (timer) {
+          clearInterval(timer);
+          timer = undefined;
+          $('[data-run]').textContent = '连续训练';
+        } else {
+          timer = window.setInterval(trainStep, 90);
+          $('[data-run]').textContent = '暂停';
+        }
+      });
+      $('[data-reset]').addEventListener('click', reset);
+      root
+        .querySelectorAll<HTMLInputElement>('[data-k="N"], [data-k="K"]')
+        .forEach((el) => el.addEventListener('input', reset));
+      $('[data-lbl]').addEventListener('change', render);
+      $<HTMLInputElement>('[data-k="alpha"]').addEventListener('input', render);
+      window.addEventListener('resize', drawHist);
+      new MutationObserver(drawHist).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-theme'],
+      });
+
+      reset();
+    });
+  }
+
+  setupL04Router();
+  document.addEventListener('astro:page-load', setupL04Router);
+</script>

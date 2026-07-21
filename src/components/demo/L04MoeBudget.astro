@@ -1,0 +1,380 @@
+---
+// 第 4 讲演示 3：MoE 的参数预算。
+// 把「总参数」和「激活参数」拆成骨干（注意力 + 词嵌入）+ 专家池，
+// 让人直接看到「参数涨多少、FLOPs 不涨」这件事到底是怎么算出来的。
+// 四个预设的骨干参数是按各自公开配置手算好的，所以总参数 / 激活参数能对上官方数字。
+---
+
+<div class="demo" data-demo="l04-budget">
+  <div class="presets">
+    <span class="plabel">预设：</span>
+    <button data-p="mixtral">Mixtral 8x7B</button>
+    <button data-p="qwen">Qwen1.5-MoE-A2.7B</button>
+    <button data-p="olmoe">OLMoE-1B-7B</button>
+    <button data-p="dsv3">DeepSeek-V3</button>
+    <button data-p="dense">稠密对照</button>
+    <span class="official" data-official></span>
+  </div>
+
+  <div class="knobs">
+    <label>模型维度 d_model<input type="number" data-k="d" value="4096" min="64" step="64" /></label>
+    <label>每专家中间维 d_ff<input type="number" data-k="dff" value="14336" min="64" step="64" /></label>
+    <label>MoE 层数<input type="number" data-k="L" value="32" min="1" /></label>
+    <label>路由专家数<input type="number" data-k="nr" value="8" min="0" /></label>
+    <label>共享专家数<input type="number" data-k="ns" value="0" min="0" /></label>
+    <label>激活的路由专家 top-k<input type="number" data-k="k" value="2" min="0" /></label>
+    <label>骨干参数（十亿）<input type="number" data-k="bb" value="1.604" min="0" step="0.01" /></label>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="ct">总参数量</div>
+      <div class="cv" data-out="total"></div>
+      <div class="cs" data-out="total-sub"></div>
+    </div>
+    <div class="card hot">
+      <div class="ct">激活参数量（决定 FLOPs）</div>
+      <div class="cv" data-out="active"></div>
+      <div class="cs" data-out="active-sub"></div>
+    </div>
+    <div class="card">
+      <div class="ct">稀疏度（激活 ÷ 总）</div>
+      <div class="cv" data-out="ratio"></div>
+      <div class="cs" data-out="ratio-sub"></div>
+    </div>
+  </div>
+
+  <div class="block">
+    <h4>参数都在哪（横条按参数量等比）</h4>
+    <div class="stack" data-stack></div>
+    <div class="legend">
+      <span class="sw a"></span>骨干：注意力 + 词嵌入（每个 token 都要走）
+      <span class="sw b"></span>共享专家（每个 token 都要走）
+      <span class="sw c"></span>被激活的路由专家
+      <span class="sw d"></span>没被激活的路由专家（占参数，不花 FLOPs）
+    </div>
+  </div>
+
+  <div class="block">
+    <h4>逐步核算</h4>
+    <div class="calc" data-calc></div>
+  </div>
+
+  <p class="note">
+    「骨干参数」= 注意力 + 词嵌入（DeepSeek-V3 那一档还包含它开头 3 个稠密层）。
+    四个预设的骨干值是按各自公开配置手算好填进去的，所以算出来的总参数和激活参数
+    能和官方公布的数字对上。<b>你自己改配置时它不会自动跟着变</b> ——
+    这个演示要展示的是专家池那部分怎么算，骨干只是一个加数。
+  </p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+
+  .presets {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem;
+    margin-bottom: 0.9rem;
+  }
+  .plabel {
+    font-size: 0.78rem;
+    color: var(--ink-faint);
+    letter-spacing: 0.05em;
+  }
+  .presets button {
+    padding: 0.25rem 0.6rem;
+    font: inherit;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    background: transparent;
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .presets button:hover,
+  .presets button.on {
+    color: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .official {
+    font-size: 0.75rem;
+    color: var(--weld);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .knobs {
+    display: grid;
+    gap: 0.55rem;
+    grid-template-columns: 1fr 1fr;
+  }
+  @media (min-width: 640px) {
+    .knobs {
+      grid-template-columns: repeat(4, 1fr);
+    }
+  }
+  .knobs label {
+    display: block;
+    font-size: 0.74rem;
+    letter-spacing: 0.03em;
+    color: var(--ink-faint);
+  }
+  .knobs input {
+    display: block;
+    width: 100%;
+    margin-top: 0.22rem;
+    padding: 0.32rem 0.45rem;
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: 0.83rem;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+  }
+  .knobs input:focus {
+    outline: none;
+    border-color: var(--indigo);
+  }
+
+  .grid {
+    display: grid;
+    gap: 0.6rem;
+    margin-top: 1.1rem;
+    grid-template-columns: 1fr;
+  }
+  @media (min-width: 560px) {
+    .grid {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  }
+  .card {
+    padding: 0.6rem 0.75rem 0.7rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 7px;
+  }
+  .card.hot {
+    border-color: color-mix(in srgb, var(--madder) 45%, var(--rule));
+  }
+  .ct {
+    font-size: 0.72rem;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+  .cv {
+    margin-top: 0.2rem;
+    font-family: var(--font-mono);
+    font-size: 1.15rem;
+    color: var(--indigo);
+    font-variant-numeric: tabular-nums;
+  }
+  .card.hot .cv {
+    color: var(--madder);
+  }
+  .cs {
+    margin-top: 0.15rem;
+    font-size: 0.73rem;
+    color: var(--ink-muted);
+  }
+
+  .block {
+    margin-top: 1.2rem;
+  }
+  .block h4 {
+    margin: 0 0 0.5rem;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+
+  .stack {
+    display: flex;
+    height: 26px;
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    overflow: hidden;
+    background: var(--bg-raised);
+  }
+  .stack :global(span) {
+    display: block;
+    height: 100%;
+    transition: width 0.25s var(--ease);
+  }
+  .stack :global(.a) {
+    background: var(--indigo);
+  }
+  .stack :global(.b) {
+    background: var(--weld);
+  }
+  .stack :global(.c) {
+    background: var(--madder);
+  }
+  .stack :global(.d) {
+    background: color-mix(in srgb, var(--ink-faint) 30%, transparent);
+  }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.3rem 0.9rem;
+    align-items: center;
+    margin-top: 0.5rem;
+    font-size: 0.75rem;
+    color: var(--ink-muted);
+  }
+  .sw {
+    display: inline-block;
+    width: 14px;
+    height: 10px;
+    border-radius: 2px;
+  }
+  .sw.a {
+    background: var(--indigo);
+  }
+  .sw.b {
+    background: var(--weld);
+  }
+  .sw.c {
+    background: var(--madder);
+  }
+  .sw.d {
+    background: color-mix(in srgb, var(--ink-faint) 30%, transparent);
+  }
+
+  .calc :global(div) {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.95;
+    color: var(--ink-muted);
+    overflow-wrap: anywhere;
+  }
+  .calc :global(b) {
+    color: var(--ink);
+  }
+
+  .note {
+    margin: 1rem 0 0;
+    font-size: 0.78rem;
+    line-height: 1.7;
+    color: var(--ink-faint);
+  }
+  .note b {
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupL04Budget() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l04-budget"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const g = (k: string) => Number($<HTMLInputElement>(`[data-k="${k}"]`).value) || 0;
+      const set = (k: string, v: number) => {
+        $<HTMLInputElement>(`[data-k="${k}"]`).value = String(v);
+      };
+
+      const B = (x: number) =>
+        x >= 1e9 ? (x / 1e9).toFixed(2) + ' B' : (x / 1e6).toFixed(1) + ' M';
+
+      // d_model / d_ff / MoE 层数 / 路由专家 / 共享专家 / top-k / 骨干（十亿）
+      const presets: Record<string, { v: number[]; note: string }> = {
+        mixtral: { v: [4096, 14336, 32, 8, 0, 2, 1.604], note: '官方：46.7B 总 / 12.9B 激活' },
+        qwen: { v: [2048, 1408, 24, 60, 4, 4, 1.023], note: '官方：14.3B 总 / 2.7B 激活' },
+        olmoe: { v: [2048, 1024, 16, 64, 0, 8, 0.475], note: '官方：6.9B 总 / 1.3B 激活' },
+        dsv3: {
+          v: [7168, 2048, 58, 256, 1, 8, 14.46],
+          note: '官方：671B 总 / 37B 激活（另有开头 3 个稠密层，已并入骨干）',
+        },
+        dense: { v: [4096, 14336, 32, 1, 0, 1, 1.604], note: '把专家数设成 1 就退化成稠密模型' },
+      };
+
+      function calc() {
+        const d = g('d'),
+          dff = g('dff'),
+          L = g('L'),
+          nr = g('nr'),
+          ns = g('ns');
+        const k = Math.min(g('k'), nr);
+        const backbone = g('bb') * 1e9;
+
+        // 一个专家：SwiGLU 有三个 d_model × d_ff 的矩阵（gate / up / down）
+        const E = 3 * d * dff;
+        const sharedP = L * ns * E;
+        const routedAll = L * nr * E;
+        const routedAct = L * k * E;
+
+        const total = backbone + sharedP + routedAll;
+        const active = backbone + sharedP + routedAct;
+
+        $('[data-out="total"]').textContent = B(total);
+        $('[data-out="total-sub"]').textContent =
+          `骨干 ${B(backbone)} + 专家池 ${B(sharedP + routedAll)}`;
+        $('[data-out="active"]').textContent = B(active);
+        $('[data-out="active-sub"]').textContent =
+          `每个 token 走 ${ns} 个共享 + ${k} 个路由 = ${ns + k} 个专家`;
+        $('[data-out="ratio"]').textContent = ((active / total) * 100).toFixed(1) + '%';
+        $('[data-out="ratio-sub"]').textContent =
+          `参数是激活量的 ${(total / active).toFixed(2)} 倍 —— 白赚的那部分`;
+
+        const parts: [string, number][] = [
+          ['a', backbone],
+          ['b', sharedP],
+          ['c', routedAct],
+          ['d', routedAll - routedAct],
+        ];
+        $('[data-stack]').innerHTML = parts
+          .map(([c, v]) => `<span class="${c}" style="width:${(v / total) * 100}%"></span>`)
+          .join('');
+
+        $('[data-calc]').innerHTML = [
+          `① 一个专家 = 3 · d_model · d_ff = 3 × ${d} × ${dff} = <b>${B(E)}</b>`,
+          `② 全部专家 = 层数 × (路由 + 共享) × 每专家 = ${L} × (${nr} + ${ns}) × ${B(E)} = <b>${B(routedAll + sharedP)}</b>`,
+          `③ 激活的专家 = 层数 × (top-k + 共享) × 每专家 = ${L} × (${k} + ${ns}) × ${B(E)} = <b>${B(routedAct + sharedP)}</b>`,
+          `④ 总参数 = ② + 骨干 ${B(backbone)} = <b>${B(total)}</b>`,
+          `⑤ 激活参数 = ③ + 骨干 ${B(backbone)} = <b>${B(active)}</b>`,
+        ]
+          .map((s) => `<div>${s}</div>`)
+          .join('');
+      }
+
+      root.querySelectorAll<HTMLInputElement>('.knobs input').forEach((el) => {
+        el.addEventListener('input', () => {
+          root.querySelectorAll('.presets button').forEach((b) => b.classList.remove('on'));
+          $('[data-official]').textContent = '（已手改配置，不再对应任何已发布模型）';
+          calc();
+        });
+      });
+
+      root.querySelectorAll<HTMLButtonElement>('.presets button').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const p = presets[btn.dataset.p!];
+          ['d', 'dff', 'L', 'nr', 'ns', 'k', 'bb'].forEach((key, i) => set(key, p.v[i]));
+          root
+            .querySelectorAll('.presets button')
+            .forEach((b) => b.classList.toggle('on', b === btn));
+          $('[data-official]').textContent = p.note;
+          calc();
+        });
+      });
+
+      $('[data-official]').textContent = presets.mixtral.note;
+      root.querySelector('.presets button')!.classList.add('on');
+      calc();
+    });
+  }
+
+  setupL04Budget();
+  document.addEventListener('astro:page-load', setupL04Budget);
+</script>

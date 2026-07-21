@@ -1,0 +1,287 @@
+---
+// CS336 第 3 讲：注意力掩码热力图。
+// 三种模式：因果全注意力 / 滑动窗口 / 交错（每 4 层放一层全注意力）。
+// 右边实时算出这一层真正要算的 (query, key) 对数，以及相对全注意力省了多少。
+---
+
+<div class="demo" data-demo="l03-mask">
+  <div class="row">
+    <label class="chk"><input type="radio" name="l03mask" data-mode value="full" checked /> 因果全注意力</label>
+    <label class="chk"><input type="radio" name="l03mask" data-mode value="swa" /> 滑动窗口</label>
+    <label class="chk"><input type="radio" name="l03mask" data-mode value="mix" /> 交错：每 4 层一层全注意力</label>
+  </div>
+
+  <div class="row">
+    <label class="sld">
+      序列长度 n = <span data-n-val>32</span>
+      <input type="range" data-n min="8" max="64" step="1" value="32" />
+    </label>
+    <label class="sld">
+      窗口宽度 w = <span data-w-val>8</span>
+      <input type="range" data-w min="1" max="32" step="1" value="8" />
+    </label>
+    <label class="sld">
+      层数 L = <span data-l-val>32</span>
+      <input type="range" data-l min="4" max="80" step="4" value="32" />
+    </label>
+  </div>
+
+  <div class="two">
+    <div>
+      <canvas data-canvas width="420" height="420"></canvas>
+      <p class="axis">横轴 = 被看的位置（key），纵轴 = 正在算的位置（query）。深色格子 = 这一对要真算。</p>
+    </div>
+    <div>
+      <table>
+        <tbody data-stats></tbody>
+      </table>
+      <p class="hint" data-hint></p>
+    </div>
+  </div>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem 1.3rem;
+    margin-bottom: 0.8rem;
+  }
+  .sld,
+  .chk {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.83rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .sld input[type='range'] {
+    width: 140px;
+    accent-color: var(--indigo);
+  }
+  .chk input {
+    accent-color: var(--indigo);
+  }
+  .two {
+    display: grid;
+    gap: 1.2rem;
+    align-items: start;
+  }
+  @media (min-width: 700px) {
+    .two {
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    }
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    max-width: 420px;
+    height: auto;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .axis {
+    margin: 0.45rem 0 0;
+    font-size: 0.76rem;
+    color: var(--ink-faint);
+    line-height: 1.6;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.81rem;
+    font-variant-numeric: tabular-nums;
+  }
+  table :global(td) {
+    padding: 0.28rem 0.4rem;
+    color: var(--ink-muted);
+    border-bottom: 1px solid var(--rule);
+  }
+  table :global(td.k) {
+    color: var(--ink-faint);
+  }
+  table :global(td.v) {
+    text-align: right;
+    font-family: var(--font-mono);
+    color: var(--ink);
+  }
+  table :global(tr.hi td.v) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+  .hint {
+    margin: 0.9rem 0 0;
+    font-size: 0.83rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupL03Mask() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l03-mask"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const cv = $<HTMLCanvasElement>('[data-canvas]');
+      const ctx = cv.getContext('2d')!;
+      const css = (n: string) =>
+        getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+      // 不用 :checked 伪类 —— 直接看属性，行为在各种环境下都一致
+      const modeEls = [...root.querySelectorAll<HTMLInputElement>('[data-mode]')];
+      function mode() {
+        return (modeEls.find((e) => e.checked) ?? modeEls[0]).value;
+      }
+
+      // 某一层的掩码：allowed(i, j) —— 位置 i 能不能看位置 j
+      function allowed(i: number, j: number, w: number, layerIsFull: boolean) {
+        if (j > i) return false; // 因果：不能看未来
+        if (layerIsFull) return true;
+        return i - j < w;
+      }
+
+      function countLayer(n: number, w: number, layerIsFull: boolean) {
+        let c = 0;
+        for (let i = 0; i < n; i++) for (let j = 0; j <= i; j++) if (allowed(i, j, w, layerIsFull)) c++;
+        return c;
+      }
+
+      function draw() {
+        const n = parseInt($<HTMLInputElement>('[data-n]').value, 10);
+        let w = parseInt($<HTMLInputElement>('[data-w]').value, 10);
+        const L = parseInt($<HTMLInputElement>('[data-l]').value, 10);
+        const md = mode();
+        $('[data-n-val]').textContent = String(n);
+        $('[data-w-val]').textContent = String(w);
+        $('[data-l-val]').textContent = String(L);
+
+        // 全注意力模式下窗口滑块不起作用，画图时当成 n
+        const showFull = md === 'full';
+        const effW = showFull ? n : w;
+
+        const size = cv.width;
+        const cell = size / n;
+        ctx.clearRect(0, 0, size, size);
+        const indigo = css('--indigo');
+        const madder = css('--madder');
+        const rule = css('--rule');
+
+        // 交错模式下，画面上下叠两块：上半是全注意力层，下半是窗口层
+        for (let i = 0; i < n; i++) {
+          for (let j = 0; j < n; j++) {
+            let color = '';
+            if (j > i) {
+              color = '';
+            } else if (showFull) {
+              color = indigo;
+            } else if (md === 'swa') {
+              color = i - j < effW ? indigo : '';
+            } else {
+              // mix：这一格在「窗口层」里算得到就用靛蓝，只有「全注意力层」才算的用茜红
+              color = i - j < effW ? indigo : madder;
+            }
+            if (!color) continue;
+            ctx.fillStyle = color;
+            ctx.globalAlpha = color === madder ? 0.32 : 0.78;
+            ctx.fillRect(j * cell, i * cell, Math.max(1, cell - 0.6), Math.max(1, cell - 0.6));
+          }
+        }
+        ctx.globalAlpha = 1;
+        ctx.strokeStyle = rule;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(0.5, 0.5, size - 1, size - 1);
+
+        // ── 统计 ──
+        const full = countLayer(n, n, true); // = n(n+1)/2
+        const swa = countLayer(n, effW, false);
+        let perLayerAvg: number;
+        let label: string;
+        if (md === 'full') {
+          perLayerAvg = full;
+          label = '因果全注意力';
+        } else if (md === 'swa') {
+          perLayerAvg = swa;
+          label = `滑动窗口 w = ${w}`;
+        } else {
+          const fullLayers = Math.floor(L / 4);
+          perLayerAvg = (fullLayers * full + (L - fullLayers) * swa) / L;
+          label = `交错（${fullLayers} 层全注意力 + ${L - fullLayers} 层窗口）`;
+        }
+
+        // KV cache：全注意力层每个位置要留住全部历史，窗口层只要留 w 个
+        const kvFull = n;
+        const kvSwa = Math.min(w, n);
+        let kvPerLayerAvg: number;
+        if (md === 'full') kvPerLayerAvg = kvFull;
+        else if (md === 'swa') kvPerLayerAvg = kvSwa;
+        else {
+          const fullLayers = Math.floor(L / 4);
+          kvPerLayerAvg = (fullLayers * kvFull + (L - fullLayers) * kvSwa) / L;
+        }
+
+        const rows: [string, string, boolean][] = [
+          ['当前模式', label, false],
+          ['因果全注意力要算的格子数', `${full}`, false],
+          ['当前模式平均每层的格子数', `${perLayerAvg.toFixed(1)}`, true],
+          ['相对全注意力', `${((perLayerAvg / full) * 100).toFixed(1)} %`, true],
+          ['全网络（L 层）总格子数', `${(perLayerAvg * L).toFixed(0)}`, false],
+          ['KV cache：平均每层每个位置要留住的历史长度', `${kvPerLayerAvg.toFixed(1)}`, false],
+          ['KV cache 相对全注意力', `${((kvPerLayerAvg / kvFull) * 100).toFixed(1)} %`, true],
+        ];
+        const tb = $('[data-stats]');
+        tb.replaceChildren();
+        for (const [k, v, hi] of rows) {
+          const tr = document.createElement('tr');
+          if (hi) tr.className = 'hi';
+          const a = document.createElement('td');
+          a.className = 'k';
+          a.textContent = k;
+          const b = document.createElement('td');
+          b.className = 'v';
+          b.textContent = v;
+          tr.append(a, b);
+          tb.append(tr);
+        }
+
+        let hint = '';
+        if (md === 'full') {
+          hint =
+            '这是最标准的因果注意力：位置 i 能看到 0 到 i 的所有位置。格子数是 n(n+1)/2 —— ' +
+            '随 n 平方增长，序列一长就吃不消，KV cache 也要把全部历史留着。';
+        } else if (md === 'swa') {
+          hint =
+            `滑动窗口把每个位置能看的范围压到最近 ${w} 个。代价是信息传不远 —— ` +
+            '不过多堆几层之后，第 1 层的局部聚合会被第 2 层再聚合一次，感受野还是会一层层扩开。';
+        } else {
+          hint =
+            '交错模式下，靛蓝格子是每一层都算得到的（窗口内），淡茜红格子只有那 1/4 的全注意力层才算。' +
+            `平均下来每层只花全注意力的一小部分开销，但每 4 层就有一层能把整段上下文接起来 —— ` +
+            'Cohere Command A、Gemma 3/4、Llama 4、OLMo 3 走的都是这条路。';
+        }
+        $('[data-hint]').textContent = hint;
+      }
+
+      root.querySelectorAll('input').forEach((el) => el.addEventListener('input', draw));
+      new MutationObserver(draw).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-theme'],
+      });
+      draw();
+    });
+  }
+
+  setupL03Mask();
+  document.addEventListener('astro:page-load', setupL03Mask);
+</script>

@@ -1,0 +1,314 @@
+---
+// 第 4 讲演示 4：KV cache 的显存占用，MHA / GQA / MLA 三种方案对比。
+// 对应第 13.1 节：MLA 只缓存低维潜在向量 c_t^KV，加上少数几维专门做 RoPE 的 key。
+---
+
+<div class="demo" data-demo="l04-kv">
+  <div class="presets">
+    <span class="plabel">预设：</span>
+    <button data-p="dsv3">DeepSeek-V3</button>
+    <button data-p="l70">Llama-3-70B 式</button>
+    <button data-p="l8">Llama-3-8B 式</button>
+  </div>
+
+  <div class="knobs">
+    <label>层数<input type="number" data-k="L" value="61" min="1" /></label>
+    <label>注意力头数<input type="number" data-k="h" value="128" min="1" /></label>
+    <label>每头维度<input type="number" data-k="dh" value="128" min="1" /></label>
+    <label>KV 头数（GQA）<input type="number" data-k="kv" value="8" min="1" /></label>
+    <label>MLA 潜在维 d_c<input type="number" data-k="dc" value="512" min="1" /></label>
+    <label>MLA 解耦 RoPE 维<input type="number" data-k="dr" value="64" min="0" /></label>
+    <label>
+      精度
+      <select data-k="bytes">
+        <option value="2" selected>bf16（2 字节）</option>
+        <option value="1">fp8（1 字节）</option>
+        <option value="4">fp32（4 字节）</option>
+      </select>
+    </label>
+    <label>上下文长度 <code data-out="ctx"></code><input type="range" data-k="ctx" min="10" max="21" step="1" value="17" /></label>
+  </div>
+
+  <div class="rows" data-rows></div>
+
+  <div class="block">
+    <h4>逐步核算</h4>
+    <div class="calc" data-calc></div>
+  </div>
+
+  <p class="note">
+    只数 KV cache 本身，不含权重、激活值和推理框架的额外开销；也假设 batch = 1。
+    MHA 那一行是「如果 DeepSeek-V3 这个形状用普通多头注意力」的假想对照，
+    用来看 MLA 到底压掉了多少 —— 真实的 DeepSeek-V3 只有 MLA 那一行。
+  </p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+
+  .presets {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem;
+    margin-bottom: 0.9rem;
+  }
+  .plabel {
+    font-size: 0.78rem;
+    color: var(--ink-faint);
+    letter-spacing: 0.05em;
+  }
+  .presets button {
+    padding: 0.25rem 0.6rem;
+    font: inherit;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    background: transparent;
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .presets button:hover,
+  .presets button.on {
+    color: var(--indigo);
+    border-color: var(--indigo);
+  }
+
+  .knobs {
+    display: grid;
+    gap: 0.55rem;
+    grid-template-columns: 1fr 1fr;
+  }
+  @media (min-width: 640px) {
+    .knobs {
+      grid-template-columns: repeat(4, 1fr);
+    }
+  }
+  .knobs label {
+    display: block;
+    font-size: 0.74rem;
+    letter-spacing: 0.03em;
+    color: var(--ink-faint);
+  }
+  .knobs code {
+    font-family: var(--font-mono);
+    color: var(--indigo);
+  }
+  .knobs input,
+  .knobs select {
+    display: block;
+    width: 100%;
+    margin-top: 0.22rem;
+    padding: 0.32rem 0.45rem;
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: 0.83rem;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+  }
+  .knobs input[type='range'] {
+    padding: 0;
+    background: transparent;
+    border: none;
+    accent-color: var(--indigo);
+  }
+  .knobs input:focus,
+  .knobs select:focus {
+    outline: none;
+    border-color: var(--indigo);
+  }
+
+  .rows {
+    display: grid;
+    gap: 0.45rem;
+    margin-top: 1.1rem;
+  }
+  .rows :global(.r) {
+    display: grid;
+    grid-template-columns: 5.5rem 1fr;
+    gap: 0.6rem;
+    align-items: center;
+    padding: 0.55rem 0.7rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 7px;
+  }
+  .rows :global(.name) {
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--ink);
+  }
+  .rows :global(.bar) {
+    position: relative;
+    height: 22px;
+    background: color-mix(in srgb, var(--rule) 55%, transparent);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .rows :global(.bar i) {
+    position: absolute;
+    inset: 0 auto 0 0;
+    display: block;
+    transition: width 0.25s var(--ease);
+  }
+  .rows :global(.bar span) {
+    position: absolute;
+    top: 0;
+    left: 0.45rem;
+    line-height: 22px;
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .rows :global(.mha i) {
+    background: color-mix(in srgb, var(--madder) 55%, transparent);
+  }
+  .rows :global(.gqa i) {
+    background: color-mix(in srgb, var(--weld) 55%, transparent);
+  }
+  .rows :global(.mla i) {
+    background: color-mix(in srgb, var(--indigo) 55%, transparent);
+  }
+
+  .block {
+    margin-top: 1.2rem;
+  }
+  .block h4 {
+    margin: 0 0 0.5rem;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+  .calc :global(div) {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.95;
+    color: var(--ink-muted);
+    overflow-wrap: anywhere;
+  }
+  .calc :global(b) {
+    color: var(--ink);
+  }
+
+  .note {
+    margin: 1rem 0 0;
+    font-size: 0.78rem;
+    line-height: 1.7;
+    color: var(--ink-faint);
+  }
+</style>
+
+<script>
+  function setupL04Kv() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l04-kv"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const g = (k: string) =>
+        Number((root.querySelector(`[data-k="${k}"]`) as HTMLInputElement).value) || 0;
+      const set = (k: string, v: number) => {
+        (root.querySelector(`[data-k="${k}"]`) as HTMLInputElement).value = String(v);
+      };
+
+      // L / heads / d_head / kv_heads / d_c / d_rope
+      const presets: Record<string, number[]> = {
+        dsv3: [61, 128, 128, 8, 512, 64],
+        l70: [80, 64, 128, 8, 512, 64],
+        l8: [32, 32, 128, 8, 256, 64],
+      };
+
+      const mem = (bytes: number) => {
+        if (bytes >= 1024 ** 3) return (bytes / 1024 ** 3).toFixed(2) + ' GiB';
+        if (bytes >= 1024 ** 2) return (bytes / 1024 ** 2).toFixed(2) + ' MiB';
+        return (bytes / 1024).toFixed(1) + ' KiB';
+      };
+
+      function calc() {
+        const L = g('L'),
+          h = g('h'),
+          dh = g('dh'),
+          kv = g('kv'),
+          dc = g('dc'),
+          dr = g('dr');
+        const bytes = Number((root.querySelector('[data-k="bytes"]') as HTMLSelectElement).value);
+        const ctx = 2 ** g('ctx');
+        $('[data-out="ctx"]').textContent = ctx.toLocaleString('en-US') + ' token';
+
+        // 每个 token 每层要存多少个数
+        const eMha = 2 * h * dh; // K 和 V 各 h 个头
+        const eGqa = 2 * kv * dh; // K 和 V 只有 kv 个头
+        const eMla = dc + dr; // 只存潜在向量 + 那几维解耦的 RoPE key
+
+        const rows: [string, string, number][] = [
+          ['MHA', 'mha', eMha],
+          ['GQA', 'gqa', eGqa],
+          ['MLA', 'mla', eMla],
+        ];
+        const max = Math.max(...rows.map((r) => r[2]));
+
+        $('[data-rows]').innerHTML = rows
+          .map(([name, cls, e]) => {
+            const perTok = e * L * bytes;
+            const totalB = perTok * ctx;
+            const w = (e / max) * 100;
+            return (
+              `<div class="r ${cls}"><span class="name">${name}</span>` +
+              `<span class="bar"><i style="width:${w}%"></i>` +
+              `<span>每 token ${mem(perTok)} ｜ ${ctx.toLocaleString('en-US')} token 共 ${mem(totalB)} ｜ 相对 MHA ${((e / eMha) * 100).toFixed(1)}%</span>` +
+              `</span></div>`
+            );
+          })
+          .join('');
+
+        $('[data-calc]').innerHTML = [
+          `MHA：每层每 token 存 2 · 头数 · 头维 = 2 × ${h} × ${dh} = <b>${eMha.toLocaleString('en-US')}</b> 个数`,
+          `GQA：K/V 头数减到 ${kv}，变成 2 × ${kv} × ${dh} = <b>${eGqa.toLocaleString('en-US')}</b> 个数`,
+          `MLA：只存潜在向量 c 和解耦的 RoPE key = ${dc} + ${dr} = <b>${eMla.toLocaleString('en-US')}</b> 个数`,
+          `再乘层数 ${L} 和每个数 ${bytes} 字节，就是每 token 的字节数；再乘上下文长度就是总显存。`,
+        ]
+          .map((s) => `<div>${s}</div>`)
+          .join('');
+      }
+
+      root.querySelectorAll<HTMLElement>('.knobs input, .knobs select').forEach((el) => {
+        el.addEventListener('input', () => {
+          if ((el as HTMLInputElement).dataset.k !== 'ctx' && (el as HTMLElement).tagName !== 'SELECT') {
+            root.querySelectorAll('.presets button').forEach((b) => b.classList.remove('on'));
+          }
+          calc();
+        });
+        el.addEventListener('change', calc);
+      });
+
+      root.querySelectorAll<HTMLButtonElement>('.presets button').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const p = presets[btn.dataset.p!];
+          ['L', 'h', 'dh', 'kv', 'dc', 'dr'].forEach((k, i) => set(k, p[i]));
+          root
+            .querySelectorAll('.presets button')
+            .forEach((b) => b.classList.toggle('on', b === btn));
+          calc();
+        });
+      });
+
+      root.querySelector('.presets button')!.classList.add('on');
+      calc();
+    });
+  }
+
+  setupL04Kv();
+  document.addEventListener('astro:page-load', setupL04Kv);
+</script>
