@@ -1,6 +1,10 @@
 ---
 import { getCollection } from 'astro:content';
 import BaseLayout from '../layouts/BaseLayout.astro';
+import Heatmap from '../components/Heatmap.astro';
+
+// 社区入口：填入知识星球链接后会自动出现在首页；留空则不渲染（不上线死链接）。
+const ZHISHIXINGQIU = '';
 
 const posts = (await getCollection('blog', ({ data }) => !data.draft))
   .sort((a, b) => b.data.date.valueOf() - a.data.date.valueOf())
@@ -33,6 +37,14 @@ const TRAJECTORY =
       <a href="/projects">项目</a>
       <a href="/cv">CV</a>
       <a href="mailto:you@example.com">邮箱</a>
+      {
+        ZHISHIXINGQIU && (
+          <a href={ZHISHIXINGQIU} class="community" target="_blank" rel="noopener">
+            <span class="loomtile" aria-hidden="true" />
+            知识星球 ↗
+          </a>
+        )
+      }
     </div>
 
     {/* 层 2 hero：轨迹自绘 + 标记沿路径飞行 */}
@@ -115,6 +127,10 @@ const TRAJECTORY =
       </section>
     )
   }
+
+  <section class="block" data-reveal>
+    <Heatmap />
+  </section>
 </BaseLayout>
 
 <style>
@@ -138,9 +154,31 @@ const TRAJECTORY =
   .hero-links {
     display: flex;
     flex-wrap: wrap;
+    align-items: center;
     gap: 1.4rem;
     margin-top: 1.4rem;
     font-size: 0.94rem;
+  }
+  /* 知识星球：比普通链接稍强调，挂一枚织结 */
+  .community {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45em;
+    padding: 0.22rem 0.7rem;
+    border: 1px solid color-mix(in srgb, var(--weld) 45%, var(--rule));
+    border-radius: 999px;
+    color: color-mix(in srgb, var(--weld) 72%, var(--ink));
+    text-decoration: none;
+    transition: border-color 0.2s var(--ease), background-color 0.2s var(--ease);
+  }
+  .community .loomtile {
+    --tile: var(--weld);
+    width: 0.7em;
+    height: 0.7em;
+  }
+  .community:hover {
+    border-color: var(--weld);
+    background: color-mix(in srgb, var(--weld) 10%, transparent);
   }
 
   /* ── 轨迹动画 ─────────────────────────────────────────────── */

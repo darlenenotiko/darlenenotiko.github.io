@@ -1,7 +1,7 @@
 # 个人网站
 
-Astro + MDX 搭的个人学术网站：论文 / 博客 / 项目 / 日志，含 KaTeX 数学公式、
-Loom 视觉设计、Libertinus 字体，以及一套本地（dev）笔记批注系统。
+Astro + MDX 搭的个人学术网站：论文 / 博客 / 项目 / 日志，含 MathML 数学公式（Temml）、
+Loom 视觉设计、Libertinus 字体、写作活动热力图，以及一套本地（dev）笔记批注系统。
 
 **在线地址**：https://darlenenotiko.github.io
 
@@ -40,7 +40,7 @@ npm run dev        # 开发服务器 + 批注系统 → http://localhost:4321
 - `src/content/` — 网站内容：`papers` / `blog` / `projects` / `logs`，Markdown / MDX
 - `src/components/mdx/` — 笔记里可直接用的组件：定理框 `Theorem`、图 `Figure`、
   提示 `Callout`、可折叠块 `Collapsible`（无需 import）
-- 数学公式：MDX 里写 `$...$`（行内）或 `$$...$$`（独立），构建时由 KaTeX 渲染成静态 HTML
+- 数学公式：MDX 里写 `$...$`（行内）或 `$$...$$`（独立），构建时由 Temml 渲染成静态 MathML（浏览器端零 JS）
 
 ## 隐私边界（重要）
 
@@ -49,4 +49,4 @@ npm run dev        # 开发服务器 + 批注系统 → http://localhost:4321
 
 ## 技术栈
 
-Astro · MDX · KaTeX · Libertinus（self-host）· 纯静态输出
+Astro · MDX · Temml/MathML · Libertinus（self-host）· 纯静态输出。SEO：sitemap.xml / robots.txt / OG 分享卡 / 自定义 404。

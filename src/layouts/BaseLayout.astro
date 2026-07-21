@@ -10,6 +10,11 @@ interface Props {
 
 const { title, description = '个人主页' } = Astro.props;
 
+// 绝对地址（社交分享卡 / canonical）。site 已在 astro.config.mjs 配好。
+const site = Astro.site ?? new URL('https://darlenenotiko.github.io');
+const canonicalURL = new URL(Astro.url.pathname, site);
+const ogImage = new URL('/og.png', site);
+
 const nav = [
   { href: '/', label: '首页' },
   { href: '/papers', label: '论文' },
@@ -29,8 +34,20 @@ const path = Astro.url.pathname;
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <title>{title}</title>
     <meta name="description" content={description} />
+    <link rel="canonical" href={canonicalURL} />
+
+    {/* 社交分享卡：Open Graph + Twitter，绝对图地址 */}
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="个人主页" />
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonicalURL} />
+    <meta property="og:image" content={ogImage} />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImage} />
+
     <link rel="alternate" type="application/rss+xml" title={title} href="/rss.xml" />
 
     {/* 主题必须在首次绘制前确定，否则会闪一下白屏 */}
@@ -50,7 +67,10 @@ const path = Astro.url.pathname;
   <body>
     <header class="site-header">
       <div class="page header-inner">
-        <a href="/" class="brand">姓名</a>
+        <a href="/" class="brand">
+          <span class="loomtile brand-tile" aria-hidden="true"></span>
+          姓名
+        </a>
         <nav>
           {
             nav.slice(1).map((item) => (
@@ -83,10 +103,14 @@ const path = Astro.url.pathname;
     </main>
 
     <footer class="site-footer">
-      <div class="page">
+      {/* selvage：布匹的织边，一条极淡的平纹条 */}
+      <div class="selvage" aria-hidden="true"></div>
+      <div class="page footer-inner">
         <span>© {new Date().getFullYear()} 姓名</span>
         <span class="dot">·</span>
         <a href="/rss.xml">RSS</a>
+        <span class="dot">·</span>
+        <a href="/sitemap.xml">Sitemap</a>
       </div>
     </footer>
 
@@ -205,11 +229,22 @@ const path = Astro.url.pathname;
         height: 60px;
       }
       .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.5rem;
         font-family: var(--font-serif);
         font-size: 1.12rem;
         font-weight: 600;
         color: var(--ink);
         text-decoration: none;
+      }
+      .brand-tile {
+        width: 0.85em;
+        height: 0.85em;
+        transition: transform 0.4s var(--ease);
+      }
+      .brand:hover .brand-tile {
+        transform: rotate(90deg);
       }
       nav {
         display: flex;
@@ -270,10 +305,28 @@ const path = Astro.url.pathname;
       }
 
       .site-footer {
-        border-top: 1px solid var(--rule);
-        padding: 1.8rem 0;
+        margin-top: 2rem;
         font-size: 0.86rem;
         color: var(--ink-faint);
+      }
+      /* 织边：重复的 2×2 平纹方块，极淡，作页脚上缘 */
+      .selvage {
+        height: 8px;
+        --tile: var(--thread);
+        background: conic-gradient(
+            var(--tile) 0 25%,
+            transparent 25% 50%,
+            var(--tile) 50% 75%,
+            transparent 75%
+          )
+          0 0 / 8px 8px;
+        opacity: 0.5;
+      }
+      .footer-inner {
+        display: flex;
+        align-items: center;
+        padding-top: 1.8rem;
+        padding-bottom: 1.8rem;
       }
       .site-footer a {
         color: var(--ink-faint);

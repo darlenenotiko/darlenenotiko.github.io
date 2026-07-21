@@ -1,0 +1,212 @@
+---
+import { getCollection } from 'astro:content';
+
+// 写作活动热力图 —— 数据来自站内内容本身（博客 / 日志 / 项目的日期），
+// 不依赖 GitHub API 或任何外部服务，纯构建时计算。
+// 视觉是一块「布」：空格是经纬线的底纹，有更新的格子按靛蓝染料由浅到深上色，
+// 颜色全部走 --indigo / --bg-sunken / --thread 这些 token，深色模式自动翻转。
+
+interface Props {
+  weeks?: number;
+}
+const { weeks: WEEKS = 26 } = Astro.props;
+
+const dates: Date[] = [
+  ...(await getCollection('blog', ({ data }) => !data.draft)).map((p) => p.data.date),
+  ...(await getCollection('logs')).map((p) => p.data.date),
+  ...(await getCollection('projects', ({ data }) => !data.draft)).map((p) => p.data.date),
+];
+
+const key = (d: Date) => d.toISOString().slice(0, 10);
+const counts = new Map<string, number>();
+for (const d of dates) counts.set(key(d), (counts.get(key(d)) ?? 0) + 1);
+
+const DAY = 86_400_000;
+const now = new Date();
+const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+const todayTs = today.getTime();
+// 列对齐到周日：最后一列是本周
+const endSundayTs = todayTs - today.getUTCDay() * DAY;
+const startTs = endSundayTs - (WEEKS - 1) * 7 * DAY;
+
+const level = (c: number) => (c >= 4 ? 4 : c);
+
+type Cell = { key: string; count: number; level: number; future: boolean };
+const grid: Cell[][] = [];
+let windowTotal = 0;
+for (let w = 0; w < WEEKS; w++) {
+  const col: Cell[] = [];
+  for (let d = 0; d < 7; d++) {
+    const ts = startTs + (w * 7 + d) * DAY;
+    const k = key(new Date(ts));
+    const count = counts.get(k) ?? 0;
+    if (ts <= todayTs) windowTotal += count;
+    col.push({ key: k, count, level: level(count), future: ts > todayTs });
+  }
+  grid.push(col);
+}
+
+const MONTHS = ['1月', '2月', '3月', '4月', '5月', '6月', '7月', '8月', '9月', '10月', '11月', '12月'];
+let prevMonth = -1;
+const monthLabels = grid.map((col) => {
+  const m = new Date(Date.parse(col[0].key + 'T00:00:00Z')).getUTCMonth();
+  if (m !== prevMonth) {
+    prevMonth = m;
+    return MONTHS[m];
+  }
+  return '';
+});
+---
+
+<figure class="heatmap">
+  <figcaption>
+    <span class="hm-title"><span class="loomtile" aria-hidden="true"></span>写作节律</span>
+    <span class="hm-sub">近半年 {windowTotal} 次更新</span>
+  </figcaption>
+
+  <div class="hm-scroll">
+    <div class="hm-inner">
+      <div class="months" aria-hidden="true">
+        {monthLabels.map((m) => <span class="mcol">{m}</span>)}
+      </div>
+      <div class="weeks" role="img" aria-label={`过去 ${WEEKS} 周共 ${windowTotal} 次内容更新`}>
+        {
+          grid.map((col) => (
+            <div class="wk">
+              {col.map((c) => (
+                <span
+                  class:list={['cell', { future: c.future }]}
+                  data-level={c.level}
+                  title={c.future ? undefined : `${c.key}：${c.count} 次更新`}
+                />
+              ))}
+            </div>
+          ))
+        }
+      </div>
+    </div>
+  </div>
+
+  <div class="legend" aria-hidden="true">
+    <span>少</span>
+    <span class="cell" data-level="0"></span>
+    <span class="cell" data-level="1"></span>
+    <span class="cell" data-level="2"></span>
+    <span class="cell" data-level="3"></span>
+    <span class="cell" data-level="4"></span>
+    <span>多</span>
+  </div>
+</figure>
+
+<style>
+  .heatmap {
+    margin: 0;
+    --cell: 12px;
+    --gap: 3px;
+  }
+  figcaption {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 1rem;
+    padding-bottom: 0.6rem;
+    border-bottom: 1px solid var(--rule);
+  }
+  .hm-title {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5em;
+    font-family: var(--font-sans);
+    font-size: 1.15rem;
+    font-weight: 600;
+    color: var(--ink);
+  }
+  .hm-sub {
+    font-size: 0.82rem;
+    color: var(--ink-faint);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* 窄屏可横向滚动，不撑破页面 */
+  .hm-scroll {
+    overflow-x: auto;
+    padding-bottom: 0.3rem;
+  }
+  .hm-inner {
+    display: inline-block;
+    min-width: 0;
+  }
+
+  .months {
+    display: flex;
+    gap: var(--gap);
+    margin-bottom: 5px;
+  }
+  .mcol {
+    width: var(--cell);
+    font-family: var(--font-sans);
+    font-size: 0.62rem;
+    letter-spacing: 0.02em;
+    color: var(--ink-faint);
+    white-space: nowrap; /* 月名比格子宽，向右溢出对齐到列起点，正是想要的效果 */
+  }
+
+  .weeks {
+    display: flex;
+    gap: var(--gap);
+  }
+  .wk {
+    display: flex;
+    flex-direction: column;
+    gap: var(--gap);
+  }
+  .cell {
+    width: var(--cell);
+    height: var(--cell);
+    border-radius: 2px;
+    /* 空格 = 布的经纬底纹（淡 thread），不是「缺失的数据」 */
+    background: color-mix(in srgb, var(--thread) 20%, transparent);
+    transition: transform 0.15s var(--ease), outline-color 0.15s var(--ease);
+  }
+  /* 靛蓝染料由浅到深；用 token 混色，深色模式随 --indigo/--bg-sunken 自动翻转 */
+  .cell[data-level='1'] {
+    background: color-mix(in srgb, var(--indigo) 26%, var(--bg-sunken));
+  }
+  .cell[data-level='2'] {
+    background: color-mix(in srgb, var(--indigo) 48%, var(--bg-sunken));
+  }
+  .cell[data-level='3'] {
+    background: color-mix(in srgb, var(--indigo) 70%, var(--bg-sunken));
+  }
+  .cell[data-level='4'] {
+    background: var(--indigo);
+  }
+  .cell:not(.future):hover {
+    transform: scale(1.35);
+    outline: 1px solid var(--accent);
+  }
+  .cell.future {
+    visibility: hidden;
+  }
+
+  .legend {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 4px;
+    margin-top: 0.8rem;
+    font-size: 0.72rem;
+    color: var(--ink-faint);
+  }
+  .legend .cell:hover {
+    transform: none;
+    outline: none;
+  }
+  .legend span:first-child {
+    margin-right: 2px;
+  }
+  .legend span:last-child {
+    margin-left: 2px;
+  }
+</style>

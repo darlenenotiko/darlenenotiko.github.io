@@ -1,0 +1,73 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+
+// GitHub Pages 会把未知路径回退到 /404.html —— Astro 静态构建从这里生成它。
+---
+
+<BaseLayout title="页面走丢了 · 404" description="没有找到这个页面">
+  <section class="nf">
+    <div class="emblem" aria-hidden="true">
+      <span class="loomtile"></span>
+      <span class="loomtile"></span>
+      <span class="loomtile"></span>
+      <span class="loomtile"></span>
+    </div>
+    <h1>404</h1>
+    <p class="lead">这一段线头没织进布里。</p>
+    <p class="sub">页面可能被移动、改名，或从来没有存在过。</p>
+    <div class="links">
+      <a href="/">回到首页</a>
+      <a href="/blog">读点文章</a>
+      <a href="/logs">看看日志</a>
+    </div>
+  </section>
+</BaseLayout>
+
+<style>
+  .nf {
+    max-width: var(--measure);
+    margin: 4vh auto 0;
+    text-align: center;
+  }
+  /* 一枚断了的织物：2×2 loomtile，其中一格空缺 */
+  .emblem {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 3px;
+    width: 42px;
+    height: 42px;
+    margin: 0 auto 1.6rem;
+  }
+  .emblem .loomtile {
+    width: 100%;
+    height: 100%;
+  }
+  /* 缺失的一角：只留经线痕迹，呼应「走丢」 */
+  .emblem .loomtile:nth-child(3) {
+    background: none;
+    border: 1px dashed var(--rule);
+  }
+  .nf h1 {
+    margin: 0;
+    font-size: clamp(3rem, 12vw, 5rem);
+    letter-spacing: 0.04em;
+    color: var(--indigo);
+  }
+  .lead {
+    margin: 0.4rem 0 0;
+    font-size: 1.15rem;
+    color: var(--ink);
+  }
+  .sub {
+    margin: 0.5rem 0 0;
+    color: var(--ink-muted);
+  }
+  .links {
+    display: flex;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 1.4rem;
+    margin-top: 2rem;
+    font-size: 0.95rem;
+  }
+</style>
