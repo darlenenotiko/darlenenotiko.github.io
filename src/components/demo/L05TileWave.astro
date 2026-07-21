@@ -1,0 +1,316 @@
+---
+// CS336 第 5 讲：分块、对齐与波量化 —— 把课上那张「方阵矩阵乘吞吐量」的怪图复现出来。
+// 左边：给定矩阵边长 N、分块尺寸、SM 数量，算出要切几块、要跑几波、SM 占用率是多少。
+// 右边：把占用率随 N 的变化画成曲线 —— 那些锯齿就是波量化。1792 → 1793 的悬崖也在里面。
+---
+
+<div class="demo" data-demo="l05-tilewave">
+  <div class="ctrl">
+    <label class="sld">
+      矩阵边长 N = <span data-nval>1792</span>
+      <input type="range" data-n min="256" max="4096" step="1" value="1792" />
+    </label>
+    <button data-jump="1792">跳到 1792</button>
+    <button data-jump="1793">跳到 1793</button>
+  </div>
+
+  <div class="ctrl">
+    <span class="tag">分块尺寸</span>
+    <select data-tile>
+      <option value="256,128" selected>256 × 128（课上用的）</option>
+      <option value="128,128">128 × 128</option>
+      <option value="64,64">64 × 64</option>
+    </select>
+    <span class="tag">SM 数量</span>
+    <select data-sm>
+      <option value="108" selected>A100：108</option>
+      <option value="132">H100：132</option>
+    </select>
+  </div>
+
+  <div class="two">
+    <table class="out"><tbody data-out></tbody></table>
+    <div>
+      <canvas data-canvas width="640" height="300"></canvas>
+      <p class="note">
+        纵轴是 SM 占用率 = 分块总数 ÷（波数 × SM 数）。横轴是 N。竖线是当前的 N。
+      </p>
+    </div>
+  </div>
+
+  <p class="verdict" data-verdict></p>
+  <p class="note" data-align></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.45rem 0.9rem;
+    margin-bottom: 0.7rem;
+  }
+  .tag {
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .sld {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.82rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .sld input[type='range'] {
+    width: 240px;
+    accent-color: var(--indigo);
+  }
+  .ctrl button {
+    padding: 0.24rem 0.62rem;
+    font: inherit;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .ctrl button:hover {
+    color: var(--bg);
+    background: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .ctrl select {
+    padding: 0.24rem 0.4rem;
+    font: inherit;
+    font-size: 0.8rem;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+  }
+  .two {
+    display: grid;
+    grid-template-columns: minmax(0, 0.85fr) minmax(0, 1.15fr);
+    gap: 1rem;
+    align-items: start;
+  }
+  @media (max-width: 640px) {
+    .two {
+      grid-template-columns: 1fr;
+    }
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  table.out {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+  }
+  table.out :global(td) {
+    padding: 0.24rem 0.4rem;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-muted);
+    font-family: var(--font-mono);
+  }
+  table.out :global(td.k) {
+    font-family: inherit;
+    color: var(--ink-faint);
+    white-space: nowrap;
+  }
+  .verdict {
+    margin: 0.9rem 0 0;
+    padding: 0.6rem 0.8rem;
+    font-size: 0.86rem;
+    line-height: 1.7;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .note {
+    margin: 0.5rem 0 0;
+    font-size: 0.79rem;
+    line-height: 1.7;
+    color: var(--ink-faint);
+  }
+</style>
+
+<script>
+  function setupL05TileWave() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l05-tilewave"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const cv = $<HTMLCanvasElement>('[data-canvas]');
+      const ctx = cv.getContext('2d')!;
+      const css = (n: string) =>
+        getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+      // 输出矩阵 N×N 被切成 ceil(N/tm) × ceil(N/tn) 个分块；
+      // 每个分块占一个 SM，一次能同时跑 SM 个分块，所以要跑 ceil(tiles/sm) 波。
+      function stats(n: number, tm: number, tn: number, sm: number) {
+        const a = Math.ceil(n / tm);
+        const b = Math.ceil(n / tn);
+        const tiles = a * b;
+        const waves = Math.ceil(tiles / sm);
+        const util = tiles / (waves * sm);
+        const last = tiles - (waves - 1) * sm;
+        return { a, b, tiles, waves, util, last };
+      }
+
+      function draw() {
+        const n = parseInt($<HTMLInputElement>('[data-n]').value, 10);
+        const [tm, tn] = $<HTMLSelectElement>('[data-tile]')
+          .value.split(',')
+          .map(Number);
+        const sm = parseInt($<HTMLSelectElement>('[data-sm]').value, 10);
+        $('[data-nval]').textContent = String(n);
+
+        const s = stats(n, tm, tn, sm);
+
+        const rows: [string, string][] = [
+          ['输出矩阵', `${n} × ${n}`],
+          ['分块尺寸', `${tm} × ${tn}`],
+          ['纵向分块数', `⌈${n}/${tm}⌉ = ${s.a}`],
+          ['横向分块数', `⌈${n}/${tn}⌉ = ${s.b}`],
+          ['分块总数', `${s.a} × ${s.b} = ${s.tiles}`],
+          ['SM 数量', String(sm)],
+          ['要跑几波', `⌈${s.tiles}/${sm}⌉ = ${s.waves}`],
+          ['最后一波用了几个 SM', `${s.last} / ${sm}`],
+          ['SM 占用率', `${(s.util * 100).toFixed(1)}%`],
+        ];
+        const tb = $('[data-out]');
+        tb.replaceChildren();
+        for (const [k, v] of rows) {
+          const tr = document.createElement('tr');
+          const a = document.createElement('td');
+          a.className = 'k';
+          a.textContent = k;
+          const b = document.createElement('td');
+          b.textContent = v;
+          tr.append(a, b);
+          tb.append(tr);
+        }
+
+        $('[data-verdict]').textContent =
+          s.waves === 1
+            ? `${s.tiles} 个分块一次就能全部铺到 ${sm} 个 SM 上，只跑一波，` +
+              `有 ${sm - s.last} 个 SM 闲着但不用等第二轮。`
+            : `${s.tiles} 个分块装不进 ${sm} 个 SM，要跑 ${s.waves} 波。` +
+              `前 ${s.waves - 1} 波是满的，最后一波只有 ${s.last} 个分块，` +
+              `也就是说有 ${sm - s.last} 个 SM 在整整一波的时间里什么都不干 —— 这就是波量化。`;
+
+        const mod = (k: number) => (n % k === 0 ? '能' : '不能');
+        $('[data-align]').textContent =
+          `对齐检查：N = ${n}，被 8 整除 ${mod(8)}、被 16 整除 ${mod(16)}、被 32 整除 ${mod(32)}、` +
+          `被 128 整除 ${mod(128)}。能被 16 或 32 整除时，一次突发读正好落在分块边界上，取数是合并的；` +
+          `否则每读一个分块都要多发几次内存请求。`;
+
+        // ---- 画占用率曲线 ----
+        const W = cv.width;
+        const H = cv.height;
+        const pad = 38;
+        const xMin = 256;
+        const xMax = 4096;
+        const px = (x: number) => pad + ((x - xMin) / (xMax - xMin)) * (W - 2 * pad);
+        const py = (y: number) => H - pad - y * (H - 2 * pad);
+
+        const ink = css('--ink');
+        const faint = css('--ink-faint');
+        const rule = css('--rule');
+        const indigo = css('--indigo');
+        const madder = css('--madder');
+
+        ctx.clearRect(0, 0, W, H);
+        ctx.strokeStyle = rule;
+        ctx.lineWidth = 1;
+        ctx.font = '11px system-ui, sans-serif';
+        ctx.fillStyle = faint;
+        for (let x = 512; x <= 4096; x += 512) {
+          ctx.beginPath();
+          ctx.moveTo(px(x), pad);
+          ctx.lineTo(px(x), H - pad);
+          ctx.stroke();
+          ctx.textAlign = 'center';
+          ctx.fillText(String(x), px(x), H - pad + 14);
+        }
+        for (let y = 0; y <= 1.0001; y += 0.25) {
+          ctx.beginPath();
+          ctx.moveTo(pad, py(y));
+          ctx.lineTo(W - pad, py(y));
+          ctx.stroke();
+          ctx.textAlign = 'right';
+          ctx.fillText((y * 100).toFixed(0) + '%', pad - 6, py(y) + 4);
+        }
+
+        ctx.strokeStyle = indigo;
+        ctx.lineWidth = 1.4;
+        ctx.beginPath();
+        let started = false;
+        for (let x = xMin; x <= xMax; x++) {
+          const u = stats(x, tm, tn, sm).util;
+          const X = px(x);
+          const Y = py(u);
+          started ? ctx.lineTo(X, Y) : (ctx.moveTo(X, Y), (started = true));
+        }
+        ctx.stroke();
+
+        // 当前 N
+        ctx.strokeStyle = madder;
+        ctx.lineWidth = 1.6;
+        ctx.beginPath();
+        ctx.moveTo(px(n), pad);
+        ctx.lineTo(px(n), H - pad);
+        ctx.stroke();
+        ctx.fillStyle = madder;
+        ctx.beginPath();
+        ctx.arc(px(n), py(s.util), 3.5, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = ink;
+        ctx.textAlign = 'left';
+        ctx.font = '12px system-ui, sans-serif';
+        ctx.fillText(`N = ${n}，占用率 ${(s.util * 100).toFixed(1)}%`, pad + 6, pad - 12);
+      }
+
+      root
+        .querySelectorAll<HTMLElement>('input, select')
+        .forEach((el) => el.addEventListener('input', draw));
+      root.querySelectorAll<HTMLButtonElement>('[data-jump]').forEach((b) =>
+        b.addEventListener('click', () => {
+          $<HTMLInputElement>('[data-n]').value = b.dataset.jump!;
+          draw();
+        }),
+      );
+
+      new MutationObserver(draw).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-theme'],
+      });
+
+      draw();
+    });
+  }
+
+  setupL05TileWave();
+  document.addEventListener('astro:page-load', setupL05TileWave);
+</script>

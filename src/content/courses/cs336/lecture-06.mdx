@@ -1,0 +1,1585 @@
+---
+course: cs336
+courseTitle: 'Stanford CS336：从零构建语言模型'
+lecture: 6
+title: Kernel 与 Triton
+date: 2026-07-21
+description: GPU 的编程模型与硬件是怎么互相纠缠的；怎么做基准测试和性能分析；以及用 Triton 从零写四个 kernel：GeLU、softmax、行求和、分块矩阵乘法。
+speaker: Percy Liang
+slides: lecture_06.py（可执行讲义）
+tags: [CS336, GPU, kernel, Triton, tiling, 算子融合, PTX]
+---
+
+import L06HbmTraffic from '../../../components/demo/L06HbmTraffic.astro';
+import L06BlockGrid from '../../../components/demo/L06BlockGrid.astro';
+import L06Tiling from '../../../components/demo/L06Tiling.astro';
+import L06Occupancy from '../../../components/demo/L06Occupancy.astro';
+
+这是 CS336 的第六讲，主讲人换回 Percy Liang。上一讲（周一）Tatsu 讲了 GPU 的高层概览 ——
+GPU 长什么样、怎么思考性能、以及 GPU 带来的种种怪癖。这一讲是它的延续，
+但**往下钻到代码里**：写几个 Triton kernel，顺便把**基准测试（benchmarking）**和
+**性能分析（profiling）**这两件事讲清楚。
+
+一句话概括这一讲的主线：**编程模型给你正确性，硬件给你性能。**
+你写 kernel 的时候面对的是一个很干净的抽象（线程、线程块、网格），
+但你的代码最终要跑在一块只有 148 个流式多处理器、寄存器和 shared memory 都极其有限的芯片上 ——
+**跑得快不快，几乎完全由后者决定。**
+
+<Callout type="note" title="补充：什么是 kernel">
+第一讲提过一句：**kernel 就是一个在 GPU 上运行的函数。**
+
+你在 PyTorch 里写 `a + b`，看起来只是一次加法；但底下发生的事是
+**CPU 向 GPU 发起了一次 kernel 启动（kernel launch）**，
+让成千上万个线程同时跑同一份加法代码，每个线程负责一小块数据。
+
+所以「写 kernel」的意思就是：**自己定义那份被成千上万个线程同时执行的代码**，
+而不是用 PyTorch 内置的那些。
+</Callout>
+
+<Callout type="note" title="关于这一讲的标题">
+录像的标题写的是「Kernels, Triton, XLA」，但课上**没有讲到 XLA**（Google 用于 TPU 的编译器）——
+时间全花在 GPU、Triton 和四个 kernel 例子上了。这份讲义按实际讲的内容组织。
+</Callout>
+
+<Collapsible title="本讲课务">
+
+这一讲课务很少，只有和作业相关的三条：
+
+- **基准测试和性能分析是作业里强制要做的** —— Percy 的原话是「我们让你在作业里做，
+  所以你没得选」。
+- 作业里用的性能分析工具是 **nsight**（NVIDIA 的性能分析器），比 PyTorch 内置的 profiler
+  给的信息细得多。课上因为时间关系跳过了 nsight。
+- 这一讲讲完四个 kernel 例子（尤其是最后的分块矩阵乘法），
+  **你就有了在作业里实现 FlashAttention 所需要的全部材料**。
+
+</Collapsible>
+
+## 一、回顾：GPU 的硬件长什么样
+
+<Figure src="/courses/cs336/l06-gpu-hardware.png" caption="一块典型 GPU 的简化示意图：左边是芯片，上面挂着一堆 SM，每个 SM 自带寄存器和 L1 + shared memory，整块芯片共享一个 L2；右边那一大块是 HBM。来源：CS336 课件" />
+
+课上讨论的是 NVIDIA 的 GPU（Tatsu 上一讲也讲了 TPU，另外还有 AMD 等等）。
+NVIDIA 的 GPU 已经出了好几代：**A100 → H100 → B200**。
+
+<Callout type="note" title="补充：SM 是什么">
+**SM = streaming multiprocessor，流式多处理器。** 它是 GPU 上真正做计算的那个单元 ——
+一块 GPU 芯片上并排放着一百多个 SM，每个 SM 内部有自己的一批计算核心、
+自己的寄存器堆、以及一块自己的高速小内存。
+
+可以这样记：**GPU 的并行度来自「有很多个 SM」加「每个 SM 上又有很多线程」这两层。**
+后面所有关于性能的讨论，本质上都是在问：**这一百多个 SM 有没有被喂饱。**
+</Callout>
+
+### 1.1 内存层级：容量
+
+每一代 GPU 的关键参数（这张表是课件里的原表）：
+
+| 指标 | A100 | H100 | B200 |
+| --- | --- | --- | --- |
+| SM 个数 | 108 | 132 | 148 |
+| 每个 SM 的寄存器容量 | 256 KB | 256 KB | 256 KB |
+| 每个 SM 的 L1 缓存 + shared memory | 192 KB | 256 KB | 256 KB |
+| L2 缓存容量（整块芯片共享） | 40 MB | 50 MB | 96–126 MB |
+| HBM 容量 | 80 GB | 80 GB | 192 GB |
+
+几个值得注意的地方：
+
+- **SM 的个数大约在 100 到 200 之间，而且这些年没怎么变。** 从 108 到 148，涨得很有限。
+- **寄存器也基本没变。** B200 上每个 SM 有 **65536 个寄存器**，合计 256 KB。
+- **L1 缓存和 shared memory 是同一块物理内存**，只是用法不同：
+  **shared memory 是你能控制的，L1 缓存是你控制不了的**。两者都是**每个 SM 一份**，容量在同一个量级。
+- **L2 缓存不是每个 SM 一份，而是整块芯片共享的**，容量大一些。
+- **HBM 容量是唯一在明显上涨的数**：80 GB 到 192 GB。
+
+<Callout type="note" title="补充：寄存器、缓存、shared memory 分别是什么">
+从快到慢、从小到大排一遍：
+
+- **寄存器（register）**：**每个线程私有**的几十上百个存储槽，是 CPU / GPU 上最快的存储。
+  你在 kernel 里写的那些局部变量，最终大多住在寄存器里。
+- **shared memory（共享内存）**：**每个 SM 一块**的高速小内存，
+  **同一个 thread block 里的所有线程都能读写它** —— 这是线程之间交换数据的主要手段。
+  容量只有一两百 KB，但比 HBM 快几十倍。
+- **L1 / L2 缓存**：自动生效的缓存，你不显式管理它。L1 和 shared memory 共用同一块硅片，
+  L2 在整块芯片上共享。
+- **HBM（high bandwidth memory，高带宽显存）**：显卡上那几十上百 GB 的大内存。
+  你的模型权重、激活值都住在这里。**它离计算核心最远，也最慢。**
+
+关键的一句：**shared memory 是程序员能主动利用的那一层**，
+而这一讲后半段所有的优化技巧 —— 融合、分块 —— 本质上都是在问
+**「怎么少去 HBM 跑几趟，多在 shared memory 里干活」**。
+</Callout>
+
+Percy 补充了一句：**B200 还有一种叫 tensor memory（TMEM）的东西**，
+专门服务于 tensor core，位置介于寄存器和 shared memory 之间。它对程序员是不可见的，
+但硬件上确实存在。
+
+### 1.2 内存层级：带宽
+
+除了容量，还要看**带宽**。规律很简单：**带宽和容量大致成反比。**
+
+| 指标 | A100 | H100 | B200 |
+| --- | --- | --- | --- |
+| 寄存器带宽 | 约 116 TB/s | 约 401 TB/s | 约 447 TB/s |
+| L1 缓存 + shared memory 带宽 | 约 19 TB/s | 约 33 TB/s | 约 19 TB/s |
+| L2 缓存带宽 | 约 5–8 TB/s | 约 12 TB/s | 约 9 TB/s |
+| HBM 带宽 | 2 TB/s | 3.35 TB/s | 8 TB/s |
+
+**寄存器最快，L1 略慢，L2 更慢，HBM 最慢。** 不过 Percy 也说了句公道话：
+**8 TB/s 放在整个计算机世界里也不算慢**，只是在 GPU 内部的对比里它是最慢的一层。
+
+<Theorem type="proposition" name="要记在脑子里的那句话">
+**大的内存又慢又远，但装得多；快的内存（寄存器、L1 / shared memory）就在 SM 上，
+是本地的、快的，但很小。**
+
+这就是我们要工作的全部环境。
+</Theorem>
+
+## 二、编程模型：thread、thread block、grid
+
+硬件讲完了，那**怎么给 GPU 编程**？
+
+<Figure src="/courses/cs336/l06-grid-ctas.png" caption="编程模型的三层：一个 grid 里有很多 CTA（thread block），每个 CTA 里有很多 thread。来源：NVIDIA PTX ISA 文档" />
+
+<Theorem type="definition" name="编程模型的三层">
+
+- **线程（thread）**：在**数据的一小块**上执行一段代码。图里每一支向下的箭头就是一个线程。
+- **线程块（thread block）**，也叫**并发线程数组（concurrent thread array, CTA）**：**一组线程**。
+- **网格（grid）**：**一堆线程块的集合**。
+
+**启动一个 kernel，就是启动一整个 grid 的线程块和线程**，让它们同时去做某个计算。
+
+</Theorem>
+
+这是简化的图景，实际上还有别的东西：
+
+- **H100 和 B200 有 thread block cluster（线程块簇）**，也就是把若干个线程块聚成一簇，
+  从而支持某种程度的**分布式共享内存**。
+- **B200 还有前面说的 tensor memory。**
+
+这些东西有的对程序员不可见，但硬件里确实有。这一讲是入门，不管它们。
+
+### 2.1 为什么非要有「线程块」这一层
+
+一个很自然的疑问是：**为什么不能就是一个 grid 里全是线程，每个线程拿一小块数据干活？**
+
+对**逐元素运算（elementwise operation）**来说，这确实够了。比如 GeLU 这个激活函数是逐元素作用的，
+那么让每个线程处理一个元素就非常自然 —— 用 Percy 的写法就是对
+$i = 0, \ldots, N-1$ 分别算 $f(i)$。
+
+**但对 softmax 或者矩阵乘法这类运算就不够了**，因为**线程之间需要通信**。
+
+严格来说也不是完全不行 —— 你可以让每个线程独立算出结果矩阵里的一个元素，
+需要什么就去 HBM 读什么、算完写回 HBM。**这是正确的**，但正如我们已经知道的，
+**HBM 非常慢**，这个策略性能会很糟。
+
+所以正确的做法是**用 shared memory** —— 它是 SM 本地的、快的。而**线程块这个概念，
+正是「一组会访问同一块 shared memory 的线程」**。
+
+<Theorem type="proposition" name="线程块的意义">
+因为一个线程块里的线程要共享同一块 shared memory，而 shared memory 是每个 SM 一份的，
+所以**一个线程块必然被调度到一个 SM 上**。
+
+于是一个线程块要干的事就长成这个固定的形状：
+
+1. **从 HBM 读一批数据进来**；
+2. **处理它** —— 处理过程中线程之间可以通过 shared memory 互相通信；
+3. **把结果写回 HBM**。
+
+</Theorem>
+
+这个形状后面会反复出现。Percy 说：**讲到分块（tiling）的时候，这就是全部的游戏。**
+
+而在 **Triton 里，我们会原生地按线程块来思考**。他说，一旦你习惯了「用线程块思考」，
+很多事情会变得顺理成章，日子好过很多。
+
+## 三、编程模型撞上硬件：五件必须知道的事
+
+编程模型本身很简单：线程、线程块、网格，就这三样。**事情变复杂的地方，
+是编程模型和硬件的相互作用。**
+
+编程模型提供的是**硬件的一层抽象**。写 kernel 的时候，你只需要知道有一堆线程块，
+定义它们各自要做什么计算 —— 这部分**就像写 Python 一样简单**。
+**如果你只在乎正确性，知道这些就够了。**
+
+但**性能对硬件极其敏感**。而我们讨论 GPU 和 kernel 的**全部理由**就是想榨出性能。
+所以这里有两个层次：**理解这个计算在算什么**是编程模型的事，
+**它跑得多快**却强烈依赖硬件。
+
+下面是五个例子，用来说明这件事为什么重要。
+
+### 3.1 warp 与控制分歧
+
+<Theorem type="definition" name="warp（线程束）">
+线程块里的线程实际上还被**分组成 warp，每个 warp 32 个线程**。
+
+比如一个线程块有 64 个线程，那它就有 **2 个 warp**（前 32 个和后 32 个）：
+
+```text
+| TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT | TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT |
+|             warp 0               |             warp 1               |
+```
+
+**warp 不属于那个干净的编程模型**（编程模型里只有线程、线程块、网格），
+但它是硬件的真实组织方式。写代码的时候你不必显式管它。
+</Theorem>
+
+warp 的第一个关键性质是：**一个 warp 内的所有 32 个线程必须在 SM 上以「锁步（lockstep）」
+的方式执行同一条指令。** 每一个周期，它们执行的都得是**完全相同的那条指令**。
+
+由此就有了**控制分歧（control divergence）**：如果 warp 里不同的线程需要执行不同的指令
+（比如代码里有 `if A else B` 这样的分支），会发生什么？
+
+```text
+| AAAAAAAAA....................... |   ← 先让走 A 分支的线程执行，其余的干等
+| .........BBBBBBBBBBBBBBBBBBBBBBB |   ← 再让走 B 分支的线程执行，前面那批干等
+```
+
+**两个分支被串行化了。** 这很低效，也正是**写 kernel 时一般要避免分支**的原因。
+
+warp 的第二个关键性质，Percy 说这是他觉得 warp 真正酷的地方：
+
+<Callout type="insight" title="SM 在多个 warp 之间零成本切换，用来隐藏延迟">
+一个 SM 上其实同时驻留着**多个 warp**，还有一个 **warp 调度器（warp scheduler）**。
+每个 warp 里的线程各自占着一批寄存器 —— 而正因为**每个 warp 的状态都完整地待在寄存器里**，
+SM 可以**零成本地在这些 warp 之间切换**。
+
+**这在 CPU 上是做不到的**（CPU 切换线程要保存和恢复上下文，代价不小）。
+GPU 这样设计的目的只有一个：**隐藏延迟。**
+
+具体场景是这样：某个 warp 发出了一次 HBM 读取，而 HBM 读取**可能要等上一百个周期**。
+你当然不想让这个 SM 就干坐着等。于是它**立刻切换到另一个 warp**，
+那个 warp 也许正好可以去做一些 tensor core 运算。等数据回来了，warp 调度器再切回来。
+</Callout>
+
+### 3.2 warp occupancy：寄存器把线程挤掉
+
+warp 引出的第二个概念是**占用率（occupancy）**，更准确地说是 **warp occupancy**。
+
+硬件的约束是：**每个线程最多用 255 个寄存器**。而**一个 SM 的寄存器总数是固定的**。
+所以：**每个线程用的寄存器越多，能同时驻留的线程就越少** —— 这纯粹是除法。
+这就叫**占用率降低**。
+
+<Callout type="warning" title="占用率低不一定是坏事">
+一个常见的误解是「占用率越高越好」。**不是的。**
+
+如果线程数少了，但**每个线程干的活更多**，那反而可能更好。
+占用率是一个**你可以测量**的量，但不是「越大越好」——这里面有别的取舍。
+</Callout>
+
+一个具体的例子叫**线程粗化（thread coarsening）**：
+
+假设你要做一个逐元素运算。**方案一**是让一个线程处理一个元素 —— 线程非常多。
+**方案二**是让**每个线程处理多个元素**（比如固定 8 个）—— 线程少了，
+调度这些事变得容易，但每个线程干的活更多。
+
+Percy 的说法是：**如果你的线程太「瘦」了，也许该把它们喂胖一点。**
+
+现在来算一个具体的占用率。这是课件里的算例：
+
+```python
+# 我们想跑的东西
+num_threads_per_block = 128     # 一个线程块里放 128 个线程
+num_registers_per_thread = 160  # 每个线程用 160 个寄存器
+
+# 硬件能提供的（B200 的数字）
+max_registers = 65536  # 每个 SM 允许的寄存器总数
+max_warps = 64         # 每个 SM 允许同时驻留的 warp 数
+
+# 于是我们实际能同时跑多少
+assert num_registers_per_thread <= 255            # 硬件上限，先检查一下
+
+# 一个线程块要占多少寄存器：线程数 × 每线程寄存器数
+num_registers_per_block = num_threads_per_block * num_registers_per_thread   # 20480
+
+# 一个 SM 上能同时放几个这样的块：被寄存器卡住了
+num_blocks = max_registers // num_registers_per_block                        # 3
+
+# 换算成 warp 数：每 32 个线程一个 warp
+num_warps = num_blocks * num_threads_per_block / 32                          # 12
+
+# 占用率 = 实际驻留的 warp 数 ÷ 允许的最大 warp 数
+occupancy = num_warps / max_warps                                            # 0.1875
+```
+
+一步步走：$128 \times 160 = 20480$ 个寄存器一个块；
+$65536 \div 20480$ 取整是 **3 个块**；
+$3 \times 128 \div 32 = 12$ 个 warp；
+$12 / 64 = 18.75\%$。
+
+**占用率只有 18.75%** —— 我们只用上了这个 SM 能容纳的 warp 数的不到五分之一，
+原因就是**每个线程的寄存器用量太大**。Percy 对这个例子的评语是：
+**这是一个「内存反过来限制了你能做多少计算」的例子。**
+
+<Callout type="tip" title="动手：两种占用率">
+下面这个工具把上面这条算式做成了滑块，另外把 3.5 节的**波次量化**也放在了一起
+（那一节读完再回来看下半部分也行）。
+
+上半部分默认就是课上的算例：128 线程 / 块、160 寄存器 / 线程，结果是 **18.75%**。
+值得试的事：
+
+- 把寄存器从 160 拖到 128：$128 \times 128 = 16384$，$65536 / 16384 = 4$ 个块，
+  占用率一下跳到 25%。**再拖到 64**，块数变成 8，占用率 50%。
+  可以看到占用率是**阶梯状**跳的 —— 因为块数必须是整数，这就是那个整除运算的后果。
+- 反过来把寄存器拖到 255（硬件上限），看占用率掉到什么程度。
+- **决定占用率的主要是「每线程用多少寄存器」，而不是块的大小。**
+  在 160 寄存器不变的情况下，把每块线程数从 128 改成 64 或 32，
+  会看到 warp 数一直是 12 —— 因为块数相应地变成 6 个、12 个，正好抵消。
+  但**取整会咬人**：改成 256 时一个 SM 只放得下 1 个块，warp 数掉到 8；
+  改成 512 时 $512 \times 160 = 81920$ 已经超过 65536，**一个块都放不下，kernel 根本起不来**。
+
+</Callout>
+
+<L06Occupancy />
+
+### 3.3 bank conflict：shared memory 上的排队
+
+第三个例子叫 **bank conflict（存储体冲突）**，这一条**只针对 shared memory**。
+
+硬件的组织方式是：**shared memory 被分成 32 个 bank（存储体），每个 bank 宽 4 字节。**
+
+```text
+B00 B01 B02 B03 B04 B05 B06 B07 B08 B09 B10 B11 B12 ...  B31
+... ... ... ... ... ... ... ... ... ... ... ... ...      ...
+... ... ... ... ... ... ... ... ... ... ... ... ...      ...
+```
+
+约束是：**每个时钟周期，每个 bank 最多只能被一个线程访问**（除非多个线程访问的是
+**完全相同的那个位置**，那样可以广播）。
+
+于是：**如果多个线程同时试图访问同一个 bank 的不同位置，这些访问就必须被串行化。**
+这就是 bank conflict。
+
+<Callout type="warning" title="最坏的情况：32 路 bank conflict">
+设想 shared memory 里放着一个矩阵，**一行正好横跨全部 32 个 bank**
+（这是最自然的行主序摆法）。
+
+现在你有一个操作要让 **32 个线程同时访问第一列**。你可能很高兴地想：
+「32 个线程，我可以大规模并行！」——
+
+**但第一列的 32 个元素全都落在同一个 bank 里。** 于是这 32 个线程只能排队，一个一个来。
+这叫 **32 路 bank conflict**，是**能碰到的最糟的情况**。
+</Callout>
+
+那不能干脆只按行访问吗？Percy 说：**做不到，这在矩阵乘法里是不可避免的** ——
+算 `A @ B` 的时候，你**必须**访问 A 的行和 B 的列，有时候还要做转置。
+逐元素运算你想按什么顺序访问都行，但矩阵乘法里你没法控制每个矩阵到底是行主序还是列主序。
+
+**解法叫 swizzling（搅动 / 重排）**：把 shared memory 里的数据**重新摆放**
+（比如把地址按「行下标异或列下标」的方式打乱），使得按列访问时元素散落到不同 bank 上。
+课上没有展开讲。
+
+另外 Percy 提到：**做性能分析的时候，你可以直接看到 bank conflict 的数量、看到占用率**，
+从而知道发生了什么。
+
+### 3.4 memory coalescing：HBM 上的合并访问
+
+第四个例子是**内存合并访问（memory coalescing）**，Tatsu 上一讲讲过，这里快速复习。
+这一条**只针对 HBM**。
+
+规则是：**当一个 warp 里的 32 个线程访问 HBM 时，这些访问会被合并成一次 128 字节的事务**，
+也就是**一条缓存行（cache line）**，硬件一次性把它取回来。
+
+设想内存是这样铺开的（每行 32 个元素，每个 4 字节，正好 128 字节 = 一条缓存行）：
+
+```text
+M00 M01 M02 M03 M04 M05 M06 M07 M08 ... M29 M30 M31
+M32 M33 M34 M35 M36 M37 M38 M39 M40 ... M61 M62 M63
+```
+
+- **最好的情况（完全合并，full coalescing）**：线程 0 访问 `M00`、线程 1 访问 `M01`、
+  以此类推 —— **32 个线程访问的正好是同一条缓存行**（$32 \times 4 = 128$ 字节）。
+  一次取回，全部用上。
+- **坏的情况**：如果你**沿着列往下走**，那么为了拿到第一列的 32 个元素，
+  你要取回 32 条不同的缓存行，**每条里只用了 4 个字节，剩下 124 个字节全浪费**。
+
+<Callout type="warning" title="别把 bank conflict 和 coalescing 搞混">
+这两件事**感觉上很像**（都是「按列访问会出事」），但它们是**完全不同的两个约束**：
+
+- **bank conflict** 说的是 **shared memory**，问题是「32 个 bank 各自每周期只服务一个线程」。
+- **memory coalescing** 说的是 **HBM**，问题是「取回来的 128 字节缓存行有没有被用满」。
+
+它们发生在内存层级的不同层上。
+</Callout>
+
+### 3.5 block occupancy：最后一波没填满
+
+最后一个例子叫 **block occupancy**，问题出在**线程块是被调度到 SM 上的**这件事上。
+
+**逻辑上你可以定义任意多个线程块**，但**物理上芯片只有固定数目的 SM**，比如 B200 是 148 个。
+
+<Figure src="/courses/cs336/l06-wave-quantization.png" caption="线程块以「波（wave）」为单位被调度到 SM 上。第一波填满，最后那一波（tail）只有零星几个块，其余 SM 空着。来源：NVIDIA 开发者博客" />
+
+举例：**你启动了 160 个线程块**。
+
+- **第一波**：148 个块被调度上去，把所有 SM 填满。
+- 等它们跑完之后，**第二波**才能上 —— 但第二波只有 **12 个块**。
+- 于是在第二波期间，**148 减 12 = 136 个 SM 完全空着**。
+
+这就是**波次量化（wave quantization）问题**：**最后一波的线程块数量偏少，
+留下一堆 SM 闲着**，也就是 block occupancy 低。
+
+**解决办法**：**让线程块的数量能整除 SM 的个数**（或者反过来说，凑成 SM 数的整数倍）。
+
+<Callout type="note" title="补充：课上的一个学生提问 —— 一个块能不能和别的块共享一个 SM">
+有同学问：148 个 SM、160 个块，非得分两波吗？**能不能让一个块「共享」一个 SM？**
+
+Percy 的回答分两层：
+
+1. **如果你的代码写得对**，那么一个块往往已经把 SM 上的资源（比如 tensor core）用得差不多了，
+   **这时候再往上塞一个块也不会让事情变快**。
+2. **更根本的问题是不均匀性**：**一个线程块必须整体待在一起**，
+   你没法把它切开、摊到多个 SM 上去。
+
+所以真正该做的**不是**想办法共享 SM，**而是改块的大小**，
+从而改变块的总数，让这个「尾巴」不出现。
+</Callout>
+
+### 3.6 这一节的小结
+
+<Theorem type="proposition" name="编程模型与硬件的对应">
+**编程模型很优雅：**
+
+- **grid** ↔ 大家都能访问的 **HBM**
+- **thread block** ↔ 块内共享的 **shared memory**
+- **thread** ↔ 线程私有的**寄存器**
+
+**但硬件的细节 —— warp、bank conflict、memory coalescing、两种占用率 ——
+才真正决定性能。**
+</Theorem>
+
+Percy 最后补了一句实话：**这些细节其实很难知道。** 性能分析器会告诉你一堆信息，
+但你还得知道到底有多少个 SM、每样东西的确切大小；而且**有时候调度器做的事你根本控制不了**。
+所以现实**比编程模型乱得多**。
+
+## 四、基准测试：它花了多长时间
+
+<Theorem type="proposition" name="成功的配方">
+
+1. **对你的代码做基准测试和性能分析**
+2. **做改动**
+3. **再对你的代码做一次基准测试和性能分析**
+
+</Theorem>
+
+Percy 特意把这一节放在讲 Triton 之前，理由是：
+**在你开始写 kernel 之前，你应该先测量、先搞清楚瓶颈在哪。**
+
+**基准测试（benchmarking）测的是「做某件事花了多少墙上时钟时间」。**
+它只给你**端到端的时间**，不告诉你时间花在哪儿（那是性能分析的活）。但它仍然很有用：
+
+- **比较不同实现**（哪个更快？）
+- **理解性能怎么随规模变化**（比如随维度）
+
+因为它把一切浓缩成**一个数**，所以特别适合看扩展趋势。
+
+PyTorch 有现成的工具 [`torch.utils.benchmark`](https://pytorch.org/tutorials/recipes/recipes/benchmark.html)，
+但这门课叫「从零构建语言模型」，所以还是自己写一个 —— 主要是为了把几个**坑**摆到台面上。
+
+先看被测的东西是怎么准备的：
+
+```python
+def run_operation2(dim: int, operation: Callable) -> Callable:
+    """造两个 dim × dim 的随机方阵，返回一个「执行该操作」的函数。"""
+    x = torch.randn(dim, dim, device=cuda_if_available())
+    y = torch.randn(dim, dim, device=cuda_if_available())
+    # 注意：矩阵是提前造好的，返回的函数只负责跑那个操作，不含造数据的时间
+    return lambda: operation(x, y)
+
+
+# 于是这就是一个「跑一次 1024×1024 矩阵乘法」的函数
+matmul = run_operation2(dim=1024, operation=lambda a, b: a @ b)
+```
+
+然后是基准测试本身：
+
+```python
+def benchmark(run: Callable, num_warmups: int = 1, num_trials: int = 3) -> float:
+    """跑 num_trials 次 run，返回平均耗时（毫秒）。"""
+
+    # 坑一：预热（warmup）。
+    # 头几次可能因为惰性编译等原因偏慢，而我们真正关心的是「稳态」下的速度 ——
+    # 因为这个 kernel 后面会被跑成千上万次，最初那几次的开销不该算进去。
+    for _ in range(num_warmups):
+        run()
+    torch.cuda.synchronize()  # 等所有 CUDA 线程干完（很重要！）
+
+    # 现在开始真正计时
+    times: list[float] = []
+    for trial in range(num_trials):   # 坑二：多跑几次，因为存在方差
+        # 坑三：用 CUDA event 计时，而不是 Python 的时钟 ——
+        # 这样测的是 GPU 上真正的执行时间，不会把 CPU 侧的开销算进来
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        start_event.record()      # 开始计时
+        run()                     # 真正执行计算
+        end_event.record()        # 结束计时
+
+        # 坑四：同步。GPU 上一切都是异步发生的，这一行是同步屏障，
+        # 不加的话你测到的只是「把任务塞进队列」的时间
+        torch.cuda.synchronize()
+
+        times.append(start_event.elapsed_time(end_event))
+
+    mean_time = mean(times)
+    return mean_time
+```
+
+Percy 说，如果你要求很严格，大概不该只看平均值，而该看**整个分布**、看 **P95**；
+这里为了简单只取平均。
+
+**有了它就能看扩展趋势了**：
+
+```python
+results = {}
+for dim in [256, 512, 1024, 2048, 4096, 8192]:
+    results[dim] = benchmark(run_operation2(dim=dim, operation=lambda a, b: a @ b))
+```
+
+<Callout type="insight" title="矩阵乘法的耗时曲线有一个「地板」">
+按理说矩阵乘法的运算量是 $O(n^3)$，所以时间应该是**立方增长**的。
+实际测出来确实如此 —— **但要等到维度大概到 2000 以上才开始。**
+
+在那之前，**时间基本是一个常数**。
+
+原因我们在第二讲已经见过了：**GPU 是为相当大的矩阵乘法造的。**
+一个 2×2 的矩阵乘法，GPU 跑起来极其低效 —— 你只是在为启动 kernel、
+搬那几个数付固定开销，算力完全没被用上。
+</Callout>
+
+## 五、性能分析：时间花在了哪里
+
+**性能分析（profiling）告诉你时间实际花在了哪里。**
+
+Percy 说还有一个不那么显然的用途：**即使你根本不关心时间，性能分析也能帮你搞清楚
+底下到底在发生什么。** 尤其是用这种高级语言的时候，你写一段代码、跑一下、拿到结果，
+中间发生了什么完全看不见 —— 能看一眼是很有价值的。
+
+PyTorch 有[内置的 profiler](https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html)：
+
+```python
+def profile(run: Callable, num_warmups: int = 1):
+    # 同样要先预热
+    for _ in range(num_warmups):
+        run()
+    torch.cuda.synchronize()
+
+    # 把要测的代码放进 profiler 的上下文里跑
+    with torch.profiler.profile(activities=[ProfilerActivity.CUDA],
+            experimental_config=torch._C._profiler._ExperimentalConfig(verbose=True)) as prof:
+        run()
+        torch.cuda.synchronize()
+
+    # 按 CUDA 总耗时排序，打印前 10 行
+    table = prof.key_averages().table(sort_by="cuda_time_total",
+                                      max_name_column_width=100,
+                                      row_limit=10)
+    return table
+```
+
+### 5.1 看三个例子
+
+**例一：两个张量相加。**
+
+```python
+add_profile = profile(run_operation2(dim=2048, operation=lambda a, b: a + b))
+```
+
+平时写 PyTorch 你根本不会去想 `a + b` 底下发生了什么 —— 就两个张量加起来嘛。
+但 profiler 里能看到一个名字很长的 kernel，里面写着 **`CUDAFunctor_add`** 之类的字样。
+这说明：底下确实有一个叫「加法」的 kernel 在跑。
+
+（这个例子的耗时占比不有趣，因为整段代码只做加法，那一行必然占 100%。）
+
+**例二：矩阵乘法，维度 2048。**
+
+```python
+matmul_profile = profile(run_operation2(dim=2048, operation=lambda a, b: a @ b))
+```
+
+同样是一个长名字，形如：
+
+```text
+cutlass3x_sm100_simt_sgemm_f32_f32_f32_f32_f32_64x64x16_1x1x1_3_nnn_align1_bi...
+```
+
+**例三：同样是矩阵乘法，但维度换成 128。**
+
+你会发现**调用的是另一个 kernel**：仔细看名字里的 tile 形状，
+例二是 `64x64x16`，例三变成了一组**更小的数**。
+
+<Theorem type="proposition" name="从这三个例子能看出什么">
+
+1. **你能看到实际被调用的 CUDA kernel 是哪些** —— 一般就是那些名字特别长的行。
+2. **张量维度不同，调用的 CUDA kernel 也不同。** PyTorch 会挑不同的实现。
+3. **kernel 的名字本身就告诉你一些实现细节。**
+
+</Theorem>
+
+把例二那个名字拆开读：
+
+- **`cutlass`**：NVIDIA 的线性代数 CUDA 库（专门做矩阵乘法这类事）。
+- **`sm100`**：对应 NVIDIA **Blackwell** 架构，也就是 B200。所以这是一个**专为 Blackwell 设计**的 kernel。
+- **`f32`**：float32。
+- **`64x64x16`**：**tile（分块）的形状** —— 这正是本讲最后讲矩阵乘法时会展开的那个概念。
+
+<Callout type="note" title="补充：为什么同一个算子会有一堆 kernel">
+因为「什么实现最快」取决于矩阵的形状。一个为 2048×2048 调优的 kernel
+（tile 开得大、每个线程块干很多活）放到 128×128 上就会**块数太少、SM 填不满**；
+反过来为小矩阵调的 kernel 放到大矩阵上又会**块数太多、每块干的活太少**。
+
+所以像 cuBLAS / CUTLASS 这样的库里其实**编译进了成百上千个 kernel 变体**，
+运行时根据形状去挑一个。这也是为什么 profiler 里的 kernel 名字带一堆数字 ——
+那些数字就是这个变体的配置。
+</Callout>
+
+**记得做基准测试、记得做性能分析。** Percy 说：作业里会让你做，所以你没得选。
+
+## 六、跑一遍 GeLU：朴素 / 内置 / 编译
+
+现在把上面两件工具用在一个具体例子上：[GeLU 激活函数](https://pytorch.org/docs/stable/generated/torch.nn.GELU.html)。
+
+GeLU 是一个常用的非线性函数，通常用下面这个 **tanh 近似**来算，因为它对计算更友好：
+
+$$
+\mathrm{GeLU}(x) \;\approx\; 0.5\,x\,\Bigl(1 + \tanh\bigl(\sqrt{2/\pi}\,(x + 0.044715\,x^3)\bigr)\Bigr)
+$$
+
+（其中 $\sqrt{2/\pi} \approx 0.79788456$。）
+
+我们让**三匹马赛跑**。
+
+**第一匹：朴素的 PyTorch 实现（不融合）。** 就是把公式一字不差地写成 PyTorch：
+
+```python
+def naive_gelu(x: torch.Tensor):
+    # 把上面那个 tanh 近似公式直接抄进来
+    return 0.5 * x * (1 + torch.tanh(0.79788456 * (x + 0.044715 * x * x * x)))
+```
+
+**第二匹：PyTorch 内置的实现（已融合）。**
+
+```python
+def builtin_gelu(x: torch.Tensor):
+    # PyTorch 自带的 GeLU，指定用 tanh 近似，保证和上面算的是同一个函数
+    return torch.nn.functional.gelu(x, approximate="tanh")
+
+
+check_equal_1d(naive_gelu, builtin_gelu)   # 随机输入下两者结果一致
+```
+
+**第三匹：把朴素实现丢给 PyTorch 编译器。** 这一条是很多人可能还不知道的：
+**任何 PyTorch 函数都可以调用 `torch.compile` 编译一遍**，得到一个新函数，做的事情完全一样。
+
+```python
+compiled_gelu = torch.compile(naive_gelu)
+check_equal_1d(naive_gelu, compiled_gelu)   # 编译不该改变语义
+```
+
+**开跑**（输入是 16384 × 16384 的矩阵）：
+
+```python
+naive_time    = benchmark(run_operation1(dim=16384, operation=naive_gelu))
+builtin_time  = benchmark(run_operation1(dim=16384, operation=builtin_gelu))
+compiled_time = benchmark(run_operation1(dim=16384, operation=compiled_gelu))
+```
+
+结果是：**朴素版约 3.75 毫秒；内置版快得多；编译版也快得多，但比内置版稍慢一点。**
+
+<Callout type="warning" title="这些数字不要当成定论">
+课上有同学问「为什么 Triton kernel 更快」，Percy 纠正说：**这里 Triton kernel 并不更快** ——
+编译出来的那个 Triton kernel **比内置版慢**。
+
+他还补充说：**去年他讲这一课的时候，两者其实更接近。** 这些数字会变，
+而且**强烈依赖硬件**；这里的实现也都没有认真优化过，
+只是拿来说明大方向。
+</Callout>
+
+**三个实现算的是同一个函数，为什么性能差这么多？** 拉出 profiler 看看。
+
+**朴素版的 profile**：能看到**一堆不同的 kernel** —— binary functor、unary functor、
+add、tanh 等等。原因很直接：
+
+<Theorem type="proposition" name="为什么朴素版慢">
+你在 PyTorch 里写下那个表达式，PyTorch 会建出一张**计算图**，
+而**图里的每一个原语操作都会被实现成一个 kernel**。
+
+而**每启动一个 kernel，都要：从 HBM 读数据 → 一路搬到 SM → 做计算 → 写回 HBM。**
+下一个 kernel 再从 HBM 把它捡起来、算、写回，如此往复。
+
+**因为 kernel 调用之间，数据必须回到 HBM。**
+</Theorem>
+
+数一下那个表达式里有多少个逐元素原语：`0.044715 * x` 一次乘、再乘 `x` 一次、
+再乘 `x` 一次、`x + …` 一次加、`0.79788456 * …` 一次乘、`tanh` 一次、`1 + …` 一次加、
+`0.5 * x` 一次乘、最后两者相乘一次 —— **九个**。
+也就是说朴素版要**从 HBM 读九遍、写九遍**，而理论上只需要读一遍、写一遍。
+
+**内置版的 profile**：Percy 说这个「其实不太有意思」—— 就是**一个** GeLU 的 CUDA kernel 实现。
+为什么会有这个东西？**因为大家都在用 GeLU，所以有人给它写了个 kernel，放进了标准库。**
+没有任何魔法。（课上有同学问它是用什么写的，Percy 看了一眼说名字里写着
+「CUDA kernel implementation」，估计是有人用 CUDA 写的。）
+
+**编译版的 profile**：这个 Percy 说很有意思。你拿一个朴素实现（它在 PyTorch 里就是一张计算图），
+跑一遍编译器，底下出来的是**单个 kernel** —— 编译器**看懂了整张计算图，
+然后用 Triton 把那个 kernel 写了出来**。所以你在 profile 里看到的是一个 **Triton kernel**。
+
+<Theorem type="definition" name="算子融合（kernel fusion）">
+
+- **朴素实现**：多个 kernel，需要多次往返 HBM，**没有融合** —— 慢。
+- **内置版 / 编译版**：**一个 kernel**，GeLU 里所有的运算都被**融合**到了一起。
+  于是**每个元素只从 HBM 读一次、写回一次**。
+
+**这就是算子融合。** 注意：**融合一个 FLOP 都没省下来，省的全是数据搬运。**
+而对逐元素运算来说，数据搬运就是全部的瓶颈（回忆第二讲：GeLU 的算术强度只有 5，
+远低于 H100 的加速器强度 295，是彻底的内存受限）。
+
+</Theorem>
+
+<Callout type="tip" title="动手：把融合省下来的搬运量算出来">
+下面这个对账器有两个模式。
+
+**「逐元素算子链」** 默认就是上面 GeLU 的情形：**9 个逐元素算子**、
+输入 $2^{24}$ 个元素。可以看到不融合要做 9n 次读加 9n 次写，融合后只有 n 读 n 写 ——
+**HBM 流量正好压到 1/9**。把「算子个数」拖到 1，两条柱子就一样长了（一个算子无可融合）。
+
+**「朴素 softmax」** 那一栏对应下面第九节要讲的 `naive_softmax`：
+五个 PyTorch 操作合计 5MN + M 次读、3MN + 2M 次写，融合后是 MN 读 MN 写 ——
+**倍数是 4**，正是课件注释里写的那个「4 倍加速」。
+
+值得试的事：把**列数 N** 拖到最小（16），比值会顶到 4 以上 ——
+因为那两个零头合起来是 3M，除以 2MN 就是 1.5/N，N 小的时候不可忽略；
+再把 N 拖大，比值稳稳收敛回 4。**行数 M 怎么拖都不影响这个比值。**
+
+</Callout>
+
+<L06HbmTraffic />
+
+## 七、Triton 是什么
+
+这就很自然地引到了 Triton。
+
+**在 CUDA 里（NVIDIA 开发，多年来一直是写 kernel 的标准做法），你指定的是「每个线程做什么」。**
+你写一段代码，里面有一个 ID 标识「我是哪个线程」，然后这段代码就被执行。
+
+- **好处**：它和底下真正发生的事**贴得非常近**，给你**细粒度的控制**。
+- **坏处**：所有线程都在一个线程块里，而**某些操作要求它们互相通信**。
+  于是你必须让它们**同步** —— 比如「大家一起从 HBM 读」、「同步一下」、「做计算」——
+  这些**簿记工作全得你自己做**。
+
+Percy 的判断是：**如果你做的全是逐元素运算，CUDA 挺好，无所谓；
+但一旦运算变复杂，Triton 的抽象就开始有价值了。**
+
+**在 Triton 里（OpenAI 开发，现在已经相当标准），你指定的是「每个线程块做什么」。**
+
+- 一般来说**够强了**，尤其是刚上手的时候。
+  如果你真的想榨干最新硬件的每一个新特性，它可能不给你完全的灵活性 —— 但先别管这个。
+- **概念框架**永远是那三步：**把数据 load 进 shared memory → 在上面做运算 →
+  写回 global memory。**
+
+<Callout type="insight" title="Triton 是两种思维之间的中间点">
+在 **PyTorch** 里，你定义的是一些巨大的矩阵，说「把它们乘起来」——
+矩阵乘法就是那个原子操作，而你大量的脑力花在**「怎么把事情都塞进大矩阵乘法里」**。
+
+在 **CUDA** 里，你思考的是**单个元素**在干什么。
+
+**Triton 的线程块正好是这两者之间的中间点。**
+</Callout>
+
+<Callout type="note" title="补充：global memory 就是 HBM">
+Triton 和 CUDA 的文档里说的 **global memory（全局内存）**，物理上就是 **HBM**。
+叫「全局」是因为**所有线程块都能访问它**，与之相对的是「每个块私有」的 shared memory
+和「每个线程私有」的寄存器。这份讲义里两个词是一个意思。
+</Callout>
+
+## 八、例子一：GeLU —— 逐元素运算
+
+上手写第一个 Triton kernel。这是**最简单的一类**：逐元素。
+（Percy 在课上问了一句有多少人写过 Triton，举手的人不多。）
+
+```python
+x = torch.randn(8192, device=cuda_if_available())   # 一个 8192 维的向量
+y = triton_gelu(x)
+check_equal_1d(triton_gelu, naive_gelu)             # 检查正确性
+```
+
+### 8.1 主机端：把 grid 划出来
+
+这一部分**还是普通的 PyTorch**，没有任何 Triton 的东西，只是在做准备工作。
+
+```python
+def triton_gelu(x: torch.Tensor):
+    # 检查输入：必须在 GPU 上，而且内存必须是连续的
+    # （不连续的话下面的指针算术就不对了）
+    assert x.is_cuda
+    assert x.is_contiguous()
+
+    # 分配输出张量。
+    # 注意：在 Triton 里我们不再用「函数式」的思维了 —— 没有返回值这回事，
+    # 你必须显式地读、显式地写。所以要先准备好一块给 kernel 写的地方。
+    y = torch.empty_like(x)
+
+    # 划分 grid：把所有元素切成一个个 block
+    # | T T T T T T T T | T T T T T T T T | T T T T T T T T | T T T T T T T T |
+    # |    Block 0      |    Block 1      |    Block 2      |    Block 3      |
+    num_elements = x.numel()                              # 8192
+    BLOCK_SIZE = 1024                                     # 一个块里的线程数
+    num_blocks = triton.cdiv(num_elements, BLOCK_SIZE)    # 向上取整的除法 → 8
+
+    # 启动 kernel。方括号里那一项指定的是 grid 的形状：
+    # 这里说「grid 里有 num_blocks 个块」，于是这个函数会被调用 num_blocks 次，
+    # 每次对应一个块。
+    kernel = triton_gelu_kernel[(num_blocks,)](x, y, num_elements, BLOCK_SIZE=BLOCK_SIZE)
+
+    output_ptx("triton_gelu", kernel)    # 把编译出来的 PTX 存下来，一会儿看
+
+    return y
+```
+
+为什么要切块？因为**这个张量可以任意大**，而**一个 SM 装不下它** —— 太大了。
+所以必须切开。这里 8192 个元素、块大小 1024，于是有 **8 个块**。
+
+<Callout type="note" title="补充：triton.cdiv 是什么">
+`cdiv` 是 **ceiling division，向上取整的除法**：`cdiv(a, b)` 等于
+「$a$ 除以 $b$ 再向上取整」。
+
+用它是因为**元素总数不一定能被 BLOCK_SIZE 整除**。比如 8000 个元素、块大小 1024，
+`cdiv(8000, 1024) = 8`（而不是 7），也就是**宁可多起一个块**，
+让最后那个块只处理一部分元素 —— 剩下的靠下面的 `mask` 挡掉。
+</Callout>
+
+### 8.2 kernel 本体
+
+```python
+@triton.jit          # 这个装饰器告诉 Triton：这个函数要被即时编译成 GPU 代码
+def triton_gelu_kernel(x_ptr, y_ptr, num_elements, BLOCK_SIZE: tl.constexpr):
+    # x_ptr：输入数据在 HBM 里的起始地址
+    # y_ptr：输出数据在 HBM 里的起始地址
+    # 注意这里已经不是张量了，是 **指针** —— 你可以把它们当成整数（地址）来想
+
+    # | T T T T T T T T | T T T T T T T T | T T T T T T T T | T T T T T T T T |
+    # |    Block 0      |    Block 1      |    Block 2      |    Block 3      |
+
+    # 「我是谁」：program_id 标识这是第几个块。四个块的话，pid 分别是 0, 1, 2, 3
+    pid = tl.program_id(axis=0)
+
+    # 「我该处理哪一段数据」：这个块的起始下标
+    # pid = 0 → start = 0；pid = 1 → start = BLOCK_SIZE；pid = 2 → 2 × BLOCK_SIZE ……
+    start = pid * BLOCK_SIZE
+
+    # 这个块要操作的全部下标。
+    # tl.arange(0, BLOCK_SIZE) 概念上就是 0, 1, ..., BLOCK_SIZE - 1 这串整数
+    offsets = start + tl.arange(0, BLOCK_SIZE)
+
+    # 别读写越界：造一个掩码，越界的位置为 false。
+    # 对不是最后一个的块，这个掩码全是 true
+    mask = offsets < num_elements
+
+    # 读：这就是指针算术 —— x_ptr 是起始地址，加上 offsets 就得到这一批元素的地址。
+    # 被 mask 挡掉的位置不去读
+    x = tl.load(x_ptr + offsets, mask=mask)
+
+    # 算：从这里开始，x 就可以当成一个普通的向量来用了。
+    # GeLU 的 tanh 近似是 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))，
+    # 但 Triton 里没有 tl.tanh，所以用恒等式 tanh(a) = (exp(2a) - 1) / (exp(2a) + 1)
+    a = 0.79788456 * (x + 0.044715 * x * x * x)
+    exp = tl.exp(2 * a)
+    tanh = (exp - 1) / (exp + 1)
+    y = 0.5 * x * (1 + tanh)
+
+    # 写：同样是指针算术，同样按掩码写回 HBM
+    tl.store(y_ptr + offsets, y, mask=mask)
+```
+
+<Theorem type="proposition" name="所有 Triton kernel 都长这个样子">
+Percy 特别强调要记住这个**通用形状**：
+
+1. 拿到**输入指针和输出指针**；
+2. **醒过来**，问「我是哪个块」（`tl.program_id`）；
+3. **算出我该看哪些下标**（`start`、`offsets`、`mask`）；
+4. **从 HBM 读**（`tl.load`）；
+5. **干活**（这一段写起来就像普通 PyTorch）；
+6. **写回 HBM**（`tl.store`）。
+
+后面三个例子全是这个骨架，只是第 3 步和第 5 步变复杂。
+</Theorem>
+
+<Callout type="note" title="补充：课上的一个提问 —— 这段代码用 CUDA 写会有什么不同">
+有同学问：如果用 CUDA 写这个 kernel，是不是也就是「读、算、写回」？
+
+Percy 的回答是：**对逐元素运算来说，两者看起来几乎一模一样** ——
+而且 **CUDA 甚至更简单**，因为它真的就是逐元素的：你醒过来，认领一个线程，
+然后就在那**一个元素**上干活。**Triton 这个版本相当于它的「向量化」形式** ——
+你认领的是一个块，然后在整块上干活。
+
+**但只要你做的事超出逐元素，CUDA 就会麻烦得多**（后面三个例子会越来越明显）。
+</Callout>
+
+<Callout type="note" title="补充：tl.constexpr 是什么意思">
+`BLOCK_SIZE: tl.constexpr` 里的 `constexpr` 表示这个参数是**编译期常量**。
+
+它不是运行时传进来的普通数值，而是**参与编译**的：Triton 会针对每个具体的
+BLOCK_SIZE 值**生成一份专门的机器码**（比如把循环完全展开、按这个大小分配寄存器）。
+这也是为什么 `tl.arange(0, BLOCK_SIZE)` 能工作 —— 编译的时候它就知道这个范围有多长。
+
+代价是：**换一个 BLOCK_SIZE 就要重新编译一次**。
+</Callout>
+
+<Callout type="tip" title="动手：BLOCK_SIZE、program_id 和 mask">
+下面这个工具就是上面那四行的可视化。条带是整个输入张量，
+每一段是一个线程块（也就是 `tl.program_id` 拿到的一个 pid），
+下面的表格逐块列出 `start`、`offsets` 的范围，以及 mask 里有多少个 true。
+
+默认就是课上的 **8192 / 1024 = 8 个块**，每个都是满的。值得试的事：
+
+- 点「除不尽（8000 / 1024）」：块数还是 8，但**最后一个块只有 832 个有效元素**，
+  另外 192 个位置被 mask 掉（图上是斜纹那一块）。**这就是 `mask` 存在的全部理由。**
+- 把 BLOCK_SIZE 从 1024 拖到 32，看块数怎么从 8 涨到 256 ——
+  再回头看 3.5 节的波次量化：块数一多，尾波的浪费就相对不明显了；
+  块数少的时候（比如只有 8 个块），148 个 SM 里有 140 个是完全闲着的。
+- 把元素数拖到 1，看 `cdiv` 怎么仍然给你 1 个块 —— 那个块里 1023 个位置都被 mask 掉。
+
+</Callout>
+
+<L06BlockGrid />
+
+### 8.3 往下看一层：PTX
+
+**Triton 会被编译成 PTX（parallel thread execution）**，这是 GPU 的一种**中间汇编语言**。
+课件把 `triton_gelu` 生成的 PTX 存了下来供翻看。
+
+从 PTX 里能看到什么：
+
+- **`ld.global.*` 和 `st.global.*`**：从 global memory（也就是 HBM）**读**和**写**。
+  这两行就对应上面的 `tl.load` 和 `tl.store`。
+- **`%ctaid.x` 是块下标，`%tid.x` 是线程下标。**
+- **`%f` 开头的是浮点寄存器，`%r` 开头的是整数寄存器。**
+  你会看到「把 0 放进 R5、把 0 放进 R6」、「把这个寄存器乘以这个常数、结果放进那个寄存器」
+  这类语句。
+- **一个线程同时处理 8 个元素** —— 这就是前面说的**线程粗化**。
+  编译器判断这个线程太轻了，干的活不多，于是**主动把它加厚了**。
+
+<Callout type="insight" title="PTX 里已经没有「线程块」了">
+一个重要的观察：**PTX 描述的是「一个线程」在做什么，不是一个线程块。**
+线程块那一层在编译过程中已经被消解掉了。
+
+而 PTX 里**仍然没有说清**的东西也很多 —— 比如在哪个 SM 上跑、warp 怎么排 ——
+**那些大多是硬件控制的**，你看不见。
+</Callout>
+
+<Callout type="note" title="补充：课上关于 PTX 的三个提问">
+
+**问：这段 PTX 是给每个线程各生成一份吗？**
+不是。**编译一次，所有线程跑的是同一份代码。** 线程区分自己的方式是
+**这段代码被传入了 ID**：`%ctaid.x` 告诉你「我在哪个块里」，
+`%tid.x` 告诉你「我是块里的第几个线程」。
+
+**问：PTX 是编译器生成的，人一般不看吧？**
+确实**有人手写 PTX** —— 如果你真的觉得自己比编译器强。Percy 说 NVIDIA 的编译器已经相当成熟，
+一般不需要这么干；但**在一些还不太成熟的加速器上**，有时候你就是得伸手进去多牵着走几步。
+
+**问：`tl.load` 会阻塞吗？我的 warp 是不是就在那儿干等？**
+（这个问题课上被问了两次，第二次一位同学自己把机制复述了一遍，Percy 确认是对的。）
+**是的**：那条 load 指令会**阻塞若干个周期**。但这个 warp 跑在某个 SM 上，
+而**这个 SM 同时跑着多个 warp** —— 所以它会**立刻找另一个 warp 来跑**，
+等数据回来了，warp 调度器再切回来。**线程不会真的干坐着。**
+这正是 3.1 节说的「零成本切换隐藏延迟」在具体代码上的样子。
+
+（还有同学问「为什么是 4 个 warp 调度器」，Percy 说他不知道确切原因。）
+</Callout>
+
+<Callout type="note" title="补充：tl.load 到底做了什么 —— 课上的一个重要澄清">
+有同学问：`tl.load` 执行的时候，数据是从 HBM 到 shared memory 再到寄存器吗？具体每一步是什么？
+
+Percy 的回答分两层。
+
+**机制上**：这在某种意义上是**一个「谎言」**。GPU 并不会真的在上面调用 Triton 这个库、
+真的执行这行 Python。**这行代码是写给我们看的，用来指定计算是什么。**
+编译器拿走它，翻译成 PTX，然后由 PTX 去干活。
+
+**概念上**：`x_ptr` 是 HBM 里的一个内存位置，`x_ptr + offsets` 指定了**一段内存位置**，
+`tl.load` 把这些位置上的数据取回来，绑到一个叫 `x` 的局部变量上。
+
+**至于这个 `x` 实际住在哪** —— 是寄存器还是 shared memory ——
+**Triton 自己决定**，你不写。（后面第十节还会再碰到这个问题。）
+
+同理，还有同学问「怎么才能用上 tensor core」：**短答案是你不控制，硬件决定往哪儿放。**
+</Callout>
+
+## 九、例子二：softmax —— 行装得进一个块
+
+前面看的是逐元素运算。现在看**要在多个值上做聚合**的运算。
+
+（这一节大致跟着 [Triton 官方的 fused softmax 教程](https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html)走。）
+
+**softmax 做的事**：**对矩阵的每一行取指数、再归一化。**
+
+```text
+[0 0 0    ]      =>   [1/3 1/3 1/3]
+[1 1 -inf ]           [1/2 1/2 0  ]
+```
+
+它用在注意力里，也用在生成概率上，总之是个好东西。
+
+### 9.1 朴素实现，以及数一数读写
+
+```python
+def naive_softmax(x: torch.Tensor):
+    # M 是行数，N 是列数
+    M, N = x.shape
+
+    # 算每行的最大值（为了数值稳定：先减掉最大值，指数就不会上溢）
+    x_max = x.max(dim=1)[0]              # 读 MN 个，写 M 个
+
+    # 减掉最大值
+    x = x - x_max[:, None]               # 读 MN + M 个，写 MN 个
+
+    # 逐元素取指数
+    numerator = torch.exp(x)             # 读 MN 个，写 MN 个
+
+    # 算归一化常数：每行求和
+    denominator = numerator.sum(dim=1)   # 读 MN 个，写 M 个
+
+    # 归一化
+    y = numerator / denominator[:, None] # 读 MN 个，写 MN 个
+
+    # 合计：5MN + M 次读，3MN + 2M 次写
+    # 原则上应该只需要 MN 次读、MN 次写（也就是 4 倍的加速空间！）
+    return y
+```
+
+**为什么会这样**：这是**纯 PyTorch**。上面每一行都是**不同的 kernel**，
+除非你调 `torch.compile`，否则它们就是各自独立的操作，**每一个都要从 HBM 读、往 HBM 写**。
+
+理想情况显然是：**每个元素只读进来一次，算完写回去一次** —— 也就是 MN 读、MN 写。
+两者一比，**大约有 4 倍的加速空间**。（就是上面第六节那个演示的第二个模式。）
+
+### 9.2 Triton 版本
+
+<Figure src="/courses/cs336/l06-triton-softmax.png" wide caption="每一行对应一个 program 实例（pid 就是行下标）：load 整行 → 减最大值 → 取指数并求和 → 归一化写回。来源：CS336 课件" />
+
+Percy 说，一旦脚手架搭好，**核心计算看起来和朴素版几乎一模一样**。
+
+**关键的设计决定是：让每一行成为一个块。** 为什么？
+
+- softmax **不是逐元素的**，因为每一行要归一化、要求和 —— 需要行内的值互相通信。
+- 但它**是「按行的」**：**不同的行之间毫无关系。**
+- 而**不同的块之间本来就不共享内存**（shared memory 只在块内共享），
+  所以「一行一块」和硬件的约束完美对上了。
+
+主机端：
+
+```python
+def triton_softmax(x: torch.Tensor):
+    # 分配输出张量
+    y = torch.empty_like(x)
+
+    # 划 grid
+    M, N = x.shape                          # 行数 × 列数
+    block_size = triton.next_power_of_2(N)  # 一个块要装下整行，块大小取 N 的上一个 2 的幂
+    num_blocks = M                          # 一个块就是一行，所以有 M 个块
+
+    # 启动 kernel：grid 是 (M,)
+    triton_softmax_kernel[(M,)](
+        x_ptr=x, y_ptr=y,
+        x_row_stride=x.stride(0), y_row_stride=y.stride(0),   # 「往下走一行」要跳多少个位置
+        num_cols=N, BLOCK_SIZE=block_size
+    )
+
+    return y
+```
+
+<Callout type="note" title="补充：为什么块大小要取 2 的幂">
+`triton.next_power_of_2(N)` 把块大小凑成 2 的幂。Percy 在课上的说法是「图个吉利」，
+但背后是有原因的：**warp 是 32 个线程一组**，而 Triton 内部做归约（比如 `tl.max`、`tl.sum`）
+时用的是**树形规约**，**长度是 2 的幂时最规整**，也不会出现半个 warp 空转的情况。
+
+代价是**块可能比实际需要的大**（比如 N = 300 会取到 512），
+多出来的位置靠 `mask` 挡掉 —— 下面 kernel 里就能看到。
+</Callout>
+
+kernel 本体：
+
+```python
+@triton.jit
+def triton_softmax_kernel(x_ptr, y_ptr, x_row_stride, y_row_stride,
+                          num_cols, BLOCK_SIZE: tl.constexpr):
+    # 前提：一整行装得进一个块
+    assert num_cols <= BLOCK_SIZE
+
+    # 每一行独立处理：醒来，我是第 row_idx 行
+    row_idx = tl.program_id(0)
+    # 这一行里的所有列下标：0, 1, ..., BLOCK_SIZE - 1
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+
+    # 从 global memory 读
+    # 我这一行的起始地址 = 数据起点 + 行号 × 行步长
+    x_start_ptr = x_ptr + row_idx * x_row_stride
+    x_ptrs = x_start_ptr + col_offsets          # 这一整行所有元素的地址
+    # 超出实际列数的位置填 -inf —— 因为 exp(-inf) = 0，
+    # 对 softmax 来说这等价于「这个位置不存在」
+    x_row = tl.load(x_ptrs, mask=col_offsets < num_cols, other=float("-inf"))
+
+    # 算：这一段和朴素版一字不差 —— 求最大值、减掉、取指数、求和、相除
+    x_row = x_row - tl.max(x_row, axis=0)
+    numerator = tl.exp(x_row)
+    denominator = tl.sum(numerator, axis=0)
+    y_row = numerator / denominator
+
+    # 写回 global memory
+    y_start_ptr = y_ptr + row_idx * y_row_stride
+    y_ptrs = y_start_ptr + col_offsets
+    tl.store(y_ptrs, y_row, mask=col_offsets < num_cols)
+```
+
+<Callout type="insight" title="装得进一个块的话，写起来就像普通 PyTorch">
+注意中间那五行 —— `tl.max`、`tl.exp`、`tl.sum`、除法 ——
+**和你在 PyTorch 里会写的东西几乎一模一样**。
+
+Percy 说这就是 Triton 让人舒服的地方：**只要东西装得进一个块，
+你基本上就是在写普通的 PyTorch。** 归约怎么在 32 个线程之间做、
+中间结果放哪里，这些全由 Triton 处理了。
+
+**下一节就是「装不进去」的时候。**
+</Callout>
+
+<Callout type="note" title="补充：课上关于 softmax kernel 的两个提问">
+
+**问：如果列数（或行数）比块大小还大怎么办？**
+下一节就讲这个。实际上**行数一般远大于块大小**，那没关系（行数只影响块的个数）；
+麻烦的是**列数比块大小大**。
+
+**问：如果我想按「列」做 softmax 呢？**
+应该没问题，**因为这里我们追踪的是指针，指针可以指向任何地方。**
+你要改的是 **stride**：把「往下走一行跳多少」换成「往右走一列跳多少」，
+再把 `col_offsets` 乘上行步长，就是在按列取数了。
+</Callout>
+
+## 十、例子三：行求和 —— 行装不下一个块时的「婴儿版分块」
+
+上一节里**一整行装得进一个块**，所以归约发生在块内，Triton 帮你处理掉了。
+**那如果一行装不下呢？**
+
+具体例子：**一行有 4096 列，但块大小只有 1024。** 这时候必须做点什么。
+
+<Theorem type="proposition" name="策略">
+
+1. **把这一行切成若干个 tile（片）** —— 上面的例子里是 4 个。
+2. **每个线程遍历这些 tile，各自累加出一个部分和。**
+3. **最后在所有线程的累加器之间做一次归约（求和）** ——
+   靠 shared memory 或者 warp shuffle 完成。
+
+</Theorem>
+
+为了好想，Percy 把例子从 softmax 换成了更简单的**行求和（row sum）**：
+给一个矩阵，算出每一行的和。
+
+```python
+def builtin_row_sum(x: torch.Tensor):
+    return x.sum(dim=1)     # PyTorch 自带的，没什么惊喜
+
+
+x = torch.tensor([[1., 2, 3, 4], [5, 6, 7, 8]], device=cuda_if_available())
+y1 = builtin_row_sum(x)     # [10., 26.]
+```
+
+### 10.1 先在纸上走一遍
+
+<Figure src="/courses/cs336/l06-triton-row-sum.png" wide caption="块 1 负责第 1 行（共 10 列，块大小 4）：4 个线程各自带一个累加器，逐个 tile 累加；最后一个 tile 越界的两列被 mask 掉；最后 tl.sum 把 4 个累加器树形归约成一个标量。来源：CS336 课件" />
+
+跟着图走一遍（这是 Percy 在课上口述的过程）。**每个块仍然负责一行**，这一点没变。
+假设我是**块 1，负责第 1 行**。这一行有 10 个元素，块大小是 4，所以有 3 个 tile：
+tile 0 是第 0–3 列，tile 1 是第 4–7 列，tile 2 是第 8–11 列（后两列越界）。
+
+现在开始迭代。**4 个线程各自维护一个累加器**：
+
+| | 线程 t0 | 线程 t1 | 线程 t2 | 线程 t3 |
+| --- | --- | --- | --- | --- |
+| **tile 0**（第 0–3 列） | 读到 3 | 读到 1 | 读到 4 | 读到 1 |
+| 累加器 | 3 | 1 | 4 | 1 |
+| **tile 1**（第 4–7 列） | 读到 5 | 读到 9 | 读到 2 | 读到 6 |
+| 累加器 | 3+5 = **8** | 1+9 = **10** | 4+2 = **6** | 1+6 = **7** |
+| **tile 2**（第 8–11 列） | 读到 5 | 读到 3 | 越界，被 mask | 越界，被 mask |
+| 累加器 | 8+5 = **13** | 10+3 = **13** | **6** | **7** |
+
+循环结束时，我们手上是一个**累加器的向量** `[13, 13, 6, 7]`。
+最后**把它求和**：$13 + 13 + 6 + 7 = 39$，
+正好等于 $3+1+4+1+5+9+2+6+5+3 = 39$。写回 `out[1] = 39`。
+
+### 10.2 代码
+
+```python
+def triton_row_sum(x: torch.Tensor, BLOCK_SIZE: int = 1024) -> torch.Tensor:
+    M, N = x.shape
+    y = torch.empty(M, device=x.device, dtype=x.dtype)   # 每行一个结果
+    row_sum_kernel[(M,)](x, y, N, BLOCK_SIZE=BLOCK_SIZE) # grid 还是 (M,)：一行一块
+    return y
+
+
+@triton.jit
+def row_sum_kernel(x_ptr, out_ptr, N, BLOCK_SIZE: tl.constexpr):
+    row = tl.program_id(0)   # 醒来：我负责第几行？
+
+    # 每个线程一个累加器。
+    # 一行长这样（N = 12, BLOCK_SIZE = 4 的情形）：
+    #   T1 T2 T3 T4 | T1 T2 T3 T4 | T1 T2 T3 T4
+    #     tile 0         tile 1         tile 2
+    # 注意 BLOCK_SIZE 就是线程数；数据比块大，就只能迭代着来
+    acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+
+    # 遍历所有 tile：start 依次是 0, BLOCK_SIZE, 2×BLOCK_SIZE, ...
+    for start in range(0, N, BLOCK_SIZE):
+        cols = start + tl.arange(0, BLOCK_SIZE)   # 这个 tile 覆盖的列下标
+        mask = cols < N                           # 最后一个 tile 可能越界
+        # 从 HBM 读这个 tile；越界的位置读成 0，加进去不影响结果
+        x = tl.load(x_ptr + row * N + cols, mask=mask, other=0.0)
+        acc += x                                  # 累加（这一步不碰 HBM）
+
+    # 最后把 BLOCK_SIZE 个累加器归约成一个标量
+    result = tl.sum(acc, axis=0)
+
+    tl.store(out_ptr + row, result)
+```
+
+<Callout type="warning" title="别把 block 和 tile 搞混 —— 这是这一节的重点">
+Percy 特意停下来强调了这个区别。
+
+在**第八节的 GeLU** 里，我们也把一长条数据切成了很多段 —— **但那些段是 block**，
+每一段由**一个独立的线程块**处理，彼此之间毫无关系。
+
+**这里切出来的是 tile，不是 block。** **block 对应的是一整行**，
+而**这个 block 必须把所有的 tile 都处理掉**。
+
+Percy 说：**从这里开始，代码就不再像 PyTorch 了** ——
+因为你**没法把所有数据一次性装进 shared memory**，
+所以必须显式地写一个循环，一片一片地过。
+</Callout>
+
+<Callout type="note" title="补充：课上关于累加器住在哪里的提问">
+有同学问：那个 `acc` 是在寄存器里还是在 shared memory 里？会不会寄存器不够、
+只能放进 shared memory？
+
+Percy 的回答：**在 Triton 程序里你不显式指定这件事，由 Triton 编译器决定。**
+但一般来说，**只要 BLOCK_SIZE 足够大，它就不得不放进 shared memory**
+（因为寄存器根本不够）。
+
+这和第八节 `tl.load` 那个提问是同一件事的两面：**Triton 抽象掉了「东西住在哪一层内存」，
+换来的是你不用手写同步和 shared memory 分配。**
+</Callout>
+
+## 十一、例子四：矩阵乘法 + ReLU —— 真正的分块
+
+Percy 称这是「大结局」。**矩阵乘法是深度学习的主食**，已经被优化到死了，
+而且在某种意义上是最基本的运算。
+
+这里加一点**花样**：**做完矩阵乘法之后再过一个 ReLU**。
+这不是凭空来的 —— **一个线性层就是一次矩阵乘法，后面接一个 ReLU 激活**，
+天天都在发生。（为什么这么安排，等下就知道了。）
+
+```python
+a = torch.randn(1024, 1024, device=cuda_if_available())
+b = torch.randn(1024, 1024, device=cuda_if_available())
+
+
+def naive_matmul_relu(x: torch.Tensor, y: torch.Tensor):
+    # 先矩阵乘法，再 ReLU —— 这是我们要对标的 PyTorch 版本
+    return torch.nn.functional.relu(x @ y)
+
+
+c = naive_matmul_relu(a, b)
+```
+
+**那怎么造一个矩阵乘法的 kernel？**
+
+设定：**A 是 M × K，B 是 K × N，所以 C 是 M × N。**
+
+```text
+|        k                  n                     
+|   [ A1 A2 A3 ]       [ B1 B2 B3 ]   [ C1 C2 C3 ]
+| m [ A4 A5 A6 ]  *  k [ B4 B5 B6 ] = [ C4 C5 C6 ]
+|   [ A7 A8 A9 ]       [ B7 B8 B9 ]   [ C7 C8 C9 ]
+```
+
+### 11.1 朴素做法
+
+**固定任意一个 (m, n)。对每一个 k：**
+
+- **从 HBM 读 `A[m, k]` 和 `B[k, n]`。**
+- **乘起来，累加。**
+
+**最后把结果写到 HBM 里的 `C[m, n]`。**
+
+这是一个**完全正确**的矩阵乘法 kernel。**那它有什么问题？**
+
+**读写次数太多。** 对每一组 (m, n, k) 都要去 HBM 读一次，所以是 **MKN 量级的读**；
+写的次数是 MN，不重要 —— **读才是瓶颈**。
+
+回忆第二讲的**算术强度（arithmetic intensity）**：运算次数除以搬运的字节数。
+这里运算次数是 MKN 量级，读的次数也是 MKN 量级，所以
+
+$$
+\text{算术强度} = O(1)
+$$
+
+**这非常糟糕。**（第二讲里我们看到，H100 的加速器强度大约是 295 ——
+算术强度是常数意味着彻底的内存受限。）
+
+**问题出在哪？仔细看会发现有大量冗余的读。** 用上面那张图：
+**算 C4 需要读 A4、A5、A6**；而**算 C5 又要把 A4、A5、A6 再读一遍**。
+
+**如果能只读一次就把两个都算出来呢？** 答案是可以 —— **用 shared memory。**
+
+### 11.2 理想化做法
+
+**把 A 和 B 全部装进 shared memory，然后再算 C。**
+
+这样一来：
+
+- 读的次数从立方降到平方：**MK + KN 次读**，MN 次写。
+- 算术强度变成 $O(N)$ —— 这正是第二讲说的**理想情形**。
+- **完全没有冗余读**：每个元素只读一次进 shared memory，之后反复用。
+
+**那问题是什么？**
+
+**A 和 B 通常大到装不进 shared memory。**（回忆 1.1 节：每个 SM 的
+shared memory 只有一两百 KB，而一个 1024 × 1024 的 fp32 矩阵就是 4 MB。）
+
+### 11.3 分块（tiling）
+
+<Figure src="/courses/cs336/l06-gemm-tiled.png" wide caption="分块矩阵乘法：外层循环沿着 A 的行 tile 和 B 的列 tile 走（浅紫是全部 tile，深紫是当前 tile），内层在 tile 内部做乘加，橙色是正在算的那个输出 tile。来源：CS336 课件引用的示意图" />
+
+<Theorem type="definition" name="分块（tiling）">
+**核心想法：把输出矩阵 C 切成一个个输出 tile，每个 tile 交给一个线程块。**
+
+固定 C 里的一个输出 tile。**对每一对（A 的行 tile，B 的列 tile）：**
+
+1. **把对应的 A tile 和 B tile 从 HBM 读进 shared memory。**
+2. **在这两个小块上做矩阵乘法。**
+3. **累加进部分和**（部分和也放在 shared memory 里）。
+
+**扫完整行整列之后，把这个输出 tile 写回 HBM。**
+
+**算术强度：** $O(\text{tile 大小})$。
+</Theorem>
+
+Percy 给了一个很好的概括：
+
+<Callout type="insight" title="全局像朴素做法，局部像理想化做法">
+分块的想法就是 **「shared memory 能装多少就装多少」**。
+
+于是它**在全局上看起来像朴素做法**（还是那个三重循环的结构），
+**但在局部上看起来像理想化做法**（tile 内部完全没有冗余读）。
+</Callout>
+
+**注意算术强度只到 $O(\text{tile 大小})$，一般达不到 $O(N)$** ——
+那要求把所有东西都装进 shared memory。**但只要 tile 开得够大，也不算太差。**
+
+**顺带的好处（这就是为什么要加 ReLU）**：
+
+- 写完 kernel 之后，你经常还想**套一个逐元素的激活函数**，比如 `GeLU(A @ B)`。
+- **解法：算子融合！** 反正累加结果已经在 shared memory 里了，
+  **在写回 HBM 之前顺手过一遍 ReLU，一次额外的 HBM 往返都不用付。**
+
+<Callout type="tip" title="动手：跟着走一遍分块矩阵乘法">
+下面这个演示把三张矩阵按 **tile**（不是元素）画出来：左边 A、中间 B、右边 C。
+红色那一块是当前线程块负责的输出 tile；点 C 上任意一块可以换一个。
+
+点「下一步 k」，你会看到 A 的一个**行 tile** 和 B 的一个**列 tile** 同时被点亮 ——
+**那正是这一步被读进 shared memory 的两小块**，读完做一次 `tl.dot` 累加进 `acc`。
+点「自动播放」可以看完整个 k 循环。
+
+下面的对账栏是三种做法读 HBM 的元素总数。默认参数（256×256×256，
+BLOCK_M = BLOCK_N = 64、BLOCK_K = 32）下：
+
+- **朴素**：$2MNK$ = 33.55 M 个元素
+- **分块**：524.3 K 个元素 —— **正好是朴素的 1/64**
+- **理想化**：131.1 K 个元素（分块的 1/4，但装不下，只是下界）
+
+值得试的事：
+
+- **只改 BLOCK_K（32 换成 16 或 64），会发现分块那一行的数字一动不动。**
+  因为分块的读取量是 `MNK × (1/BLOCK_M + 1/BLOCK_N)`，
+  和 BLOCK_K 无关 —— BLOCK_K 只影响 k 循环走几步、每步搬多少，
+  总量是固定的。它影响的是 shared memory 用量。
+- **把 BLOCK_M 和 BLOCK_N 从 64 调到 128**，分块读取量再减半 ——
+  这就是「算术强度正比于 tile 大小」的字面意思。再调到 16，看它怎么退化。
+- 把 M、N、K 调到 1024（课上真正跑的尺寸），看三个数字怎么变，比值却不变。
+
+</Callout>
+
+<L06Tiling />
+
+### 11.4 实现：先复习 stride
+
+写 kernel 之前先复习一下 **stride（步长）**，因为下面全是它。
+
+**张量是一个多维数组，但在内存里是线性铺开的。**
+**stride 告诉你怎么把一个多维下标（比如「行, 列」）映射成实际的一维下标**：
+
+```python
+x = torch.tensor([[0., 1, 2, 3],
+                  [4, 5, 6, 7]])
+
+stride_row, stride_col = x.stride()   # (4, 1)
+# 每往下走一行，在内存里要跳 4 个位置；每往右走一列，跳 1 个位置
+
+row, col = 1, 2
+index = row * stride_row + col * stride_col   # 1×4 + 2×1 = 6
+# 果然：把 x 摊平就是 [0,1,2,3,4,5,6,7]，第 6 个正是 x[1][2] = 6
+```
+
+**如果这是个转置的张量，两个 stride 就反过来。** 这就是为什么 kernel 要把 stride
+当参数传进去 —— 它不假设数据是怎么摆的。
+
+### 11.5 主机端
+
+```python
+def triton_matmul_relu(a: torch.Tensor, b: torch.Tensor):
+    assert a.is_cuda and b.is_cuda
+    assert a.is_contiguous() and b.is_contiguous()
+    assert a.shape[1] == b.shape[0]        # 形状要对得上
+
+    # A 是 M × K，B 是 K × N
+    M, K = a.shape
+    K, N = b.shape
+
+    # 分配输出张量 C（M × N）
+    c = torch.empty((M, N), device=a.device)
+
+    # 划 grid：这次是二维的 —— 一个输出 tile 一个线程块
+    BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 32
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+
+    matmul_relu_kernel[grid](
+        a, b, c,
+        M, N, K,
+        a.stride(0), a.stride(1),   # 怎么在 a 里导航
+        b.stride(0), b.stride(1),   # 怎么在 b 里导航
+        c.stride(0), c.stride(1),   # 怎么在 c 里导航
+        BLOCK_M, BLOCK_N, BLOCK_K,
+    )
+
+    return c
+```
+
+### 11.6 kernel 本体
+
+```python
+@triton.jit
+def matmul_relu_kernel(
+    a_ptr, b_ptr, c_ptr,    # 计算 c = a @ b
+    M, N, K,                # a 是 M × K，b 是 K × N，c 是 M × N
+    stride_am, stride_ak,   # 怎么在 a 里导航
+    stride_bk, stride_bn,   # 怎么在 b 里导航
+    stride_cm, stride_cn,   # 怎么在 c 里导航
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    # 醒来：我负责第 (m, n) 个输出 tile。grid 是二维的，所以有两个 program_id
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # 下标计算（有点繁琐，但都是直白的）
+    indices_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # 我要看 a 的哪些行 [BLOCK_M]
+    indices_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)  # 我要看 b 的哪些列 [BLOCK_N]
+    indices_k = tl.arange(0, BLOCK_K)                    # a 的列 = b 的行 [BLOCK_K]
+
+    # 用 stride 把二维下标翻译成地址，得到两个「指针矩阵」
+    # 广播规则：[:, None] 变成列向量，[None, :] 变成行向量，相加得到一个矩阵
+    a_ptrs = a_ptr + indices_m[:, None] * stride_am + indices_k[None, :] * stride_ak  # [BLOCK_M, BLOCK_K]
+    b_ptrs = b_ptr + indices_k[:, None] * stride_bk + indices_n[None, :] * stride_bn  # [BLOCK_K, BLOCK_N]
+
+    # 累加器矩阵，BLOCK_M × BLOCK_N，住在 shared memory 里。
+    # 注意用 float32 累加，即使输入是低精度 —— 这是数值稳定性的常规做法
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+    # 沿着 a 的行 tile、b 的列 tile 一起往前扫。
+    # 结构和上一节的行求和一模一样，只是现在同时在两个矩阵上移动
+    for k in range(0, K, BLOCK_K):
+        # 读 a 的这一小块（越界的位置补 0，加起来不影响结果）
+        a = tl.load(a_ptrs, mask=(indices_m[:, None] < M) & (indices_k[None, :] + k < K), other=0.0)
+        # 读 b 的这一小块
+        b = tl.load(b_ptrs, mask=(indices_k[:, None] + k < K) & (indices_n[None, :] < N), other=0.0)
+        # 东西一旦进了 shared memory，写起来又像 PyTorch 了：直接做小矩阵乘法
+        acc += tl.dot(a, b)
+        a_ptrs += BLOCK_K * stride_ak  # 前进到 a 的下一个行 tile（往右挪）
+        b_ptrs += BLOCK_K * stride_bk  # 前进到 b 的下一个列 tile（往下挪）
+
+    # 顺手把激活函数融合进来 —— 反正结果还在 shared memory 里，一次 HBM 往返都不用多付
+    acc = tl.maximum(acc, 0.0)
+
+    # 把这个输出 tile 写回 HBM
+    c_ptrs = c_ptr + indices_m[:, None] * stride_cm + indices_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc, mask=(indices_m[:, None] < M) & (indices_n[None, :] < N))
+```
+
+Percy 说：**下标那部分确实要多留点神，但算法的形状应该是清楚的** ——
+和上一节的行求和是同一个骨架，只是循环里同时在两个矩阵上移动，
+而且 tile 是二维的。
+
+<Callout type="insight" title="「东西进了 shared memory 就像写 PyTorch」这句话的分量">
+把三个例子并排看，你会发现同一句话被说了三次：
+
+- **softmax**：整行装得进块 → `tl.max` / `tl.sum` 写起来像 PyTorch。
+- **行求和**：装不进 → 必须写显式的 tile 循环，**不像 PyTorch 了**。
+- **矩阵乘法**：装不进 → 外层是显式的 tile 循环，**但循环体内部**那一行
+  `acc += tl.dot(a, b)` **又像 PyTorch 了**。
+
+这就是 Triton 的定位：**它替你管住了「块内怎么并行」，
+把「块之间怎么切、怎么循环」留给你。** 而后者恰恰是决定 HBM 流量、
+也就是决定性能的那一半。
+</Callout>
+
+## 十二、小结
+
+<Theorem type="proposition" name="这一讲的五条">
+
+1. **知道编程模型**（PyTorch、Triton、PTX）**是为了拿到正确性。**
+   这是程序员真正能控制的那一层 —— 连 PTX 都能写，想怎么特化都行。
+2. **理解硬件**（SM、warp、占用率、bank conflict 等）**是为了拿到性能。**
+   因为现实是：SM 的个数是有限的、bank 的个数是有限的、
+   内存和寄存器的大小都是有限的。你带着你的大矩阵和 Transformer 走进来，
+   **它得塞进硬件的这些约束里。**
+3. **做基准测试**，理解性能怎么随规模变化。
+4. **做性能分析**，看清到底有哪些东西被执行了、各花了多久 ——
+   这是理解「硬件的杂乱如何转化成性能」的唯一办法。
+5. **Triton：按线程块思考。** 读进 shared memory → 干活（顺便融合）→ 写回 HBM。
+   比按单个线程思考轻松得多，**因为你不用显式地同步线程、不用手动管 shared memory**。
+
+</Theorem>
+
+四个例子按难度递增排：
+
+| 例子 | 类型 | 新出现的东西 |
+| --- | --- | --- |
+| **GeLU** | 逐元素 | `program_id`、`offsets`、`mask`、`load` / `store` |
+| **softmax** | 行内归约（行装得进一个块） | 一行一块、`tl.max` / `tl.sum`、stride |
+| **行求和** | 行装不下一个块 | **tile 循环 + 累加器** —— 「婴儿版分块」 |
+| **矩阵乘法 + ReLU** | 真正的分块 | 二维 grid、指针矩阵、`tl.dot`、**融合激活函数** |
+
+<Callout type="note" title="补充：课上最后两个提问">
+
+**问：除了 Triton 我还有什么选择？各自能逼近最优多少？**
+
+Percy 的回答是：**每种语言都有自己的归纳偏置（inductive bias）**，
+让某些事变容易、某些事变难。
+
+- **Triton 是训 Transformer 的人做出来的**，所以**凡是和 Transformer 沾边的事，
+  在 Triton 里都相对好写。**
+- **极端情况你总可以退到 PTX** 自己写 —— **但不建议把它当第一步。**
+- 还有一批别的库和 DSL：**ThunderKittens**、**CuTe** 等等。
+  它们**不见得在抽象层次上比 Triton 更高或更低**，
+  只是给你**不同的特性组合**。
+
+**问：如果我要处理高维张量，是应该把整个张量一次性读进来，还是逐个元素处理？**
+
+Percy 说**这个问题脱离具体情境很难回答，取决于计算的性质**，
+建议课后单独聊。
+</Callout>
+
+---
+
+## 下一讲
+
+**这一讲讲完了「怎么给一块 GPU 编程」。下一讲开始讲多块 GPU。**

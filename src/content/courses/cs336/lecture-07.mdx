@@ -1,0 +1,1609 @@
+---
+course: cs336
+courseTitle: 'Stanford CS336：从零构建语言模型'
+lecture: 7
+title: 并行：把计算摊到很多张 GPU 上
+date: 2026-07-21
+description: 从集合通信原语（broadcast / all-reduce / reduce-scatter / all-gather）讲到 GPU 之间怎么连线，再用 torch.distributed 从零写出数据并行、张量并行、流水线并行。
+speaker: Percy Liang
+slides: lecture_07.py（可执行讲义）
+tags: [CS336, 语言模型, 并行, 集合通信, NCCL, 数据并行, 张量并行, 流水线并行]
+---
+
+import L07Collective from '../../../components/demo/L07Collective.astro';
+import L07Sharding from '../../../components/demo/L07Sharding.astro';
+import L07Bandwidth from '../../../components/demo/L07Bandwidth.astro';
+
+这是 CS336 的第七讲，Percy Liang 主讲，主题是**并行（parallelism）**。
+
+上一周讲的是**怎么让一张 GPU 跑得快** —— 写 kernel，钻进 GPU 内部去看高带宽显存（HBM）、
+L2 缓存、L1 缓存、寄存器、流式多处理器（SM）这些东西。这一周把镜头拉远：
+**怎么把很多张 GPU 一起用起来，让代码跑得更快。**
+
+<Figure src="/courses/cs336/l07-gpu-node-overview.png" wide caption="脑子里要有的那张图：不再是一张 GPU，而是四张、上千张 GPU 连在一起。来源：CS336 课件" />
+
+Percy 强调，虽然从一张卡变成一千张卡，但**如果你把镜头拉远看，情况是完全类似的**：
+
+**计算单元（算术逻辑单元、张量核心）离数据很远。**
+
+- 在**单 GPU** 的情形下，「很远」指的是数据在 HBM 里，要搬到计算核心上。
+- 在**多 GPU** 的情形下，你要的那个东西可能干脆在**另一张 GPU 上**，你得想办法把它挪过来。
+
+所以原则是同一条：**编排计算，绕开数据传输瓶颈。** Percy 用一句话概括了这一讲的难点：
+
+> 用一大堆 GPU 很容易，**用好**它们很难。
+
+## 一、一个统一的存储层次
+
+把上一周和这一周放在一起，可以画出一条统一的层次（Percy 说这里稍微「取了点自由」）：
+
+<Theorem type="proposition" name="从快到慢的层次">
+
+1. **单节点、单 GPU**：L1 缓存 / 共享内存 —— **最快**。
+2. **单节点、单 GPU**：HBM（高带宽显存）。
+3. **单节点、多 GPU**：NVLink / NVSwitch。
+4. **多节点、多 GPU**：InfiniBand 或以太网 —— **最慢**。
+
+</Theorem>
+
+这里有个有意思的视角转换：**上一周我们一直在抱怨 HBM 太慢**（相对于共享内存和 L1 缓存），
+**但在这一讲里，HBM 要被当成「快」的那一头了** —— 因为跨 GPU 的通信比它还慢得多。
+
+对应地，两周的技术手段也是对应的：
+
+- **上一周**：用**融合（fusion）和分块（tiling）**减少对显存的访问 ——
+  尽量一次读进共享内存、把能做的都做完、再写回去。
+- **这一周**：用**复制（replication）和分片（sharding）**减少 GPU 之间的通信。
+
+<Callout type="note" title="补充：分片和复制分别指什么">
+这一讲会反复出现这两个词，先给个最短的说明。
+
+- **分片（sharding）**：把一个大张量**切成若干块，每张卡只存其中一块**。
+  好处是省显存，代价是你要用的时候可能得先把它们凑齐（通信）。
+- **复制（replication）**：**每张卡都存一份完整的**。好处是要用的时候不用通信，
+  代价是显存里存了很多份一样的东西。
+
+这一讲后面的三种并行，本质上就是在回答「**哪些东西分片、哪些东西复制**」。
+</Callout>
+
+## 二、为什么要用多张 GPU
+
+显而易见的答案是「因为要 scale」，但 Percy 说要说得更精确一点，其实是**两个理由**：
+
+<Theorem type="proposition" name="用多 GPU 的两个理由">
+
+1. **单张 GPU 的 HBM 装不下。** 参数、激活值、梯度、优化器状态放不进一张卡。
+   具体的数：**B200 有 192 GB 显存**。如果你要训一个**一万亿参数**的模型，
+   那在一张 GPU 上是绝对放不下的。
+2. **想用更多 GPU（更多 FLOPs）来训得更快。** 即使模型能塞进单卡，
+   把东西摊开到很多卡上也能缩短训练时间。
+
+</Theorem>
+
+这里有个需要权衡的地方：有时候你**能**把所有东西塞进较少的 GPU 里，
+但那样可用的计算核心就少；如果摊开到更多卡上，**你就得付通信带宽的代价**。
+到底怎么并行，是要你自己算一笔账的。
+
+<Callout type="note" title="讲义本身的一点说明">
+这份课件仍然是**可执行讲义** —— 一个 Python 程序。但这一讲有点特殊：
+
+如果你**直接运行**它（`python lecture_07.py`），它会用**多进程（multiprocessing）**，
+真的起 4 个进程去做分布式通信，每个进程都会往标准输出打印东西。
+而 Percy 在课上**单步跟踪（trace）**这份讲义时，会切到一个特殊的**单进程模式** ——
+因为没法一行一行地跟踪多进程程序。
+
+所以课件里附了一个链接指向「这一讲的标准输出」，那才是真正跑多进程时的输出。
+下面正文里贴的每一段输出，都是那种真跑出来的结果。
+</Callout>
+
+这一讲分两部分：
+
+- **第一部分：分布式通信 / 计算的基本构件。** 先讲编程模型（集合通信操作），
+  再讲一点硬件（GPU 之间怎么连），然后开始在 PyTorch 里写代码（这也是作业二要做的），
+  最后测一下通信到底有多快。
+- **第二部分：分布式训练。** 三种并行 —— **数据并行、张量并行、流水线并行**，
+  每一种都用不同的方式切开模型。为了看清核心算法，这里用的是**多层感知机（MLP）**
+  而不是完整的 Transformer。
+
+<Callout type="note" title="补充：为什么用 MLP 就够有代表性">
+Percy 在第二部分开头专门说明了这一点：**MLP 才是 Transformer 里真正的计算瓶颈。**
+
+回想第二讲的资源核算：Transformer 的 FLOPs 绝大部分花在那些大矩阵乘法上，
+而前馈网络（也就是 MLP）那一块占了大头。所以拿一串「矩阵乘 + GELU」来演示并行，
+**并不是在简化到失真** —— 它就是主要的那部分计算。
+
+完整的 Transformer 只是**簿记（bookkeeping）更麻烦**，
+反而会把核心算法淹没在细节里。
+</Callout>
+
+---
+
+# 第一部分：分布式通信的基本构件
+
+## 三、集合通信操作
+
+<Theorem type="definition" name="集合通信操作（collective operations）">
+**集合通信操作**是分布式编程里的一组**概念原语**。它们是**并行编程文献里 1980 年代就有的经典东西**，
+不是为了训练语言模型才发明的 —— 但直到今天，我们用的仍然是这批原语。
+
+「**集合（collective）**」的意思是：你指定的是**跨多个设备的一个整体通信模式（pattern）
+或者说模板**，而不是自己去管「这张 GPU 怎么和那张 GPU 通信」这种点对点的细节。
+
+这样做通常**更好也更快**，因为系统可以替你做大量优化工作。
+</Theorem>
+
+### 3.1 术语：rank 和 world size
+
+<Figure src="/courses/cs336/l07-ranks.png" caption="四个 rank（编号 0、1、2、3），world size 是 4。来源：CS336 课件" />
+
+Percy 说这套术语他自己也觉得有点奇怪，但它是并行编程里的标准叫法：
+
+- **rank（秩 / 编号）**：指**一台具体的设备**。在我们这里就是一张 GPU（也可以是 TPU）。
+  比如四个 rank 就是 0、1、2、3。
+- **world size（世界大小）**：**设备的总数**。上图里 world size 就是 4。
+
+<Callout type="note" title="补充：rank 到底是不是「一张 GPU」">
+课上有人直接问了这个。Percy 的回答是：**在这门课里，rank 就是 GPU。**
+
+更严格地说，rank 是**一个进程**的编号，而在标准做法里我们让**每个进程独占一张 GPU**，
+所以两者一一对应。后面代码里你会看到 `cuda_if_available(rank)` ——
+就是把张量放到第 `rank` 号 GPU 上。
+</Callout>
+
+### 3.2 八个操作的全景
+
+要讲的操作有八个：
+
+- **热身**：broadcast（广播）、scatter（散布）、gather（收集）、reduce（归约）。
+  Percy 说这四个「不是驱动训练的主力」，但**能帮你建立集合通信操作的感觉**。
+- **主力**：all-gather（全收集）、reduce-scatter（归约散布）、all-reduce（全归约）。
+  **这三个会在语言模型的分布式训练里反复出现。**
+- **最一般的**：all-to-all（全对全）。对**混合专家（MoE）**很重要，但这一讲不会花太多时间。
+
+每一个操作都规定了**这组 rank 之间怎么传数据、以及顺带做什么计算**。
+
+下面一个一个来。所有例子都用 **world size = 4**，也就是四张卡。
+
+### 3.3 broadcast：从 rank 0 复制到所有 rank
+
+<Theorem type="definition" name="broadcast（广播）">
+**输入**：只有 rank 0 上有一个张量。
+
+```text
+rank0 = [0, 1, 2, 3]
+```
+
+**输出**：每一个 rank 上都有**一模一样**的那个张量。
+
+```text
+rank0 = [0, 1, 2, 3]
+rank1 = [0, 1, 2, 3]
+rank2 = [0, 1, 2, 3]
+rank3 = [0, 1, 2, 3]
+```
+</Theorem>
+
+注意源 rank 不一定非得是 0，只是为了讲解挑了一个。
+
+**用在哪**：broadcast 基本不出现在训练的核心路径上。它一般用在**初始化**：
+比如 rank 0 加载一个初始检查点（checkpoint），然后把它广播给所有 rank。
+**这是只做一次的事。**
+
+<Callout type="note" title="补充：这和 NumPy 的 broadcasting 是一回事吗">
+课上有人问了这个问题。Percy 的回答是：**概念上是同一个想法** ——
+一个东西复制成很多个东西，就像 NumPy 里一个标量被广播成一个张量的形状。
+
+但**具体的实现完全是两回事**：这里是集合通信意义上的广播，
+涉及的是数据在设备之间的真实搬运，不是形状规则。
+</Callout>
+
+### 3.4 scatter：把 rank 0 的张量切开分给所有 rank
+
+<Theorem type="definition" name="scatter（散布）">
+**输入**：rank 0 上有一个张量，它可以被切成 world size 份。
+
+```text
+rank0 = [0, 1, 2, 3]
+```
+
+**输出**：第 $i$ 份跑到 rank $i$ 上。
+
+```text
+rank0 = [0]
+rank1 = [1]
+rank2 = [2]
+rank3 = [3]
+```
+</Theorem>
+
+用 Percy 的话说：**scatter 就是把一个地方的一个大张量，铺开到多个地方去。**
+为什么这有用？因为你希望**被散布到的每张 GPU 各自对不同的那一块做局部计算**。
+
+**注意**：scatter 本身不直接用在训练里，但它是**理解 reduce-scatter 的垫脚石**。
+
+### 3.5 gather：scatter 的逆操作
+
+<Theorem type="definition" name="gather（收集）">
+**输入**：每个 rank 上各有一小块。
+
+```text
+rank0 = [0]
+rank1 = [1]
+rank2 = [2]
+rank3 = [3]
+```
+
+**输出**：所有块被**拼接**到某一个指定的 rank（这里是 rank 0）上。
+
+```text
+rank0 = [0, 1, 2, 3]
+```
+</Theorem>
+
+同样，gather 不直接用，但它是**理解 all-gather 的垫脚石**。
+
+### 3.6 reduce：收集的同时做一次归约运算
+
+<Theorem type="definition" name="reduce（归约）">
+**输入**：和 gather 一模一样，每个 rank 上有一小块。
+
+```text
+rank0 = [0]
+rank1 = [1]
+rank2 = [2]
+rank3 = [3]
+```
+
+**输出**：把所有块用某个**归约运算**（求和、最小、最大等）合成一个，放到 rank 0 上。
+以求和为例：
+
+```text
+rank0 = [6]      # 0 + 1 + 2 + 3
+```
+</Theorem>
+
+Percy 说，做过函数式编程的人对 reduce 应该很熟悉 —— **就是同一个 reduce**。
+
+<Callout type="insight" title="gather 其实是一种特殊的 reduce">
+Percy 讲完 reduce 之后补了一句很有用的话：**你可以把 gather 看成一次归约，
+只不过那个归约运算是「拼接（concatenation）」。**
+
+这样这四个热身操作就串起来了：
+scatter 和 gather 是一对逆操作，而 reduce 就是把 gather 里的「拼接」换成「求和」。
+</Callout>
+
+而 reduce 当然是**理解 all-reduce 的垫脚石**。
+
+### 3.7 all-gather：对**所有** rank 做 gather
+
+<Theorem type="definition" name="all-gather（全收集）">
+**输入**：每个 rank 上各有一小块。
+
+```text
+rank0 = [0]
+rank1 = [1]
+rank2 = [2]
+rank3 = [3]
+```
+
+**输出**：**每一个** rank 上都拿到完整的拼接结果。
+
+```text
+rank0 = [0, 1, 2, 3]
+rank1 = [0, 1, 2, 3]
+rank2 = [0, 1, 2, 3]
+rank3 = [0, 1, 2, 3]
+```
+</Theorem>
+
+回想 gather 做的事：把所有的块凑到**一个** rank 上。
+**all-gather 就是对每一个 rank 都做一遍这件事。**
+
+**「all」这个前缀的意思就是「输出到所有设备」。**
+
+**用在哪**：Percy 说这句话现在不必完全听懂，后面会看到 ——
+**每个 rank 只持有参数的一个分片，需要 all-gather 把完整的参数凑齐，才能做前向传播。**
+训练过程里你会看到大量的「gather 一下、做点事、scatter 一下、再 gather、再 scatter」。
+
+### 3.8 reduce-scatter：逐维度归约，结果散布出去
+
+<Theorem type="definition" name="reduce-scatter（归约散布）">
+**输入**：每个 rank 上有一个**同样长度**的向量。
+
+```text
+rank0 = [0, 1, 2, 3]
+rank1 = [1, 2, 3, 4]
+rank2 = [2, 3, 4, 5]
+rank3 = [3, 4, 5, 6]
+```
+
+**输出**：对**每一个分量**跨所有 rank 做归约，然后把第 $i$ 个分量的结果放到 rank $i$ 上。
+
+```text
+rank0 = [6]      # 第 0 个分量：0 + 1 + 2 + 3 = 6
+rank1 = [10]     # 第 1 个分量：1 + 2 + 3 + 4 = 10
+rank2 = [14]     # 第 2 个分量：2 + 3 + 4 + 5 = 14
+rank3 = [18]     # 第 3 个分量：3 + 4 + 5 + 6 = 18
+```
+</Theorem>
+
+对比一下就清楚了：刚才的 reduce 里，每张卡只有一个数 `0 1 2 3`，加起来得到 6 放在 rank 0；
+**现在每张卡有一整个向量，我对每一个分量分别做一次归约，然后把这四个结果分别放到四张不同的卡上。**
+
+**用在哪**（Percy 说这是预告）：**反向传播之后**，每张 GPU 处理的是**不同的数据**，
+所以各自算出来的梯度不一样。你需要**把不同数据分片上的梯度加起来**，
+然后**把存储重新分散开** —— 每张卡只负责保管一部分求和后的梯度。
+
+### 3.9 all-reduce = reduce-scatter + all-gather
+
+<Theorem type="definition" name="all-reduce（全归约）">
+**输入**：和 reduce-scatter 一样。
+
+```text
+rank0 = [0, 1, 2, 3]
+rank1 = [1, 2, 3, 4]
+rank2 = [2, 3, 4, 5]
+rank3 = [3, 4, 5, 6]
+```
+
+**输出**：每一个 rank 上都拿到**完整的逐分量归约结果**。
+
+```text
+rank0 = [6, 10, 14, 18]
+rank1 = [6, 10, 14, 18]
+rank2 = [6, 10, 14, 18]
+rank3 = [6, 10, 14, 18]
+```
+</Theorem>
+
+Percy 说 **all-reduce 在某种意义上是最容易理解的一个**：
+一堆张量，逐分量归约（这里是求和），然后把结果复制到所有节点上。
+
+而它和前两个的关系非常直接：
+
+$$
+\text{all-reduce} \;=\; \text{reduce-scatter} \;+\; \text{all-gather}
+$$
+
+先做 reduce-scatter，`6 10 14 18` 分别落在四张不同的卡上；
+再做 all-gather，把它们凑到每一张卡上。
+
+**用在哪**：这是**数据并行**里第一个会用到的操作 —— **把梯度求和，然后复制完整的参数**。
+
+<Callout type="insight" title="为什么要把 all-reduce 拆开看">
+既然 all-reduce 一步就能搞定，为什么还要强调它等于 reduce-scatter 加 all-gather？
+
+Percy 的回答是：**拆开之后你就能在中间插手。** 后面要讲的 ZeRO 和 FSDP
+（下一讲 Tatsu 会讲）就是这么干的 —— 因为 all-reduce 是一个「单体（monolithic）」操作，
+它要求**每张卡都持有完整的模型参数**。如果参数放不下，你就得更聪明一点，
+在 reduce-scatter 和 all-gather 之间做点文章。
+
+不过对最基本的版本来说，直接用 all-reduce 就够了。
+</Callout>
+
+### 3.10 all-to-all：最一般的那个
+
+<Theorem type="definition" name="all-to-all（全对全）">
+**输入**：每个 rank 上有一个长度等于 world size 的向量，
+**第 $j$ 个位置上的东西是要发给 rank $j$ 的**。
+
+```text
+rank0 = [ 0,  1,  2,  3]   # 0 发给 rank0（留给自己）、1 发给 rank1、2 发给 rank2、3 发给 rank3
+rank1 = [ 4,  5,  6,  7]   # 4 发给 rank0、5 发给 rank1、6 发给 rank2、7 发给 rank3
+rank2 = [ 8,  9, 10, 11]   # 8 发给 rank0、9 发给 rank1、10 发给 rank2、11 发给 rank3
+rank3 = [12, 13, 14, 15]   # 12 发给 rank0、13 发给 rank1、14 发给 rank2、15 发给 rank3
+```
+
+**输出**：rank $j$ 收到的，是所有 rank 的第 $j$ 个位置上的东西。
+
+```text
+rank0 = [0, 4,  8, 12]
+rank1 = [1, 5,  9, 13]
+rank2 = [2, 6, 10, 14]
+rank3 = [3, 7, 11, 15]
+```
+</Theorem>
+
+读法是：**位置决定目的地。** rank 0 收到的是所有卡的第 0 列，rank 1 收到第 1 列，以此类推。
+
+**用在哪**：**混合专家（MoE）**。直觉是这样的 ——
+**每个 rank 既持有数据的一个分片，又持有专家的一个子集。**
+而 MoE 的关键想法是**动态路由**：你必须看了数据才知道这些激活值该被送到哪些专家那里去。
+于是就变成了一次 all-to-all 通信。
+
+两点补充：
+
+- **如果各方向的数据量是平衡的**（每个 rank 发给每个其他 rank 的字节数一样多），
+  那么 all-to-all **就是一次转置** —— 把上面那个输入当成矩阵，输出就是它的转置。
+- **all-to-all 也支持不平衡的切分**（可以配置发给每个 rank 任意多的字节），
+  但**你总是希望切分尽可能平衡**。这就回到了 Tatsu 讲 MoE 时说的**负载均衡** ——
+  努力让 all-to-all 长得像上面那个理想的转置。
+
+### 3.11 怎么记住这些名字
+
+Percy 一口气过了八个操作之后，给了一组助记：
+
+<Theorem type="proposition" name="术语助记">
+
+- **reduce**：执行某种**结合律 + 交换律**的运算 —— 求和、最大、最小。
+- **scatter 是 gather 的逆**：**scatter 分发，gather 集中**。
+- **all**：意思是**目的地是所有设备**。
+
+于是 all-reduce 就是「归约之后所有设备都拿到结果」，
+all-gather 就是「收集之后所有设备都拿到结果」。
+
+</Theorem>
+
+<Callout type="note" title="补充：gather / reduce 的目标 rank 是固定的那一张卡吗">
+课上有同学问：像 gather、reduce 这种「把所有 rank 的东西写到 rank 0」的操作，
+那个 rank 0 每次都是同一张具体的 GPU 吗，还是可以换？
+
+Percy 的回答是：**在代码里你会指定 GPU 编号（也就是 rank），结果就写到那里去。**
+所以**它不需要提前很久就定下来，但必须在你执行这次调用的时候定下来。**
+</Callout>
+
+<Callout type="note" title="补充：这些只是概念，还是真有代码">
+课上有同学问了这个。Percy 的回答是：**现在展示的是概念构件，
+但很快就会看到它们在代码里长什么样。** 下面第五节就是。
+</Callout>
+
+<Callout type="tip" title="动手：把八个集合通信操作跑一遍">
+下面这个演示把这一节的**八个操作**全部做成可点击的动画。四张卡（rank 0–3），
+每张卡上的方块就是它当前持有的数。选一个操作，点「执行」，
+你会看到**每个数从哪张卡飞到哪张卡**，以及**每张卡最后手里剩下什么**。
+
+面板下方给出**这一次操作总共有多少个数跨卡传输**（按 fp32、每个数 4 字节折算）。
+
+几件值得对着上面正文做的事：
+
+- 先看 **scatter → gather** 这一对，确认它们确实互为逆操作。
+- 再看 **gather → reduce**，输入完全一样，只是输出那一步从「拼起来」换成了「加起来」。
+- 看 **reduce → all-reduce**：输入不同（reduce 每张卡一个数，all-reduce 每张卡一个向量），
+  但都是在做归约。
+- 依次点 **reduce-scatter**、**all-gather**，把两者的字节数加起来，
+  再点 **all-reduce** 对一下 —— 应该正好相等，这就是那条等式的具体形态。
+- 看 **all-to-all**：把输入的四行摆成矩阵，输出就是它的转置。
+
+</Callout>
+
+<L07Collective />
+
+## 四、硬件：GPU 到底是怎么连起来的
+
+在写代码之前，先看看物理层面。GPU 内部我们已经知道了，现在看**网络**。
+
+### 4.1 经典的（家里那种）
+
+<Figure src="/courses/cs336/l07-classic-topology.webp" caption="很经典（看图就知道很老）的一张服务器拓扑图：CPU、PCIe 总线、挂在上面的几张 GPU、内存，机器之间用以太网连。来源：Ye et al., Advances in Aerodynamics (2021)，课件外链的图" />
+
+Percy 说从这张图的画风就能看出年头。结构是：一台服务器，里面有若干 CPU，
+有一条 **PCIe 总线**（以前是用来接鼠标键盘那种东西的），GPU 挂在总线上，
+旁边还有内存；然后这台机器通过**以太网**连到另一台机器。
+
+具体的速度：
+
+- **同一个节点内的 GPU 用 PCIe 通信。** PCIe 7.0、16 条通道大约是 **242 GB/s**。
+- **不同节点的 GPU 只能一路走到以太网。** 大约 **200 MB/s**。
+
+注意这两个数字差了三个数量级。Percy 的评价是：如果你买了张游戏显卡，
+和朋友的机器接起来说「我要训个大模型」，那你面对的就是这个。
+
+### 4.2 现代的（数据中心那种）
+
+<Figure src="/courses/cs336/l07-gpu-node-overview.png" wide caption="现代数据中心的层次：节点内 NVLink 接到 NVSwitch，节点之间 InfiniBand，pod 之间以太网。来源：CS336 课件" />
+
+典型配置（Percy 说 8 这个数是典型的，256 那个数是他编的）：
+
+<Theorem type="proposition" name="典型的数据中心层次">
+
+- **每个节点 8 张 GPU**，通过 **NVLink** 连到一个 **NVSwitch** 上。
+  NVLink 5.0（B200 用的）总带宽是 **1.8 TB/s**。
+- **每个 pod 256 个节点**，节点之间通过 **InfiniBand** 连接，
+  路径是 PCIe → HCA（InfiniBand 网卡）→ InfiniBand 线缆，大约 **0.05 TB/s**（50 GB/s）。
+- **每个集群 / 数据中心若干个 pod**，pod 之间通过**以太网**连接，路径要经过 PCIe → CPU。
+
+</Theorem>
+
+拿这些数和上一讲的显存带宽对比一下就有感觉了：
+
+- **B200 的 HBM 带宽是 8 TB/s。**
+- **NVLink 5.0 是 1.8 TB/s** —— 大约**慢 4 倍**。
+
+Percy 的评价是：**设备之间能到这个速度已经相当快了**，但显然还是比不上 HBM，
+而 HBM 又比共享内存和 L1 缓存慢得多。**层次是一层套一层的。**
+
+**NVSwitch 起的作用**：NVLink 把每张 GPU 接到交换机上，
+于是**从编程的角度，你可以认为任意一张 GPU 都直连到任意另一张 GPU** ——
+硬件负责把数据送到交换机、交换机负责路由。
+
+**再往外为什么会变慢**：你不可能拿一个 NVSwitch 去接十万张 GPU。
+所以随着集群规模变大，节点必须被组织成 pod，pod 之间靠 InfiniBand；
+InfiniBand 用完了还有更大的 pod，那就只能靠以太网。
+Percy 说：**这和显存的层次结构是完全类比的 —— 节点越多，就越慢。**
+
+### 4.3 绕过 CPU：RDMA
+
+这是硬件层面很重要的一件事。
+
+**传统以太网的问题**：GPU 要发数据，得先跟 CPU 打交道。数据要**先拷贝到 CPU**，
+CPU 有一个**内核套接字缓冲区（kernel socket buffer）**，然后**组装网络包（TCP）**，
+再**拷到网卡的环形缓冲区**，最后才发出去。这一路引入了**大量延迟**。
+
+<Callout type="note" title="补充：这里的 kernel 不是 GPU kernel">
+Percy 特意澄清了这个撞名。这里说的 **kernel（内核）**是**操作系统内核**那个意思，
+不是上一周讲的「在 GPU 上跑的那个函数」。
+
+内核套接字缓冲区就是操作系统在内存里划出来的一块区域，网络数据进出都要经过它。
+</Callout>
+
+<Theorem type="definition" name="RDMA（远程直接内存访问）">
+**RDMA（Remote Direct Memory Access）**：允许**一张 GPU 直接读写另一张 GPU 的内存，
+完全不经过 CPU**。
+</Theorem>
+
+哪些路径支持：
+
+- **NVLink / NVSwitch**：显然支持。
+- **InfiniBand**：支持。所以走 InfiniBand 的 GPU 之间可以直连，不涉及 CPU。
+- **标准以太网**：**不支持。**
+
+<Callout type="note" title="补充：RDMA 和 InfiniBand / NVLink 是什么关系">
+课上有同学问了这两者的区别，Percy 的回答很清楚：
+
+**RDMA 更像是一个「想要达成的性质（desiderata）」** —— 它说的是
+「一张 GPU 能读写另一张 GPU 的内存」这件**操作层面**的事。
+
+**而 InfiniBand、NVSwitch、NVLink 是硬件** —— 是具体有哪些线缆、哪些交换机。
+
+**实现 RDMA 有多条路**：一条是 NVLink + NVSwitch，一条是 InfiniBand，
+还有下面要说的 RoCE。
+</Callout>
+
+### 4.4 两个值得知道的进展
+
+**第一个：NVL72。** NVIDIA 一直在把 pod 的规模往上推。
+对 B200 和 B300，有一个叫 **NVL72** 的东西：
+
+- 一个**托盘（tray）**上 **8 张 GPU**，
+- 一个**机架（rack）**里 **9 个托盘**，
+- 于是 **72 张 GPU 全部在一个 NVLink 域里**，互相之间都是 NVSwitch 连接。
+
+这件事的意义很大。Percy 说：如果你是个「凡人」，你的世界是
+**「8 张 GPU 之间超快，出了这 8 张就慢很多」**；但如果你很有钱，
+买得起这种高级硬件，**你可以把「超快互联」的范围扩大到 72 张 GPU**。
+
+<Callout type="note" title="补充：机架和托盘物理上是什么">
+课上有同学问了 rack 和 tray 具体指什么。Percy 说他不是硬件专家，但大致是：
+
+**机架（rack）**字面意义上就是数据中心里那种立式的架子。
+**托盘（tray）**是插在架子上的一层。对 NVL72 来说，**G 代表 Grace**（NVIDIA 的 CPU），
+每个托盘上有**两个 Grace CPU，每个 CPU 连 4 张 GPU**，所以**一个托盘 8 张 GPU**。
+托盘一层层叠起来，全都连到 NVSwitch 上。
+</Callout>
+
+**第二个：RoCE。** 前面说标准以太网不支持 RDMA，但以太网这一侧也在进步：
+**RoCE（RDMA over Converged Ethernet，融合以太网上的 RDMA）**让以太网也能绕过 CPU。
+
+这是以太网阵营对 InfiniBand 的回应。动机很实际：**InfiniBand 非常贵**
+（Percy 说这是很多 NVIDIA 产品的共同点）。用 RoCE 可以拿到相当不错的性能，
+而且**更便宜**，只是比 InfiniBand 弱一些。**Meta 发过论文探索这条路，
+所以 Llama 有可能就是在 RoCE 上训出来的。**
+
+### 4.5 NCCL：把集合通信翻译成真实的数据包
+
+<Theorem type="definition" name="NCCL">
+**NCCL（NVIDIA Collective Communication Library，读作 "nickel"）**
+是最底层的那一层库。它**把集合通信操作（all-reduce、reduce、broadcast 等）
+翻译成 GPU 之间真正传输的底层数据包**。
+</Theorem>
+
+你说「我要做一次 all-reduce」，NCCL 就去做三件事：
+
+1. **检测硬件的拓扑** —— 有多少节点、有哪些交换机、是 NVLink 还是 PCIe。
+2. **优化 GPU 之间的路径**。
+3. **启动 GPU kernel 来收发数据。**
+
+第三点值得停一下：**说到底，GPU 上跑的一切都是 kernel。**
+所以也存在**通信 kernel** —— 它们做的事就是和别的 GPU 通信。
+
+<Callout type="note" title="补充：NCCL 对多节点集群优化过吗">
+课上有同学问了这个。Percy 说他不知道具体细节，但可以这么讲：
+
+**NVIDIA 一直在为大模型的推理和训练优化他们的整个软件栈**，
+因为他们的主要客户就是那些大型语言模型提供商。所以
+**如果他们没有针对这类负载做优化，那才叫奇怪。**
+</Callout>
+
+<Callout type="note" title="补充：如果你有 9 张 GPU 怎么办">
+也是课上的问题：负载怎么分到 9 张卡上？
+
+Percy 说这取决于这 9 张卡**落在什么样的拓扑里**。假设一个节点 8 张 GPU，
+那第 9 张就在另一个节点上。如果这两个节点之间**没有 NVLink**，
+那**情况会很糟糕** —— 多出来的那个节点提供的算力不多，通信代价却很高。
+
+但如果一切都是通过 NVSwitch 连起来的（比如 NVL72 那种），
+那就**合理得多**。
+</Callout>
+
+<Callout type="note" title="补充：TPU 那边是什么样">
+有同学问 TPU 和这套东西有什么不同。Percy 说 Tatsu 之前更多地讲过 TPU，
+他自己能快速说的是：**TPU 通常是简单得多的对象**，
+但他对每个部件具体怎么对应不太熟，建议课后再聊。
+
+（这一讲最后还会再提一次 TPU，见第十一节讲 JAX 编译器的那段。）
+</Callout>
+
+## 五、torch.distributed：写出第一个分布式程序
+
+<Theorem type="definition" name="torch.distributed">
+PyTorch 的分布式库 `torch.distributed` 提供了一个**干净的接口**来使用这些集合通信操作
+（比如 `all_gather_into_tensor`），你不用直接去想 NCCL。
+
+它支持**多种后端（backend）**来适配不同硬件：
+
+- **`nccl`**：GPU 上用这个。
+- **`gloo`**：CPU 上用这个。并行编程在 GPU 出现之前就存在很久了，
+  这些集合通信操作在 CPU 上一样能做。
+
+它**也支持更高层的算法**（比如 `FullyShardedDataParallel`），
+但**这门课不用那些** —— 因为我们是从零建。
+</Theorem>
+
+### 5.1 启动：spawn 与 setup
+
+课件里有一个 `spawn` 函数，它接受另一个函数，并把它**复制成 world size 份跑起来**：
+
+```python
+def spawn(func: Callable, world_size: int, *args, **kwargs):
+    """启动 world_size 个进程，每个进程都调用 func。"""
+    if not sys.gettrace():
+        # 正常路径：真的用多进程
+        args = (world_size,) + args + tuple(kwargs.values())
+        mp.spawn(func, args=args, nprocs=world_size, join=True)
+    else:
+        # 被 edtrace 跟踪时：直接跑一遍函数，并把所有分布式调用换成空操作
+        with DisableDistributed():
+            args = (0, world_size,) + args + tuple(kwargs.values())
+            func(*args)
+```
+
+Percy 说这个 `spawn` 是他为了在讲义里跟踪代码而写的包装 ——
+**正常你只要调 `torch.multiprocessing.spawn` 就行**，那个 `else` 分支是给单步跟踪用的。
+
+被 spawn 起来的函数长这样：
+
+```python
+def collective_operations_main(rank: int, world_size: int):
+    """这个函数在每个进程上异步地跑一份（rank = 0, ..., world_size - 1）。"""
+    setup(rank, world_size)
+    ...
+    cleanup()
+```
+
+**关键的心智模型**：`world_size` 是进程数，`rank` 从 0 一直到 `world_size - 1`。
+**有 world size 个这样的函数在同时跑**，每个跑在一个进程上，各自拿到不同的 `rank`。
+
+`setup` 做的事：
+
+```python
+def setup(rank: int, world_size: int):
+    """初始化分布式环境（每个进程一开始就调用）。"""
+    # 指定 master（rank 0）住在哪里，用来做协调
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "15623"
+
+    if torch.cuda.is_available():
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    else:
+        dist.init_process_group("gloo", rank=rank, world_size=world_size)
+```
+
+<Callout type="warning" title="MASTER_ADDR 不是数据走的路">
+Percy 特意点了这一条：**这个地址和端口不是 GPU 之间传数据用的**，
+它只是用来交换**一般的元数据和做协调**。
+
+**真正的数据走 NCCL** —— 否则会非常非常慢。
+</Callout>
+
+结束时要 `cleanup`：
+
+```python
+def cleanup():
+    """清理分布式环境（每个进程结束时调用）。"""
+    torch.distributed.destroy_process_group()
+```
+
+Percy 说这是好习惯。
+
+### 5.2 barrier：同步屏障
+
+```python
+dist.barrier()   # 等所有进程都到达这一行
+```
+
+**为什么需要它**：所有进程是**异步**跑的 —— 你完全不控制谁先谁后，
+一个进程可能整个跑完了另一个才刚开始，也可能任意交错。
+如果你希望某段代码一定在另一段代码之前执行完，就放一个同步屏障。
+
+**代价**：屏障放得越多，**你就越可能在不必要地等待**。
+课件里 barrier 放得比正常情况多，纯粹是为了让 `print` 出来的东西好读。
+
+### 5.3 all-reduce 的代码
+
+```python
+### All-reduce（dist 就是 torch.distributed）
+dist.barrier()   # 等所有进程到齐（这里是为了让 print 不乱）
+
+# 输入和输出是同一个张量：rank r 上是 [0,1,2,3] + r
+data = tensor([0., 1, 2, 3], device=cuda_if_available(rank)) + rank
+
+print(f"Rank {rank} [before all-reduce]: {data}", flush=True)
+# 原地修改 data：把所有 rank 的 data 逐分量求和，结果写回每个 rank 的 data
+dist.all_reduce(tensor=data, op=dist.ReduceOp.SUM, async_op=False)
+print(f"Rank {rank} [after all-reduce]: {data}", flush=True)
+```
+
+跑出来是这样（真跑多进程时的输出）：
+
+```text
+Rank 3 [before all-reduce]: tensor([3., 4., 5., 6.], device='cuda:3')
+Rank 1 [before all-reduce]: tensor([1., 2., 3., 4.], device='cuda:1')
+Rank 2 [before all-reduce]: tensor([2., 3., 4., 5.], device='cuda:2')
+Rank 0 [before all-reduce]: tensor([0., 1., 2., 3.], device='cuda:0')
+
+Rank 0 [after all-reduce]: tensor([ 6., 10., 14., 18.], device='cuda:0')
+Rank 3 [after all-reduce]: tensor([ 6., 10., 14., 18.], device='cuda:3')
+Rank 1 [after all-reduce]: tensor([ 6., 10., 14., 18.], device='cuda:1')
+Rank 2 [after all-reduce]: tensor([ 6., 10., 14., 18.], device='cuda:2')
+```
+
+**和 3.9 节那个例子完全一样。** 三点观察：
+
+1. **`print` 出来的顺序是硬件高兴怎么排就怎么排的** —— 因为进程是异步跑的。
+   但数据都在那里。
+2. **`all_reduce` 是原地（in place）写的** —— 输入张量本身被改掉了。
+3. 调用时你传入张量、传入归约运算（这里是 `SUM`）。底层它会调 NCCL（或 gloo），
+   起 CUDA kernel、做通信，**这一切都替你办好了**。
+
+关于 `async_op=False`：如果你想更花哨可以设成 `True`，
+但那样 `print` 的顺序就全乱了，所以课件里关掉了。
+
+### 5.4 reduce-scatter 的代码
+
+```python
+### Reduce-scatter
+dist.barrier()
+
+# 输入：rank r 上是 [0,1,...,world_size-1] + r，长度是 world_size
+input = torch.arange(world_size, dtype=torch.float32, device=cuda_if_available(rank)) + rank
+# 输出：先分配好一格空间（reduce-scatter 每个 rank 只拿回 1 个数）
+output = torch.empty(1, device=cuda_if_available(rank))
+
+print(f"Rank {rank} [before reduce-scatter]: input = {input}, output = {output}", flush=True)
+# 注意这次不是原地：分开传 output 和 input
+dist.reduce_scatter_tensor(output=output, input=input, op=dist.ReduceOp.SUM, async_op=False)
+print(f"Rank {rank} [after reduce-scatter]: input = {input}, output = {output}", flush=True)
+```
+
+```text
+Rank 0 [before reduce-scatter]: input = tensor([0., 1., 2., 3.]), output = tensor([0.])
+Rank 1 [before reduce-scatter]: input = tensor([1., 2., 3., 4.]), output = tensor([0.])
+Rank 2 [before reduce-scatter]: input = tensor([2., 3., 4., 5.]), output = tensor([0.])
+Rank 3 [before reduce-scatter]: input = tensor([3., 4., 5., 6.]), output = tensor([0.])
+
+Rank 0 [after reduce-scatter]: input = tensor([0., 1., 2., 3.]), output = tensor([6.])
+Rank 1 [after reduce-scatter]: input = tensor([1., 2., 3., 4.]), output = tensor([10.])
+Rank 3 [after reduce-scatter]: input = tensor([3., 4., 5., 6.]), output = tensor([18.])
+Rank 2 [after reduce-scatter]: input = tensor([2., 3., 4., 5.]), output = tensor([14.])
+```
+
+（为了看着清楚，上面省掉了每行末尾的 `device='cuda:N'`。同样注意 `after` 那四行的顺序又乱了 ——
+rank 3 跑在了 rank 2 前面。）
+
+**输入没有被动**（因为这次不是原地写），**输出里各自拿到了对应分量的归约结果**。
+（输出张量刚分配出来时里面是什么值不用管，会被覆盖掉。）
+
+<Callout type="note" title="补充：异步的 all-reduce 到底是怎么回事">
+课上有同学问：`async_op=True` 时会发生什么？
+
+Percy 的解释是：`all_reduce` 是一个**单体操作**，你说「去做 all-reduce」，
+它就去起 CUDA kernel 做通信。而**CUDA 本来就是异步的**（相对于 CPU 进程而言），
+现在再加上**多个进程之间也是异步的**。
+
+设成 `async_op=True` 的意思是：**这行代码立刻返回，你可以接着干别的事。**
+典型用法就是**重叠计算和通信** —— 比如发出这个通信操作之后，
+马上去加载下一步要用的数据（那件事和这次通信无关）。
+等到你真的需要确认通信做完了，再调一次 wait 或者 barrier。
+
+（重叠计算和通信这件事这一讲不展开，但后面第十一节会再提到它有多重要。）
+</Callout>
+
+### 5.5 all-gather 的代码，以及那条等式的实证
+
+```python
+### All-gather
+dist.barrier()
+
+input = output   # 输入就是上面 reduce-scatter 的输出（每个 rank 一个数）
+output = torch.empty(world_size, device=cuda_if_available(rank))  # 分配 world_size 格
+
+print(f"Rank {rank} [before all-gather]: input = {input}, output = {output}", flush=True)
+dist.all_gather_into_tensor(output_tensor=output, input_tensor=input, async_op=False)
+print(f"Rank {rank} [after all-gather]: input = {input}, output = {output}", flush=True)
+```
+
+```text
+Rank 0 [before all-gather]: input = tensor([6.]),  output = tensor([ 0., 10., 14., 18.])
+Rank 2 [before all-gather]: input = tensor([14.]), output = tensor([2., 3., 4., 5.])
+Rank 1 [before all-gather]: input = tensor([10.]), output = tensor([1., 2., 3., 4.])
+Rank 3 [before all-gather]: input = tensor([18.]), output = tensor([3., 4., 5., 6.])
+
+Rank 0 [after all-gather]: input = tensor([6.]),  output = tensor([ 6., 10., 14., 18.])
+Rank 2 [after all-gather]: input = tensor([14.]), output = tensor([ 6., 10., 14., 18.])
+Rank 1 [after all-gather]: input = tensor([10.]), output = tensor([ 6., 10., 14., 18.])
+Rank 3 [after all-gather]: input = tensor([18.]), output = tensor([ 6., 10., 14., 18.])
+```
+
+看一眼 `before` 那几行的 `output`：里面是 `[2., 3., 4., 5.]` 这种莫名其妙的值。
+那是因为 `torch.empty` **只分配内存、不初始化**，里面残留的是这块显存上一次被用过的内容
+（正好是 reduce-scatter 时那些输入）。Percy 在课上也说了：**别管它，反正会被覆盖掉。**
+
+**每张卡最后都拿到了 `[6, 10, 14, 18]`** —— 这和 5.3 节 all-reduce 的输出一模一样。
+
+<Callout type="insight" title="用例子证明了那条等式">
+Percy 在这里说：**「这就通过例子证明了 all-reduce = reduce-scatter + all-gather。」**
+
+同一个输入 `[0,1,2,3] + rank`，走 all-reduce 一步到位，
+和先 reduce-scatter 再 all-gather 两步走，**结果完全相同**。
+</Callout>
+
+## 六、通信有多快：有效带宽
+
+写完代码，下一个问题是：**通信到底有多快？**
+
+Percy 说这一节会快速带过（他想留时间给第二部分），但方法很重要。
+
+### 6.1 怎么测
+
+```python
+def all_reduce(rank: int, world_size: int, num_elements: int):
+    setup(rank, world_size)
+
+    # 造一个大张量：100 * 1024^2 ≈ 1.05 亿个 fp32 元素，也就是 400 MiB
+    data = torch.randn(num_elements, device=cuda_if_available(rank))
+
+    # 预热：先跑一次不计时的，避免把首次调用的初始化开销算进去
+    dist.all_reduce(tensor=data, op=dist.ReduceOp.SUM, async_op=False)
+    torch.cuda.synchronize()  # 等 CUDA kernel 真的做完
+    dist.barrier()            # 等所有进程都到这里
+
+    # 正式计时
+    start_time = time.time()
+    dist.all_reduce(tensor=data, op=dist.ReduceOp.SUM, async_op=False)
+    torch.cuda.synchronize()  # 同样要等 kernel 做完
+    dist.barrier()            # 同样要等所有进程
+    end_time = time.time()
+
+    duration = end_time - start_time
+```
+
+<Callout type="warning" title="这里有两层异步，都必须堵住">
+课上有同学专门问了「为什么还要 `torch.cuda.synchronize()`」。Percy 的回答是：
+
+**说到底我们仍然在做 CUDA 操作**，只不过现在是多个进程各自拿一张 GPU 在做。
+而 **CUDA 操作默认是异步的** —— 当 Python 走到下一行时，那个 CUDA 操作可能还没做完。
+所以必须同步一下，确认它真的完成了。（这一点第二讲讲基准测试时就强调过。）
+
+**两层异步分别是**：
+
+1. **CUDA kernel 的异步** → 用 `torch.cuda.synchronize()` 堵。
+2. **多个进程之间的异步** → 用 `dist.barrier()` 堵。
+</Callout>
+
+<Callout type="note" title="补充：barrier 和 synchronize 的先后顺序有讲究吗">
+课上有同学追问：能不能反过来，先 `barrier` 再 `synchronize`？
+
+Percy 说他不确定，但想了一下给出了一个理由：**如果你先 barrier，
+那时候 CUDA 可能还没跑完** —— 各个进程立刻就冲到 barrier 那里碰头了，
+而它们各自的 CUDA kernel 还在跑。**这样 barrier 其实没起到作用**，
+你只是让几个进程各自独立地去等自己的 kernel，同步的语义就丢了。
+</Callout>
+
+因为每个 rank 都在跑这段代码，**每个 rank 会报出一个自己的时间**（可能各不相同）。
+真跑出来是这样：
+
+```text
+[all_reduce] Rank 0: all_reduce(world_size=4, num_elements=104857600) took 1.60ms
+[all_reduce] Rank 2: all_reduce(world_size=4, num_elements=104857600) took 1.38ms
+[all_reduce] Rank 1: all_reduce(world_size=4, num_elements=104857600) took 1.50ms
+[all_reduce] Rank 3: all_reduce(world_size=4, num_elements=104857600) took 1.38ms
+```
+
+四个数在 **1.38 到 1.60 毫秒**之间。**想要一个数的话，取平均就好。**
+
+### 6.2 有效带宽的算法
+
+光知道「花了 1.5 毫秒」没有意义 —— **这算好还是坏？**
+所以要算**有效带宽（effective bandwidth）**。这件事**和第二讲里算 MFU 是类比的**：
+都是「实际做到的 ÷ 硬件本来能做的」这个思路的第一步。
+
+<Theorem type="theorem" name="all-reduce 的有效带宽">
+
+```python
+size_bytes = data.element_size() * data.numel()      # 张量本身有多少字节
+sent_bytes = size_bytes * 2 * (world_size - 1)       # 实际需要传输的总字节数
+total_duration = world_size * duration               # 所有 rank 加起来等了多久
+bandwidth = sent_bytes / total_duration
+```
+
+**那两个因子是怎么来的**：
+
+- **`world_size - 1`**：想象你要算 rank0 + rank1 + rank2 + rank3，
+  这需要迭代 `world_size - 1` 步，因为一共有 `world_size - 1` 次加法。
+- **`2`**：因为每一步既要**发送**也要**归约（接收）**。
+
+`total_duration` 乘 world size，是因为它代表**所有 rank 一共等了多长时间**。
+
+</Theorem>
+
+代进课上的数：`num_elements` 是 $100 \times 1024^2 = 104{,}857{,}600$ 个 fp32 元素，
+也就是 **400 MiB**；world size 是 4。于是
+
+$$
+\text{sent bytes} = 419{,}430{,}400 \times 2 \times 3 = 2{,}516{,}582{,}400 \ \text{字节} \approx 2.34\ \text{GiB}
+$$
+
+四个 rank 各自报出来的有效带宽是：
+
+```text
+[all_reduce] Rank 1: all_reduce measured bandwidth = 390 GB/s
+[all_reduce] Rank 2: all_reduce measured bandwidth = 426 GB/s
+[all_reduce] Rank 0: all_reduce measured bandwidth = 366 GB/s
+[all_reduce] Rank 3: all_reduce measured bandwidth = 425 GB/s
+```
+
+也就是**大约 400 GB/s** 这个量级。
+
+<Callout type="note" title="补充：课件把 GiB 和 GB 混着叫了">
+课件里最后一行是 `round(bandwidth / 1024**3)`，除的是 $1024^3$，
+所以算出来的单位其实是 **GiB/s**，但打印时标的是 **GB/s**。
+
+两者差 7.4%，对量级判断没影响，但你自己写基准测试时最好把单位统一。
+下面的演示会把两种单位都列出来。
+</Callout>
+
+### 6.3 两条重要结论
+
+<Callout type="insight" title="有效带宽和 world size、拓扑都无关">
+把上面的式子整理一下：
+
+$$
+\text{bandwidth} = \frac{\text{size} \times 2 \times (P-1)}{P \times \text{duration}}
+  = \frac{2 \times \text{size}}{\text{duration}} \cdot \frac{P-1}{P}
+$$
+
+这里 $P$ 是 world size。当 $P$ 变大时，$\frac{P-1}{P} \to 1$，于是剩下的就是
+$2 \times \text{size} / \text{duration}$。
+
+**两条结论**：
+
+1. **有效带宽与 world size 基本无关。** 这是好事 ——
+   你把 GPU 数量加上去，带宽不会变。
+2. **也与拓扑无关。** 用环形（ring）还是树形（tree）传消息，是 NCCL 自己去决定的事，
+   不影响这个测量。
+</Callout>
+
+### 6.4 reduce-scatter 的基准测试
+
+代码结构几乎一样，只有带宽公式变了：
+
+```python
+# 注意输入是一个矩阵：world_size × num_elements（每个 rank 都有这么大一块）
+input = torch.randn(world_size, num_elements, device=cuda_if_available(rank))
+output = torch.empty(num_elements, device=cuda_if_available(rank))
+
+# ...预热、计时、reduce_scatter_tensor...
+
+data_bytes = input.element_size() * input.numel()   # 输入有多少字节
+sent_bytes = data_bytes * (world_size - 1)          # 需要传多少（这里没有 2 倍）
+total_duration = world_size * duration
+bandwidth = sent_bytes / total_duration
+```
+
+**关键区别：这里没有那个 2 倍。** 跑出来是：
+
+```text
+[reduce_scatter] Rank 0: reduce_scatter(world_size=4, num_elements=104857600) took 2.61ms
+[reduce_scatter] Rank 1: reduce_scatter(world_size=4, num_elements=104857600) took 2.47ms
+[reduce_scatter] Rank 2: reduce_scatter(world_size=4, num_elements=104857600) took 2.39ms
+[reduce_scatter] Rank 3: reduce_scatter(world_size=4, num_elements=104857600) took 2.39ms
+
+[reduce_scatter] Rank 1: reduce_scatter measured bandwidth = 475 GB/s
+[reduce_scatter] Rank 0: reduce_scatter measured bandwidth = 450 GB/s
+[reduce_scatter] Rank 2: reduce_scatter measured bandwidth = 490 GB/s
+[reduce_scatter] Rank 3: reduce_scatter measured bandwidth = 490 GB/s
+```
+
+**带宽也在 400 上下这个量级。** Percy 说有时候会有一些随机性，但都落在 400 这一档。
+
+<Theorem type="proposition" name="为什么两者带宽相近">
+回想 all-reduce = reduce-scatter + all-gather。所以：
+
+- **all-reduce 搬运的数据量是 reduce-scatter 的两倍**
+  （reduce-scatter 有它的代价，all-gather 有它的代价，加起来是两倍的活）。
+- **all-reduce 花的时间也是两倍。**
+- **两者相除，带宽就一样了。**
+
+</Theorem>
+
+**参考资料**（课件给的两个链接）：
+
+- NVIDIA nccl-tests 里那篇《How to reason about collective operations》。
+- stas00 的 ml-engineering 仓库里的 all-reduce 基准测试示例代码。
+
+<Callout type="tip" title="动手：有效带宽核算器">
+下面这个工具就是上面两段基准测试代码。选操作（all-reduce / reduce-scatter）、
+拖 world size 和元素个数、填一个实测耗时，它把每一步都列出来：
+张量多大、要传多少字节、总时长是多少、带宽是多少。
+
+默认值就是课上的设定：4 张卡、$100 \times 1024^2$ 个 fp32 元素，
+耗时取课上真跑出来的那批数字（all-reduce 1.5 ms、reduce-scatter 2.6 ms），
+所以读数应该分别是 390.6 和 450.7 —— 和上面 rank 1 报的 390、rank 0 报的 450 对得上。
+
+值得试的事：
+
+- **把 world size 从 2 拖到 64，看带宽读数几乎不动** ——
+  这就是 6.3 节那条结论的具体样子（$\frac{P-1}{P}$ 很快就贴到 1 了）。
+- **切到 reduce-scatter**：注意它的输入是 world size 倍大的矩阵，
+  而带宽公式里**没有那个 2 倍**。
+- 面板下方同时给出 GiB/s 和 GB/s 两个读数，感受一下 7.4% 的差别。
+
+</Callout>
+
+<L07Bandwidth />
+
+---
+
+# 第二部分：分布式训练
+
+现在开始真正训模型。课件走的是**多层感知机（MLP）**上非常朴素的实现 ——
+如前面所说，MLP 就是 Transformer 里真正的计算瓶颈，所以这相当有代表性。
+
+三种并行方式，**每一种用不同的方式切开你的东西**：
+
+<Theorem type="proposition" name="三种切法">
+
+- **数据并行（data parallelism）**：沿**批（batch）维度**切。
+- **张量并行（tensor parallelism）**：沿**宽度（width）维度**切。
+- **流水线并行（pipeline parallelism）**：沿**深度（depth）维度**切。
+
+</Theorem>
+
+Percy 说这几张示意图**有点示意性质，不要抠得太细**，
+它们的作用是帮你在脑子里建立「数据和参数是怎么被切开的」这个概念。
+
+三种并行都用同一份样本数据：
+
+```python
+def generate_sample_data():
+    batch_size = 128     # 128 条数据
+    num_dim = 1024       # 每条 1024 维
+    data = torch.randn(batch_size, num_dim)
+    return data
+```
+
+<Callout type="tip" title="动手：同一个模型，三种切法">
+下面这个演示把上面三种并行摆在一起：同一个 MLP（默认就是课上的
+批大小 128、维度 1024、4 层、4 张卡），你切换标签就能看到
+**每张卡上到底有哪一块数据、哪一块参数**，
+以及**通信发生在什么位置、多久一次、一次搬多少字节**。
+
+值得试的事：
+
+- 对着下面的代码看三张表：数据并行里参数是**每张卡一份完整拷贝**，
+  张量并行里每张卡只有**四分之一列**，流水线并行里每张卡只有**一部分层**。
+- 注意「通信频率」那一栏：数据并行**每步一次**，
+  张量并行**每层一次**，流水线并行**每个微批在每个边界一次**。
+  Percy 强调的「张量并行通信很多」指的就是这个 —— 不是单次搬得多，而是**次数多、且在关键路径上**。
+- 把批大小从 128 一路调到 8192，看张量并行的通信量怎么追上并超过数据并行：
+  **数据并行的通信量正比于参数量，张量并行的通信量正比于批大小 × 维度。**
+
+</Callout>
+
+<L07Sharding />
+
+## 七、数据并行（DDP）
+
+<Figure src="/courses/cs336/l07-data-parallelism.png" caption="数据并行：把数据切成块，每张 GPU 负责一块；参数完整地复制在每张卡上。来源：CS336 课件" />
+
+**分片策略：每个 rank 拿到数据的一个切片。** 参数呢？**每张卡都保留完整的一份**，
+做完全正常的模型训练，**然后同步一下**。
+
+### 7.1 切数据
+
+```python
+# 数据矩阵是 batch_size × num_dim，把行切成 world_size 块：
+# --- B0 ---
+# --- B1 ---
+# --- B2 ---
+# --- B3 ---
+batch_size = data.size(0)                                # 128
+num_dim = data.size(1)                                   # 1024
+local_batch_size = int_divide(batch_size, world_size)     # 128 / 4 = 32
+start_index = rank * local_batch_size
+end_index = start_index + local_batch_size
+data = data[start_index:end_index].to(cuda_if_available(rank))
+```
+
+于是**每张 GPU 看到 32 条数据**，各不相同。
+
+<Callout type="note" title="补充：真实场景里数据不该这样切">
+Percy 说明了一句：这里是**先造出完整的数据、再切片分发**，
+纯粹是为了讲解方便。**实践中每个 rank 应该各自去加载自己那一份数据** ——
+否则这个「先集中再分发」的步骤就成了瓶颈。
+</Callout>
+
+### 7.2 建模型：每张卡都有全部参数
+
+```python
+# 每张卡都持有全部参数 params[0], ..., params[num_layers-1]
+params = [get_init_params(num_dim, num_dim, rank) for layer in range(num_layers)]
+optimizer = torch.optim.AdamW(params, lr=1e-3)   # 每个 rank 有自己的一份优化器状态
+```
+
+每层是一个 `num_dim × num_dim` 的矩阵，随机初始化。**注意每个 rank 各有各的优化器状态。**
+
+<Callout type="note" title="补充：为什么每张卡的初始参数是一样的">
+DDP 要成立，有一个前提：**所有 rank 必须从完全相同的初始参数出发**，
+否则后面梯度同步得再准，参数也永远对不齐。
+
+课件是靠**固定随机种子**做到的：
+
+```python
+def get_init_params(num_inputs: int, num_outputs: int, rank: int) -> nn.Parameter:
+    """在第 rank 号 GPU 上创建参数。"""
+    torch.random.manual_seed(0)   # 固定种子：所有 rank 抽到同一批随机数
+    return nn.Parameter(
+        torch.randn(num_inputs, num_outputs, device=cuda_if_available(rank)) / math.sqrt(num_outputs)
+    )
+```
+
+（除以 $\sqrt{\text{num\_outputs}}$ 是初始化尺度的考虑，第二讲讲过。
+另一种做法是 rank 0 随机初始化之后 **broadcast** 给所有 rank —— 这就是 3.3 节说的那个用例。）
+</Callout>
+
+### 7.3 训练循环：只多了一行
+
+```python
+for step in range(num_steps):
+    # 前向传播（注意 data 只是本 rank 那 32 条）
+    x = data
+    for param in params:
+        x = x @ param
+        x = F.gelu(x)
+    loss = x.square().mean()   # 损失函数就是平方幅度的平均，取什么无所谓
+
+    # 反向传播
+    loss.backward()
+
+    # 跨 worker 同步梯度 —— 这是标准训练和 DDP 之间【唯一】的区别
+    for param in params:
+        dist.all_reduce(tensor=param.grad, op=dist.ReduceOp.AVG, async_op=False)
+
+    # 更新参数
+    optimizer.step()
+```
+
+**这就是全部。** Percy 说他觉得这件事「非常优雅」：
+
+**每个 rank 拿自己那一块数据做完全标准的训练，只是在反向传播之后插一句
+「把所有梯度平均一下」。这是一行代码的改动。** 然后参数照常更新。
+
+结果是：**每个 rank 在做参数更新时，表现得就像它拥有全部数据一样，
+但它实际只处理了其中一部分数据。**
+
+真跑出来的输出（`params` 那一列显示的是每层参数矩阵的形状和它第一个元素的值）：
+
+```text
+[data_parallelism] Rank 2: step = 0, loss = 0.011991873383522034,
+    params = ['1024x1024[-0.0299...]', '1024x1024[-0.0299...]', '1024x1024[-0.0279...]', '1024x1024[-0.0299...]']
+[data_parallelism] Rank 0: step = 0, loss = 0.01151061337441206,
+    params = ['1024x1024[-0.0299...]', '1024x1024[-0.0299...]', '1024x1024[-0.0279...]', '1024x1024[-0.0299...]']
+[data_parallelism] Rank 3: step = 0, loss = 0.012755745090544224,
+    params = ['1024x1024[-0.0299...]', '1024x1024[-0.0299...]', '1024x1024[-0.0279...]', '1024x1024[-0.0299...]']
+[data_parallelism] Rank 1: step = 0, loss = 0.012116298079490662,
+    params = ['1024x1024[-0.0299...]', '1024x1024[-0.0299...]', '1024x1024[-0.0279...]', '1024x1024[-0.0299...]']
+```
+
+**四个 loss 各不相同**（0.0115、0.0120、0.0121、0.0128），
+**但四行的 params 完全一样** —— 这正是下面要总结的那三条。
+
+<Theorem type="proposition" name="DDP 的三条性质">
+
+1. **各个 rank 的损失是不同的** —— 因为它们是在各自的本地数据上算的。
+2. **梯度一开始也是不同的，但被 all-reduce 成了相同的。**
+3. **所以参数在所有 rank 上始终保持一致。**
+
+</Theorem>
+
+### 7.4 三个课上的问题
+
+<Callout type="note" title="补充：批大小必须满足什么条件">
+课上连着问了两个相关的问题。
+
+**问：是不是批大小必须大于 1？**
+答：**是的。批大小至少要等于 world size 才说得通**，
+而且通常应该比这个大不少 —— 否则每张卡分不到几条数据。
+
+**问：批大小是不是应该是 world size 的整数倍？**
+答：**那样最好。** 如果不是，你可以用零来补齐（padding），
+办法总是有的，**但对所有人来说整除都更省事**。
+（课件里的 `int_divide` 函数就是在除不尽时直接报错。）
+</Callout>
+
+<Callout type="note" title="补充：换成 Transformer 要改什么">
+课上有同学问：如果模型是 Transformer 而不是 MLP，这段代码会长什么样？
+
+Percy 的回答是：**基本上一模一样。**
+**DDP 有一个很好的性质是它非常模块化** ——
+它只负责在反向传播之后平均梯度，**它根本不关心你的前向传播长什么样**。
+</Callout>
+
+<Callout type="tip" title="下一讲：参数放不下怎么办">
+Percy 在这里预告了下一讲：Tatsu 会讲更花哨的数据并行 —— **FSDP 和 ZeRO**。
+
+思路就是前面说过的：这里用的 all-reduce 是一个非常简单的单体操作，
+但它**要求每张卡都在显存里持有全部模型参数**。
+**如果参数放不下呢？** 那就得更聪明一点，把 all-reduce 拆成
+reduce-scatter 和 all-gather 来管理。这是下一讲的主题。
+</Callout>
+
+## 八、张量并行
+
+<Figure src="/courses/cs336/l07-tensor-parallelism.png" caption="张量并行：不切数据，切每一层的参数矩阵；每个 rank 拿到每一层的一部分。来源：CS336 课件" />
+
+**分片策略：每个 rank 拿到每一层的一部分，但要传输所有的数据 / 激活值。**
+
+Percy 先给了结论：**这通常意味着要传输多得多的数据**（后面会讨论）。
+
+### 8.1 切参数：列并行
+
+```python
+data = data.to(cuda_if_available(rank))    # 所有 rank 都拿到全部数据
+batch_size = data.size(0)                  # 128
+num_dim = data.size(1)                     # 1024
+local_num_dim = int_divide(num_dim, world_size)   # 1024 / 4 = 256
+
+# 每个 rank 只拿到 1/world_size 的参数
+#  |  |  |  |
+# W0 W1 W2 W3
+#  |  |  |  |
+params = [get_init_params(num_dim, local_num_dim, rank) for layer in range(num_layers)]
+```
+
+注意形状：**每一层的参数矩阵从 `1024 × 1024` 变成了 `1024 × 256`。**
+也就是说，**每个 rank 只负责输出维度的一个子集**。
+
+如果把一层的参数矩阵画出来，**这是沿着「列」在切**。所以这种做法叫
+**列张量并行（column tensor parallel）**。也可以按行切，但这一讲不讲那个。
+
+**每个 rank 仍然拥有所有的层** —— 切的是每层的宽度，不是层数。
+
+### 8.2 前向传播：算一段、all-gather、拼起来
+
+```python
+x = data
+for layer in range(num_layers):
+    # 用参数的一个切片算出激活值：(batch_size × local_num_dim) = 128 × 256
+    x = x @ params[layer]
+    x = F.gelu(x)          # GELU 是逐元素的，切开算完全没问题
+
+    # 为收集所有 rank 的激活值分配内存：world_size 个 (128 × 256)
+    activations = [torch.empty(batch_size, local_num_dim, device=cuda_if_available(rank))
+                   for _ in range(world_size)]
+
+    # 通过 all-gather 把各个 rank 的激活值发给所有人
+    dist.all_gather(tensor_list=activations, tensor=x, async_op=False)
+
+    # 拼起来得到完整的 batch_size × num_dim = 128 × 1024
+    x = torch.cat(activations, dim=1)
+```
+
+逐句读一遍：
+
+1. **`x @ params[layer]`**：注意这**只用了参数的一个切片**。
+   如果我是 rank 1，我只拿到那个矩阵的第二个 256 列。但**我照样能算** ——
+   得到的是完整输出的一个 256 维切片。
+2. **`F.gelu(x)`**：**GELU 是逐元素的**，所以切开做和整体做结果一样，不需要任何通信。
+3. **`activations` 那一行**：分配 `world_size` 个位置，每个装一份 `128 × 256`。
+4. **`dist.all_gather`**：每个 rank 把自己的 `x` 发出去，
+   **all-gather 之后每个 rank 的 `activations` 列表里都有全部四份**。
+5. **`torch.cat(..., dim=1)`**：沿着维度方向拼接，恢复成 `128 × 1024`。
+
+**然后进入下一层，再来一遍。**
+
+跑出来的结果：
+
+```text
+[tensor_parallelism] Rank 0: forward pass produced activations 128x1024[4.0669...]
+[tensor_parallelism] Rank 1: forward pass produced activations 128x1024[4.0669...]
+[tensor_parallelism] Rank 2: forward pass produced activations 128x1024[4.0669...]
+[tensor_parallelism] Rank 3: forward pass produced activations 128x1024[4.0669...]
+```
+
+**四张卡最后拿到的是同一个 `128 × 1024` 的完整激活值** —— 因为最后一层之后也做了 all-gather。
+每张卡只算了其中四分之一列，凑出来的却是完整结果。
+
+<Callout type="insight" title="张量并行到底在利用什么">
+Percy 点明了这里的数学基础：**如果你想做一次矩阵乘法，
+你可以把它拆成一组更小的矩阵乘法，在不同的 rank 上分别做，然后把结果收集起来。**
+
+具体到列并行：把 $W$ 按列切成 $[W_0, W_1, W_2, W_3]$，那么
+
+$$
+x W = x\,[W_0,\ W_1,\ W_2,\ W_3] = [\,x W_0,\ x W_1,\ x W_2,\ x W_3\,]
+$$
+
+每个 $xW_i$ 在 rank $i$ 上独立算，算完拼接就是完整结果 —— 这就是那个 all-gather。
+</Callout>
+
+### 8.3 和数据并行的一个重要差别
+
+**数据并行很优雅，因为它是按数据切的，模型被当成一个不透明的模块。
+张量并行必须动模型内部。**
+
+这是一个实实在在的工程差别：**用张量并行，你得去改模型的实现。**
+
+### 8.4 反向传播怎么办
+
+课上有同学立刻问了：反向传播怎么处理？
+
+<Theorem type="proposition" name="all-gather 与 reduce-scatter 的对偶">
+在反向传播里，你有各层的激活值，需要把梯度 **reduce-scatter** 到各个 rank 上。
+
+所以这两个操作之间有一种**对偶（duality）**：
+
+**前向做 all-gather 的地方，反向就要做 reduce-scatter。**
+</Theorem>
+
+<Callout type="note" title="补充：PyTorch 的 autograd 会自动做这件事吗">
+课上有同学问：这个 reduce-scatter 是 autograd 自动做的吗？
+
+Percy 的回答是：**在这份代码里不会。** 如果你直接调 `backward()`，
+它不会知道要做这些通信 —— **因为这段代码里的并行是我们手工管理的，
+autograd 完全不知道它的存在。**
+
+所以你必须**自己去调那个 reduce-scatter**。
+
+他补了一句：**这是有意为之的，因为这门课叫「从零构建语言模型」。**
+实践中你多半不用自己写这些 —— PyTorch 有很多东西是自动帮你做好的。
+
+（课件里张量并行的反向传播被留成了**作业习题**。）
+</Callout>
+
+## 九、流水线并行
+
+<Figure src="/courses/cs336/l07-pipeline-parallelism.png" caption="流水线并行：把网络按层切开，每个 rank 负责一段连续的层。来源：CS336 课件" />
+
+**分片策略：每个 rank 拿到一部分层，数据 / 激活值在 rank 之间传递。**
+
+和前两者对比：
+
+- **在每一层内部，这个 rank 拿到全部的维度**（不像张量并行）。
+- **每个 rank 都会以某种形式看到全部数据**（不像数据并行）。
+
+这次课件用的是 **world size = 2**，4 层，所以每个 rank 拿 2 层。
+
+### 9.1 切层
+
+```python
+data = data.to(cuda_if_available(rank))
+batch_size = data.size(0)   # 128
+num_dim = data.size(1)      # 1024
+
+# 切分层：每个 rank 负责多少层
+local_num_layers = int_divide(num_layers, world_size)   # 4 / 2 = 2
+
+# 每个 rank 只拿到一部分层，但每层还是完整的 num_dim × num_dim
+local_params = [get_init_params(num_dim, num_dim, rank) for layer in range(local_num_layers)]
+```
+
+### 9.2 微批与点对点通信
+
+```python
+# 把批切成若干微批，以缩小流水线气泡
+micro_batch_size = int_divide(batch_size, num_micro_batches)   # 128 / 4 = 32
+
+if rank == 0:
+    # rank 0 手里是真实数据，切成 num_micro_batches 块
+    micro_batches = data.chunk(chunks=num_micro_batches, dim=0)
+else:
+    # 其它 rank 先给激活值分配好内存，等着别人发过来
+    micro_batches = [torch.empty(micro_batch_size, num_dim, device=cuda_if_available(rank))
+                     for _ in range(num_micro_batches)]
+
+for x in micro_batches:
+    # 从前一个 rank 接收激活值
+    if rank - 1 >= 0:
+        dist.recv(tensor=x, src=rank - 1)
+
+    # 只计算分配给这个 rank 的那几层
+    for param in local_params:
+        x = x @ param
+        x = F.gelu(x)
+
+    # 发给下一个 rank
+    if rank + 1 < world_size:
+        dist.send(tensor=x, dst=rank + 1)
+```
+
+<Callout type="note" title="补充：send 和 recv 不是集合通信">
+这里第一次出现 `dist.send` 和 `dist.recv`。它们是**点对点（point-to-point）操作**，
+不在前面那八个集合通信操作里，Percy 说之前没讲但它们相当自解释：
+
+- **`dist.recv(tensor=x, src=rank - 1)`**：从编号 `rank - 1` 的那张卡**接收**一个张量，
+  写进 `x`。
+- **`dist.send(tensor=x, dst=rank + 1)`**：把张量 `x` **发**给编号 `rank + 1` 的那张卡。
+
+流水线并行天然就是「上一站发给下一站」，用点对点比用集合通信更贴切。
+</Callout>
+
+跑出来（world size = 2）：
+
+```text
+[pipeline_parallelism] Rank 0: sending 32x1024[0.2459...] to rank 1
+[pipeline_parallelism] Rank 0: sending 32x1024[0.1663...] to rank 1
+[pipeline_parallelism] Rank 0: sending 32x1024[0.7809...] to rank 1
+[pipeline_parallelism] Rank 0: sending 32x1024[-0.1654...] to rank 1
+```
+
+四个微批，每个 `32 × 1024`，一个接一个地从 rank 0 送到 rank 1。
+
+### 9.3 为什么要微批：流水线气泡
+
+Percy 解释了为什么代码里要多这一层拆分。
+
+**流水线并行的基本形态**：一个 rank 拿到数据，算它负责的那几层，
+然后发给下一个 GPU；下一个 GPU 算它那几层，再发给再下一个。
+**这是划分深层网络非常自然的一种方式。**
+
+**但问题是**：你会得到所谓的**流水线气泡（pipeline bubble）** ——
+**当你没在算的时候，你就在干等别人的张量传过来**。这非常低效。
+
+<Theorem type="definition" name="微批（micro batch）">
+**微批**的想法是：把一个批**拆成更小的批**，这样你可以**快速处理完一小块、
+立刻传给下一站**，下一站马上就有活干了，而你继续处理下一块。
+
+**这能减少流水线气泡的数量。**
+</Theorem>
+
+Percy 说这个话题 Tatsu 周三会讲得更细。
+
+### 9.4 没有处理的：重叠通信与计算
+
+**这个朴素版本里没有做的一件重要的事**：**重叠通信和计算**。
+对流水线并行来说，这**非常重要**。
+
+**流水线并行本身给了你正确的结构去做这件事。**
+具体做法是：**把 `send` / `recv` 换成异步版本**（在名字前加一个 `i`，
+也就是 `isend` / `irecv`），它们就变成异步的了。当然你得再加一些代码来管理这些异步操作。
+
+**想要达到的效果是**：**在你这边计算的同时，你应该在收数据或者发数据。**
+计算和通信重叠起来，就减少了实际花在等待上的时间。
+
+---
+
+## 十、这一讲缺了什么
+
+Percy 列了几件这一讲没有覆盖、但很重要的事。
+
+### 10.1 通信与计算的重叠
+
+上面在流水线并行那里说过，但**数据并行也有这个问题**。
+
+回看第七节的代码：那里是**先做完整个反向传播，然后在最后一口气做所有的 all-reduce**。
+**但如果你聪明一点**：在反向传播过程中，**一旦某一层的梯度算完了，
+你就可以立刻开始发它** —— 不用等整个反向传播结束。
+
+**这件事会在作业二里探索。**
+
+### 10.2 更一般的模型
+
+有同学问了「那真实的模型呢」。Percy 的回答是：
+**这个 MLP 基本上把理解基础所需要的东西都给你了。**
+
+**更大的模型只是需要多得多的簿记工作**，反而**会让核心算法更难看清**。
+
+### 10.3 其它形式的并行
+
+这一讲没讲的还有：
+
+- **序列并行（sequence parallelism）**：把**一整条序列切成若干段**，
+  这样就能把注意力的计算并行化。
+- **专家并行（expert parallelism）**：把 **MoE 的专家**并行化 ——
+  **前面提到的 all-to-all 就是用在这里的**。
+- **不同并行技术的各种组合** —— 这些**也会在作业里出现**。
+
+### 10.4 怎么选：强烈依赖于硬件
+
+<Theorem type="proposition" name="并行方式的选择取决于互联">
+
+- **张量并行通信量很大** —— 因为**每一层**都要把激活值发出去，而激活值相当大。
+  所以**张量并行一般只在一个节点内做**，跑在 NVLink / NVSwitch 这种高带宽互联上。
+  **你不会把张量并行跨出 NVLink 域。**
+- **流水线并行能容忍慢得多的互联。** 所以**有些去中心化训练的工作用的就是流水线并行** ——
+  他们的节点 / GPU 实际上分散在**地球的另一半**。
+  **但在那种场景下你绝不会想用张量并行。**
+
+</Theorem>
+
+所以你看到的实际组合往往是：**节点内用张量并行，然后配上数据并行或 FSDP，
+如果还需要的话再加流水线并行。**
+
+还有别的因素。比如数据并行：你可以把数据并行的规模开得挺大，
+**但接下来你会撞上「临界批大小（critical batch size）」** ——
+批大小加得太大之后，模型并不会因此进步更快，**你只是在浪费算力**。
+到那时候，**用张量并行反而更划算**。
+
+<Callout type="note" title="补充：临界批大小">
+这个概念第二讲讲梯度累积时出现过。简单说：批大小越大，梯度估计越准、训练越稳，
+但收益是递减的 —— 超过某个规模后再翻倍批大小，模型的进步几乎不再加快。
+那个转折点就是临界批大小。后面的课会详细讲。
+</Callout>
+
+这类考量还有很多，课程后面会陆续讲到。
+
+### 10.5 另一条路：JAX / TPU 与编译器
+
+最后 Percy 回到了 TPU 这个话题。
+
+**这门课是有意用 PyTorch，而且是有意用最原始的方式去调那些集合通信操作的 ——
+就是为了让你能从机制上看清楚到底发生了什么。**
+
+**另一条路**（尤其在 JAX 和 TPU 的世界里）是：
+**你只要定义模型和分片策略（sharding strategy），编译器会替你决定需要哪些集合通信操作。**
+你基本上只说「这块数据要在这里、这里和这里」，编译器就去施展一些魔法把它办了。
+
+课件给的例子是斯坦福 CRFM 的 **Levanter** 项目。
+
+Percy 的评价是：**这当然很有吸引力，但它显然会把「从零建东西」的乐趣拿走不少。**
+
+## 十一、这一讲的小结
+
+<Theorem type="proposition" name="第 7 讲要点">
+
+1. **并行的方式有很多种**：按**数据**切（批维度）、按**张量 / 专家**切（宽度维度）、
+   按**流水线**切（深度维度）、按**序列**切（长度维度）。
+2. **数据并行**：这一讲只做了 **DDP（用 all-reduce）**；
+   下一讲讲 **FSDP / ZeRO（用 all-gather + reduce-scatter）**。
+3. **张量并行**：**需要非常快的互联**（比如 NVLink）。
+4. **流水线并行**：**可以在慢互联上工作**，但**必须下功夫减少流水线气泡**。
+5. **同一个东西，你可以选择重新计算它、把它存在显存里、
+   或者把它存在另一张 GPU 的显存里然后通信过来。**
+6. **硬件会越来越快，但我们永远会想要更大的模型，
+   所以这种层次化的结构会一直存在。**
+
+</Theorem>
+
+第 5 点值得展开一下，因为它把好几讲串起来了：
+
+<Callout type="insight" title="重算 / 存显存 / 存到别的 GPU —— 同一个权衡的三种形态">
+第二讲讲**激活检查点**时，我们看到的权衡是「**重新计算** vs **存在显存里**」。
+
+这一讲可以看成那个权衡的一个**扩展**：**你还可以把它存在另一张 GPU 的显存里**，
+需要时通信过来。
+
+用这个视角回看数据并行：**每个 rank 都在做冗余的工作** ——
+每张卡都在更新并保管全部参数。**但你之所以愿意这么冗余，
+正是因为这样就不用把优化器状态搬来搬去。**
+
+**冗余计算、占用显存、花费通信 —— 你总是在这三者之间选。**
+</Callout>
+
+---
+
+## 下一讲
+
+下周三 **Tatsu Hashimoto** 会更深入地讲并行技术：**FSDP 和 ZeRO**，
+以及各种并行方式怎么组合起来用。这一讲给的是跨 GPU 的**基本机制**，
+下一讲讲的是把它们真正用好所需要的**工程细节**。

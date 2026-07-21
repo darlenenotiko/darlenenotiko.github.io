@@ -1,0 +1,252 @@
+---
+// CS336 第 8 讲：ZeRO 三个阶段的显存对账。
+// 逐字照搬课件第 18 页（ZeRO 论文那张图）和第 28 页（8×A100 80G 能装多大）的公式：
+//   baseline : (2 + 2 + K) · Ψ
+//   stage 1  : 2Ψ + 2Ψ + KΨ/N        （只切优化器状态）
+//   stage 2  : 2Ψ + (2 + K)Ψ/N       （再切梯度）
+//   stage 3  : (2 + 2 + K)Ψ/N        （连参数一起切）
+// 其中 2 = bf16 参数，2 = bf16 梯度，K = 优化器状态字节/参数。
+// 通信量：stage 0/1/2 都是 2×参数，stage 3 是 3×参数。
+---
+
+<div class="demo" data-demo="l08-zero">
+  <div class="row">
+    <label class="chk">
+      <input type="radio" name="l08zeroK" data-k value="12" checked /> 混合精度：K = 12（fp32 主权重 + fp32 双矩）→ 16 字节/参数
+    </label>
+  </div>
+  <div class="row">
+    <label class="chk">
+      <input type="radio" name="l08zeroK" data-k value="8" /> 纯 BF16 + Kahan 求和：K = 8（fp32 主权重 + bf16 双矩）→ 12 字节/参数
+    </label>
+  </div>
+
+  <div class="row">
+    <label class="sld">
+      参数量 Ψ = <span data-psi-val>7.5</span> B
+      <input type="range" data-psi min="1" max="400" step="1" value="15" />
+    </label>
+    <label class="sld">
+      GPU 数 N = <span data-n-val>64</span>
+      <input type="range" data-n min="0" max="8" step="1" value="6" />
+    </label>
+    <label class="sld">
+      单卡显存
+      <select data-mem data-default="80">
+        <option value="80" selected>A100 / H100 80 GB</option>
+        <option value="141">H200 141 GB</option>
+        <option value="180">B200 180 GB</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="wrap">
+    <table class="main">
+      <thead>
+        <tr>
+          <th>方案</th>
+          <th>切了什么</th>
+          <th>每卡字节 / 参数</th>
+          <th>每卡显存</th>
+          <th>通信量</th>
+          <th>这张卡最多装多少参数</th>
+        </tr>
+      </thead>
+      <tbody data-rows></tbody>
+    </table>
+  </div>
+
+  <p class="hint" data-hint></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1.3rem;
+    margin-bottom: 0.6rem;
+  }
+  .sld,
+  .chk {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.83rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .sld input[type='range'] {
+    width: 150px;
+    accent-color: var(--indigo);
+  }
+  .chk input {
+    accent-color: var(--indigo);
+  }
+  select {
+    font: inherit;
+    font-size: 0.8rem;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 0.15rem 0.3rem;
+  }
+  .wrap {
+    overflow-x: auto;
+    margin-top: 0.9rem;
+  }
+  table.main {
+    width: 100%;
+    min-width: 620px;
+    border-collapse: collapse;
+    font-size: 0.81rem;
+    font-variant-numeric: tabular-nums;
+  }
+  table.main :global(th) {
+    text-align: right;
+    padding: 0.3rem 0.5rem;
+    color: var(--ink-faint);
+    font-weight: 500;
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+  table.main :global(th:first-child),
+  table.main :global(th:nth-child(2)) {
+    text-align: left;
+  }
+  table.main :global(td) {
+    padding: 0.32rem 0.5rem;
+    text-align: right;
+    color: var(--ink);
+    font-family: var(--font-mono);
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+  table.main :global(td.name),
+  table.main :global(td.what) {
+    text-align: left;
+    font-family: inherit;
+    color: var(--ink-muted);
+  }
+  table.main :global(tr.over td) {
+    color: var(--madder);
+  }
+  table.main :global(td.big) {
+    color: var(--indigo);
+    font-weight: 700;
+  }
+  .hint {
+    margin: 0.9rem 0 0;
+    font-size: 0.83rem;
+    line-height: 1.8;
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupL08Zero() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l08-zero"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const kEls = [...root.querySelectorAll<HTMLInputElement>('[data-k]')];
+      const NS = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+
+      // Ψ 滑块走的是「0.5 B 一档」，这样 7.5 B（ZeRO 论文那个例子）正好取得到
+      function psi() {
+        return parseInt($<HTMLInputElement>('[data-psi]').value, 10) * 0.5;
+      }
+      function ngpu() {
+        return NS[parseInt($<HTMLInputElement>('[data-n]').value, 10)];
+      }
+      function kbytes() {
+        return parseInt((kEls.find((e) => e.checked) ?? kEls[0]).value, 10);
+      }
+
+      function draw() {
+        const P = psi(); // 单位：十亿参数
+        const N = ngpu();
+        const K = kbytes();
+        const memGB = parseInt($<HTMLSelectElement>('[data-mem]').value, 10);
+        $('[data-psi-val]').textContent = P.toFixed(1);
+        $('[data-n-val]').textContent = String(N);
+
+        // 每卡字节/参数
+        const bpp = [
+          2 + 2 + K, // baseline
+          2 + 2 + K / N, // stage 1
+          2 + (2 + K) / N, // stage 2
+          (2 + 2 + K) / N, // stage 3
+        ];
+        const names = ['朴素数据并行', 'ZeRO stage 1', 'ZeRO stage 2', 'ZeRO stage 3 / FSDP'];
+        const what = [
+          '什么都不切',
+          '切优化器状态',
+          '切优化器状态 + 梯度',
+          '全切（连参数）',
+        ];
+        const comm = ['2 × 参数', '2 × 参数（免费）', '2 × 参数（免费）', '3 × 参数'];
+
+        const tb = $('[data-rows]');
+        tb.replaceChildren();
+        for (let i = 0; i < 4; i++) {
+          // GB 按十进制算（1 GB = 1e9 字节），和 ZeRO 论文那张表口径一致
+          const gb = bpp[i] * P;
+          const maxParams = memGB / bpp[i]; // 单位：十亿参数
+          const tr = document.createElement('tr');
+          if (gb > memGB) tr.className = 'over';
+          const cells: [string, string][] = [
+            ['name', names[i]],
+            ['what', what[i]],
+            ['', bpp[i].toFixed(3)],
+            ['', `${gb.toFixed(1)} GB`],
+            ['', comm[i]],
+            ['big', `${maxParams.toFixed(2)} B`],
+          ];
+          for (const [cls, txt] of cells) {
+            const td = document.createElement('td');
+            if (cls) td.className = cls;
+            td.textContent = txt;
+            tr.append(td);
+          }
+          tb.append(tr);
+        }
+
+        const base = bpp[0] * P;
+        const s3 = bpp[3] * P;
+        let hint =
+          `当前设置下，朴素数据并行每张卡要 ${base.toFixed(1)} GB，ZeRO stage 3 只要 ${s3.toFixed(1)} GB` +
+          `（省了 ${(base / s3).toFixed(1)} 倍）。`;
+        if (base > memGB && s3 <= memGB) {
+          hint += ` 注意左边那几行标红了 —— 它们装不进 ${memGB} GB，只有 stage 3 装得下。`;
+        }
+        hint +=
+          ` 关键在最后两列一起看：stage 1 和 stage 2 的通信量和朴素数据并行完全一样` +
+          `（reduce-scatter + all-gather 等价于一次 all-reduce），所以显存是白拿的；` +
+          `stage 3 多一次 all-gather，通信量涨到 1.5 倍，但可以藏在计算下面。`;
+        $('[data-hint]').textContent = hint;
+      }
+
+      root.querySelectorAll<HTMLSelectElement>('select[data-default]').forEach((el) => {
+        el.value = el.dataset.default!;
+      });
+      root.querySelectorAll('input, select').forEach((el) => {
+        el.addEventListener('input', draw);
+        el.addEventListener('change', draw);
+      });
+      draw();
+    });
+  }
+
+  setupL08Zero();
+  document.addEventListener('astro:page-load', setupL08Zero);
+</script>

@@ -1,0 +1,602 @@
+---
+// 第 7 讲演示 1：八个集合通信原语。
+// 左边是四张卡各自的输入，右边是输出，中间画出「哪些数从哪张卡飞到哪张卡」。
+// 所有输入 / 输出的数值都直接抄自课件 lecture_07.py 的 collective_operations()。
+// 传输量按「朴素点对点计数」：一个元素从一张卡送到另一张卡算一次。
+// 这个计数恰好和课上基准测试里的环形公式一致
+//   —— all-reduce 总量 = size × 2 × (P-1)，reduce-scatter / all-gather 总量 = size × (P-1)。
+---
+
+<div class="demo" data-demo="l07-collective">
+  <div class="ops">
+    <span class="glabel">热身</span>
+    <button data-op="broadcast">broadcast</button>
+    <button data-op="scatter">scatter</button>
+    <button data-op="gather">gather</button>
+    <button data-op="reduce">reduce</button>
+    <span class="glabel">主力</span>
+    <button data-op="allgather">all-gather</button>
+    <button data-op="reducescatter">reduce-scatter</button>
+    <button data-op="allreduce">all-reduce</button>
+    <span class="glabel">最一般</span>
+    <button data-op="alltoall">all-to-all</button>
+  </div>
+
+  <p class="desc" data-desc></p>
+
+  <div class="ctrl">
+    <button data-run>执行 →</button>
+    <button data-reset class="ghost">回到输入</button>
+    <span class="focus">
+      只看这张卡的流向：
+      <button data-focus="-1" class="chip on">全部</button>
+      <button data-focus="0" class="chip">rank 0</button>
+      <button data-focus="1" class="chip">rank 1</button>
+      <button data-focus="2" class="chip">rank 2</button>
+      <button data-focus="3" class="chip">rank 3</button>
+    </span>
+  </div>
+
+  <div class="stage" data-stage>
+    <div class="col">
+      <div class="colhead">输入（每张卡手里的数）</div>
+      <div class="rows" data-in></div>
+    </div>
+    <div class="wirewrap">
+      <div class="colhead mid">跨卡传输</div>
+      <svg class="wires" data-wires aria-hidden="true"></svg>
+    </div>
+    <div class="col">
+      <div class="colhead">输出（每张卡最后拿到什么）</div>
+      <div class="rows" data-out></div>
+    </div>
+  </div>
+
+  <div class="tally" data-tally></div>
+  <p class="foot">
+    传输量按最朴素的点对点计数：一个数从一张卡送到另一张卡记一次，每个数按 fp32
+    的 4 字节折算。真实的 NCCL 用环形或树形来组织传输，路径不一样，但对
+    all-reduce / all-gather / reduce-scatter 来说总传输量恰好和这里一致。
+  </p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.1rem 1.1rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+
+  .ops {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.35rem;
+  }
+  .glabel {
+    font-size: 0.72rem;
+    letter-spacing: 0.08em;
+    color: var(--ink-faint);
+    margin-left: 0.35rem;
+  }
+  .glabel:first-child {
+    margin-left: 0;
+  }
+  .ops button {
+    padding: 0.28rem 0.6rem;
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .ops button:hover {
+    border-color: var(--indigo);
+  }
+  .ops button.on {
+    color: var(--bg);
+    background: var(--indigo);
+    border-color: var(--indigo);
+  }
+
+  .desc {
+    margin: 0.9rem 0 0;
+    font-size: 0.86rem;
+    line-height: 1.7;
+    color: var(--ink-muted);
+  }
+
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.9rem 0 0.4rem;
+  }
+  .ctrl > button {
+    padding: 0.32rem 0.8rem;
+    font: inherit;
+    font-size: 0.83rem;
+    color: var(--bg);
+    background: var(--indigo);
+    border: 1px solid var(--indigo);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: opacity 0.2s var(--ease);
+  }
+  .ctrl > button:hover {
+    opacity: 0.85;
+  }
+  .ctrl > button:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+  .ctrl > button.ghost {
+    color: var(--ink-muted);
+    background: transparent;
+    border-color: var(--rule);
+  }
+  .focus {
+    font-size: 0.76rem;
+    color: var(--ink-faint);
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+  }
+  .chip {
+    padding: 0.16rem 0.45rem;
+    font: inherit;
+    font-size: 0.74rem;
+    color: var(--ink-muted);
+    background: transparent;
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .chip.on {
+    color: var(--madder);
+    border-color: var(--madder);
+  }
+
+  .stage {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.6rem;
+    margin-top: 0.9rem;
+  }
+  @media (min-width: 720px) {
+    .stage {
+      grid-template-columns: 1fr 8rem 1fr;
+      gap: 0;
+      align-items: start;
+    }
+  }
+
+  .colhead {
+    font-size: 0.74rem;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+    margin-bottom: 0.4rem;
+    height: 1.1rem;
+  }
+  .colhead.mid {
+    text-align: center;
+  }
+
+  .rows {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .rows :global(.row) {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.3rem 0.4rem;
+    min-height: 2.5rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    transition:
+      border-color 0.2s var(--ease),
+      opacity 0.25s var(--ease);
+  }
+  .rows :global(.row.dim) {
+    opacity: 0.32;
+  }
+  .rows :global(.row.hot) {
+    border-color: var(--madder);
+  }
+  .rows :global(.rk) {
+    flex: none;
+    width: 3.1rem;
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: var(--ink-faint);
+  }
+  .rows :global(.cells) {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+  }
+  .rows :global(.cell) {
+    min-width: 2.1rem;
+    padding: 0.12rem 0.3rem;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    line-height: 1.35;
+    text-align: center;
+    color: var(--ink);
+    background: color-mix(in srgb, var(--indigo) 14%, transparent);
+    border-radius: 3px;
+    transition:
+      opacity 0.3s var(--ease),
+      transform 0.3s var(--ease);
+  }
+  .rows :global(.cell.sum) {
+    background: color-mix(in srgb, var(--weld) 34%, transparent);
+  }
+  .rows :global(.cell .sub) {
+    display: block;
+    font-size: 0.6rem;
+    color: var(--ink-faint);
+  }
+  .rows :global(.cell.hide) {
+    opacity: 0;
+    transform: translateX(-6px);
+  }
+  .rows :global(.empty) {
+    font-size: 0.76rem;
+    color: var(--ink-faint);
+  }
+
+  .wirewrap {
+    position: relative;
+  }
+  .wires {
+    display: block;
+    width: 100%;
+    height: 1px;
+  }
+  .wires :global(path) {
+    fill: none;
+    stroke: var(--indigo);
+    stroke-width: 1.4;
+    opacity: 0.75;
+    transition: opacity 0.25s var(--ease);
+  }
+  .wires :global(path.dim) {
+    opacity: 0.1;
+  }
+  .wires :global(text) {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    fill: var(--ink-faint);
+    text-anchor: middle;
+    transition: opacity 0.25s var(--ease);
+  }
+  .wires :global(text.dim) {
+    opacity: 0.15;
+  }
+  .wires :global(.arrow) {
+    fill: var(--indigo);
+    stroke: none;
+    opacity: 0.75;
+    transition: opacity 0.25s var(--ease);
+  }
+  .wires :global(.arrow.dim) {
+    opacity: 0.1;
+  }
+
+  .tally {
+    margin-top: 0.9rem;
+    padding: 0.55rem 0.7rem;
+    font-size: 0.82rem;
+    line-height: 1.8;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    font-variant-numeric: tabular-nums;
+  }
+  .tally :global(b) {
+    color: var(--madder);
+  }
+  .foot {
+    margin: 0.7rem 0 0;
+    font-size: 0.76rem;
+    line-height: 1.7;
+    color: var(--ink-faint);
+  }
+</style>
+
+<script>
+  function setupL07Collective() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l07-collective"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const P = 4; // world size
+
+      type Cell = { v: string; sub?: string; sum?: boolean };
+      type Move = { src: number; dst: number; n: number };
+      type Op = {
+        name: string;
+        desc: string;
+        input: Cell[][];
+        output: Cell[][];
+        moves: Move[];
+      };
+
+      const c = (v: number | string): Cell => ({ v: String(v) });
+      const cs = (v: number | string, sub: string): Cell => ({ v: String(v), sub, sum: true });
+
+      // rank i 的向量 [i, i+1, i+2, i+3]，reduce-scatter / all-reduce 用的输入
+      const vec = (i: number) => [0, 1, 2, 3].map((j) => c(i + j));
+      // 逐分量求和的结果：6, 10, 14, 18
+      const sums = [6, 10, 14, 18];
+      const sumSub = (j: number) => [0, 1, 2, 3].map((i) => i + j).join('+');
+
+      // 所有 i≠j 的有序对，每对 n 个元素
+      const allPairs = (n: number): Move[] => {
+        const out: Move[] = [];
+        for (let i = 0; i < P; i++)
+          for (let j = 0; j < P; j++) if (i !== j) out.push({ src: i, dst: j, n });
+        return out;
+      };
+
+      const OPS: Record<string, Op> = {
+        broadcast: {
+          name: 'broadcast（广播）',
+          desc: 'rank 0 上的整个张量原样复制到每一张卡。用在初始化：rank 0 读入检查点，广播给所有 rank —— 这是只做一次的事。',
+          input: [[c(0), c(1), c(2), c(3)], [], [], []],
+          output: [0, 1, 2, 3].map(() => [c(0), c(1), c(2), c(3)]),
+          moves: [1, 2, 3].map((j) => ({ src: 0, dst: j, n: 4 })),
+        },
+        scatter: {
+          name: 'scatter（散布）',
+          desc: 'rank 0 上的张量被切成 world size 份，第 i 份送到 rank i。它本身不直接用在训练里，但是理解 reduce-scatter 的垫脚石。',
+          input: [[c(0), c(1), c(2), c(3)], [], [], []],
+          output: [0, 1, 2, 3].map((i) => [c(i)]),
+          moves: [1, 2, 3].map((j) => ({ src: 0, dst: j, n: 1 })),
+        },
+        gather: {
+          name: 'gather（收集）',
+          desc: 'scatter 的逆操作：每张卡各有一块，全部拼接到 rank 0 上。是理解 all-gather 的垫脚石。也可以把它看成一次归约 —— 只不过归约运算是「拼接」。',
+          input: [0, 1, 2, 3].map((i) => [c(i)]),
+          output: [[c(0), c(1), c(2), c(3)], [], [], []],
+          moves: [1, 2, 3].map((i) => ({ src: i, dst: 0, n: 1 })),
+        },
+        reduce: {
+          name: 'reduce（归约）',
+          desc: '输入和 gather 完全一样，但拼接换成了归约运算（这里是求和）：0+1+2+3 = 6，结果放在 rank 0 上。是理解 all-reduce 的垫脚石。',
+          input: [0, 1, 2, 3].map((i) => [c(i)]),
+          output: [[cs(6, '0+1+2+3')], [], [], []],
+          moves: [1, 2, 3].map((i) => ({ src: i, dst: 0, n: 1 })),
+        },
+        allgather: {
+          name: 'all-gather（全收集）',
+          desc: '对每一张卡都做一遍 gather —— 「all」就是「目的地是所有设备」的意思。用在：每张卡只持有参数的一个分片，用 all-gather 凑出完整参数来做前向传播。',
+          input: [0, 1, 2, 3].map((i) => [c(i)]),
+          output: [0, 1, 2, 3].map(() => [c(0), c(1), c(2), c(3)]),
+          moves: allPairs(1),
+        },
+        reducescatter: {
+          name: 'reduce-scatter（归约散布）',
+          desc: '每张卡都有一个完整长度的向量。对第 j 个分量跨所有卡做一次求和，结果放到 rank j 上。用在：反向传播后把不同数据分片上的梯度加起来，同时把存储分散开。',
+          input: [0, 1, 2, 3].map((i) => vec(i)),
+          output: [0, 1, 2, 3].map((j) => [cs(sums[j], sumSub(j))]),
+          moves: allPairs(1),
+        },
+        allreduce: {
+          name: 'all-reduce（全归约）',
+          desc: '和 reduce-scatter 同样的输入，但每张卡都拿到完整的求和结果。等价于「先 reduce-scatter，再 all-gather」，所以每一个方向上要走两趟。用在：数据并行里同步梯度。',
+          input: [0, 1, 2, 3].map((i) => vec(i)),
+          output: [0, 1, 2, 3].map(() => [0, 1, 2, 3].map((j) => cs(sums[j], sumSub(j)))),
+          moves: allPairs(2),
+        },
+        alltoall: {
+          name: 'all-to-all（全对全）',
+          desc: '最一般的一个：位置决定目的地 —— rank i 的第 j 个数发给 rank j。平衡的时候它就是一次矩阵转置。用在 MoE：每张卡既有数据的一片，又有专家的一个子集，得把激活值路由到对应的专家上去。',
+          input: [0, 1, 2, 3].map((i) => [0, 1, 2, 3].map((j) => c(4 * i + j))),
+          output: [0, 1, 2, 3].map((j) => [0, 1, 2, 3].map((i) => c(4 * i + j))),
+          moves: allPairs(1),
+        },
+      };
+
+      let cur = 'broadcast';
+      let ran = false;
+      let focus = -1;
+
+      const inEl = $('[data-in]');
+      const outEl = $('[data-out]');
+      const svg = root.querySelector<SVGSVGElement>('[data-wires]')!;
+
+      function rowsOf(el: HTMLElement, cells: Cell[][], hide: boolean) {
+        el.replaceChildren();
+        for (let i = 0; i < P; i++) {
+          const row = document.createElement('div');
+          row.className = 'row';
+          row.dataset.rank = String(i);
+          const rk = document.createElement('span');
+          rk.className = 'rk';
+          rk.textContent = 'rank ' + i;
+          row.append(rk);
+          const box = document.createElement('span');
+          box.className = 'cells';
+          if (!cells[i].length) {
+            const e = document.createElement('span');
+            e.className = 'empty';
+            e.textContent = '（空）';
+            box.append(e);
+          }
+          for (const cell of cells[i]) {
+            const sp = document.createElement('span');
+            sp.className = 'cell' + (cell.sum ? ' sum' : '') + (hide ? ' hide' : '');
+            sp.textContent = cell.v;
+            if (cell.sub) {
+              const sub = document.createElement('span');
+              sub.className = 'sub';
+              sub.textContent = cell.sub;
+              sp.append(sub);
+            }
+            box.append(sp);
+          }
+          row.append(box);
+          el.append(row);
+        }
+      }
+
+      function centers(el: HTMLElement, host: DOMRect): number[] {
+        return [...el.querySelectorAll<HTMLElement>('.row')].map((r) => {
+          const b = r.getBoundingClientRect();
+          return b.top - host.top + b.height / 2;
+        });
+      }
+
+      function drawWires() {
+        const op = OPS[cur];
+        const wrap = svg.parentElement as HTMLElement;
+        const host = wrap.getBoundingClientRect();
+        const w = Math.max(wrap.clientWidth, 1);
+        // SVG 覆盖整个 stage 的高度，用两侧行的中心点做锚
+        const stage = $('[data-stage]');
+        const sb = stage.getBoundingClientRect();
+        const h = Math.max(stage.clientHeight, 1);
+        svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+        svg.style.height = h + 'px';
+        svg.style.position = 'absolute';
+        svg.style.left = '0';
+        svg.style.top = host.top - sb.top === 0 ? '0' : `${-(host.top - sb.top)}px`;
+
+        const li = centers(inEl, sb);
+        const lo = centers(outEl, sb);
+        svg.replaceChildren();
+        if (li.length < P || lo.length < P) return;
+        // 窄屏（两列上下堆叠）时不画线，避免连出乱七八糟的路径
+        if (wrap.clientWidth < 40) return;
+
+        const x0 = 2;
+        const x1 = w - 8;
+        for (const m of op.moves) {
+          const y0 = li[m.src];
+          const y1 = lo[m.dst];
+          const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+          const mx = (x0 + x1) / 2;
+          p.setAttribute('d', `M ${x0} ${y0} C ${mx} ${y0}, ${mx} ${y1}, ${x1} ${y1}`);
+          p.dataset.src = String(m.src);
+          p.dataset.dst = String(m.dst);
+          svg.append(p);
+
+          const tri = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+          tri.setAttribute('class', 'arrow');
+          tri.setAttribute('d', `M ${x1} ${y1} l -5 -3 l 0 6 z`);
+          tri.dataset.src = String(m.src);
+          tri.dataset.dst = String(m.dst);
+          svg.append(tri);
+
+          const t = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+          t.setAttribute('x', String(mx));
+          t.setAttribute('y', String((y0 + y1) / 2 - 2));
+          t.textContent = m.n === 1 ? '1' : String(m.n);
+          t.dataset.src = String(m.src);
+          t.dataset.dst = String(m.dst);
+          svg.append(t);
+        }
+        applyFocus();
+      }
+
+      function applyFocus() {
+        svg.querySelectorAll<SVGElement>('[data-src]').forEach((n) => {
+          const on = focus < 0 || +n.dataset.src! === focus || +n.dataset.dst! === focus;
+          n.classList.toggle('dim', !on);
+        });
+        [inEl, outEl].forEach((col) =>
+          col.querySelectorAll<HTMLElement>('.row').forEach((r) => {
+            const isF = focus >= 0 && +r.dataset.rank! === focus;
+            r.classList.toggle('hot', isF);
+            r.classList.toggle('dim', focus >= 0 && !isF);
+          }),
+        );
+      }
+
+      function tally() {
+        const op = OPS[cur];
+        const els = op.moves.reduce((a, m) => a + m.n, 0);
+        const bytes = els * 4;
+        const inTotal = op.input.reduce((a, r) => a + r.length, 0);
+        const outTotal = op.output.reduce((a, r) => a + r.length, 0);
+        $('[data-tally]').innerHTML =
+          `<b>${op.name}</b>　·　world size = 4<br />` +
+          `输入总共 ${inTotal} 个数，输出总共 ${outTotal} 个数；` +
+          `其中 <b>${els}</b> 个数需要跨卡传输 = <b>${bytes} 字节</b>（fp32，每个数 4 字节）。`;
+      }
+
+      function render(animate: boolean) {
+        const op = OPS[cur];
+        $('[data-desc]').textContent = op.desc;
+        rowsOf(inEl, op.input, false);
+        rowsOf(outEl, op.output, !ran);
+        tally();
+        $<HTMLButtonElement>('[data-run]').disabled = ran;
+        requestAnimationFrame(() => {
+          drawWires();
+          if (ran && animate) {
+            const cells = [...outEl.querySelectorAll<HTMLElement>('.cell')];
+            cells.forEach((el, i) => {
+              window.setTimeout(() => el.classList.remove('hide'), 40 + i * 45);
+            });
+          } else if (ran) {
+            outEl.querySelectorAll('.cell').forEach((el) => el.classList.remove('hide'));
+          }
+        });
+      }
+
+      root.querySelectorAll<HTMLButtonElement>('[data-op]').forEach((b) => {
+        b.addEventListener('click', () => {
+          cur = b.dataset.op!;
+          ran = false;
+          root.querySelectorAll('[data-op]').forEach((x) => x.classList.toggle('on', x === b));
+          render(false);
+        });
+      });
+      root.querySelectorAll<HTMLButtonElement>('[data-focus]').forEach((b) => {
+        b.addEventListener('click', () => {
+          focus = +b.dataset.focus!;
+          root.querySelectorAll('[data-focus]').forEach((x) => x.classList.toggle('on', x === b));
+          applyFocus();
+        });
+      });
+      $('[data-run]').addEventListener('click', () => {
+        ran = true;
+        render(true);
+      });
+      $('[data-reset]').addEventListener('click', () => {
+        ran = false;
+        render(false);
+      });
+
+      let rt: number | undefined;
+      window.addEventListener('resize', () => {
+        window.clearTimeout(rt);
+        rt = window.setTimeout(drawWires, 120);
+      });
+
+      root.querySelector<HTMLButtonElement>('[data-op="broadcast"]')!.classList.add('on');
+      render(false);
+      window.setTimeout(drawWires, 260);
+    });
+  }
+
+  setupL07Collective();
+  document.addEventListener('astro:page-load', setupL07Collective);
+</script>

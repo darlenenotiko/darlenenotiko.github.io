@@ -1,0 +1,387 @@
+---
+// 第 7 讲演示 3：集合通信的有效带宽核算器。
+// 完全照搬课件 lecture_07.py 里 all_reduce() / reduce_scatter() 两段基准测试的算法：
+//   all-reduce:      sent = size_bytes × 2 × (P-1)
+//   reduce-scatter:  sent = data_bytes × (P-1)，其中 data_bytes 是 P × num_elements 的输入
+//   两者都是 bandwidth = sent / (P × duration)
+// 默认值取课上的设定（P=4、100×1024² 个 fp32 元素），耗时取自课上真跑出来的那一批数字：
+//   all-reduce 1.38–1.60 ms（默认 1.5 ms → 390 GiB/s，和 rank 1 报的 390 完全对上）
+//   reduce-scatter 2.39–2.61 ms（默认 2.6 ms → 451 GiB/s，和 rank 0 报的 450 对上）
+---
+
+<div class="demo" data-demo="l07-bandwidth">
+  <div class="ops">
+    <button data-op="ar" class="on">all-reduce</button>
+    <button data-op="rs">reduce-scatter</button>
+  </div>
+
+  <div class="knobs">
+    <label>
+      world size（几张卡）
+      <input type="range" data-k="P" min="2" max="64" step="1" value="4" />
+      <output data-o="P"></output>
+    </label>
+    <label>
+      元素个数（× 1024²）
+      <input type="range" data-k="N" min="1" max="400" step="1" value="100" />
+      <output data-o="N"></output>
+    </label>
+    <label>
+      实测单次耗时（毫秒）
+      <input type="range" data-k="D" min="1" max="200" step="1" value="15" />
+      <output data-o="D"></output>
+    </label>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="ct">这次搬的张量有多大</div>
+      <div class="cv" data-out="size"></div>
+      <div class="cs" data-out="size-sub"></div>
+    </div>
+    <div class="card">
+      <div class="ct">实际需要传输的总字节数</div>
+      <div class="cv" data-out="sent"></div>
+      <div class="cs" data-out="sent-sub"></div>
+    </div>
+    <div class="card hot">
+      <div class="ct">有效带宽</div>
+      <div class="cv" data-out="bw"></div>
+      <div class="cs" data-out="bw-sub"></div>
+    </div>
+  </div>
+
+  <div class="block">
+    <h4>逐步核算（就是课件里那四行）</h4>
+    <div class="calc" data-calc></div>
+  </div>
+
+  <div class="block">
+    <h4>带宽随 world size 怎么变（其余参数不动）</h4>
+    <svg class="chart" data-chart viewBox="0 0 640 200" preserveAspectRatio="none" aria-hidden="true"
+    ></svg>
+    <p class="note" data-note></p>
+  </div>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.1rem 1.1rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+
+  .ops {
+    display: flex;
+    gap: 0.4rem;
+    margin-bottom: 0.9rem;
+  }
+  .ops button {
+    padding: 0.3rem 0.8rem;
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .ops button.on {
+    color: var(--bg);
+    background: var(--indigo);
+    border-color: var(--indigo);
+  }
+
+  .knobs {
+    display: grid;
+    gap: 0.6rem 1.2rem;
+  }
+  @media (min-width: 640px) {
+    .knobs {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  }
+  .knobs label {
+    display: block;
+    font-size: 0.76rem;
+    letter-spacing: 0.03em;
+    color: var(--ink-faint);
+  }
+  .knobs input[type='range'] {
+    display: block;
+    width: 100%;
+    margin-top: 0.3rem;
+    accent-color: var(--indigo);
+  }
+  .knobs output {
+    display: block;
+    margin-top: 0.15rem;
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .grid {
+    display: grid;
+    gap: 0.6rem;
+    margin-top: 1rem;
+  }
+  @media (min-width: 640px) {
+    .grid {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  }
+  .card {
+    padding: 0.6rem 0.7rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .card.hot {
+    border-color: var(--madder);
+  }
+  .ct {
+    font-size: 0.72rem;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+  }
+  .cv {
+    margin-top: 0.2rem;
+    font-family: var(--font-mono);
+    font-size: 1.05rem;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+  }
+  .card.hot .cv {
+    color: var(--madder);
+  }
+  .cs {
+    margin-top: 0.15rem;
+    font-size: 0.74rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .block {
+    margin-top: 1.1rem;
+  }
+  .block h4 {
+    margin: 0 0 0.45rem;
+    font-size: 0.76rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+  .calc {
+    padding: 0.6rem 0.7rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.95;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    overflow-x: auto;
+  }
+  .calc :global(b) {
+    color: var(--indigo);
+    font-weight: 400;
+  }
+  .calc :global(i) {
+    color: var(--ink-faint);
+    font-style: normal;
+  }
+
+  .chart {
+    display: block;
+    width: 100%;
+    height: 200px;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .chart :global(.axis) {
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .chart :global(.curve) {
+    fill: none;
+    stroke: var(--indigo);
+    stroke-width: 2;
+  }
+  .chart :global(.dot) {
+    fill: var(--madder);
+  }
+  .chart :global(text) {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    fill: var(--ink-faint);
+  }
+  .note {
+    margin: 0.55rem 0 0;
+    font-size: 0.78rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupL07Bandwidth() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l07-bandwidth"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const MiB = 1024 * 1024;
+      const GiB = 1024 * 1024 * 1024;
+      const ELEM = 4; // fp32
+
+      let op: 'ar' | 'rs' = 'ar';
+
+      const gk = (k: string) => +$<HTMLInputElement>(`[data-k="${k}"]`).value;
+
+      // 耗时滑块用 0.1 ms 为单位（1..200 → 0.1..20.0 ms）
+      const dur = () => gk('D') / 10 / 1000; // 秒
+
+      const fmtBytes = (b: number) => {
+        if (b >= GiB) return (b / GiB).toFixed(3) + ' GiB';
+        if (b >= MiB) return (b / MiB).toFixed(1) + ' MiB';
+        return b.toLocaleString('en-US') + ' B';
+      };
+      const group = (n: number) => Math.round(n).toLocaleString('en-US');
+
+      // 给定 world size，返回 [sizeOrDataBytes, sentBytes, bandwidthBytesPerSec]
+      function calc(P: number, N: number, d: number) {
+        if (op === 'ar') {
+          const size = ELEM * N; // 张量本身
+          const sent = size * 2 * (P - 1);
+          return { base: size, sent, bw: sent / (P * d) };
+        }
+        const data = ELEM * P * N; // 输入是 P × N 的矩阵
+        const sent = data * (P - 1);
+        return { base: data, sent, bw: sent / (P * d) };
+      }
+
+      function draw() {
+        const P = gk('P');
+        const N = gk('N') * MiB;
+        const d = dur();
+        const r = calc(P, N, d);
+
+        $('[data-o="P"]').textContent = P + ' 张卡';
+        $('[data-o="N"]').textContent =
+          group(N) + ' 个 fp32（' + fmtBytes(ELEM * N) + '）';
+        $('[data-o="D"]').textContent = (d * 1000).toFixed(1) + ' ms';
+
+        $('[data-out="size"]').textContent = fmtBytes(r.base);
+        $('[data-out="size-sub"]').textContent =
+          op === 'ar'
+            ? `size_bytes = 4 × ${group(N)}`
+            : `data_bytes = 4 × ${P} × ${group(N)}（输入是 world size × num_elements 的矩阵）`;
+
+        $('[data-out="sent"]').textContent = fmtBytes(r.sent);
+        $('[data-out="sent-sub"]').textContent =
+          op === 'ar'
+            ? `= size_bytes × 2 × (${P} − 1)`
+            : `= data_bytes × (${P} − 1)　（注意这里没有 2 倍）`;
+
+        $('[data-out="bw"]').textContent = (r.bw / GiB).toFixed(1) + ' GiB/s';
+        $('[data-out="bw-sub"]').textContent =
+          '也就是 ' + (r.bw / 1e9).toFixed(1) + ' GB/s（课件除的是 1024³，却标成了 GB/s）';
+
+        const lines =
+          op === 'ar'
+            ? [
+                `<i># 张量本身有多少字节</i>`,
+                `size_bytes     = element_size × numel = 4 × ${group(N)} = <b>${group(r.base)}</b>`,
+                `<i># 实际需要传输：world_size − 1 步，每步既发送又归约所以乘 2</i>`,
+                `sent_bytes     = size_bytes × 2 × (${P} − 1) = <b>${group(r.sent)}</b>`,
+                `<i># 所有 rank 一共等了多久</i>`,
+                `total_duration = ${P} × ${(d * 1000).toFixed(1)}ms = <b>${(P * d * 1000).toFixed(1)}ms</b>`,
+                `bandwidth      = sent_bytes / total_duration = <b>${(r.bw / GiB).toFixed(1)} GiB/s</b>`,
+              ]
+            : [
+                `<i># 输入是 world_size × num_elements 的矩阵</i>`,
+                `data_bytes     = element_size × numel = 4 × ${P} × ${group(N)} = <b>${group(r.base)}</b>`,
+                `<i># 实际需要传输（这里没有 2 倍）</i>`,
+                `sent_bytes     = data_bytes × (${P} − 1) = <b>${group(r.sent)}</b>`,
+                `total_duration = ${P} × ${(d * 1000).toFixed(1)}ms = <b>${(P * d * 1000).toFixed(1)}ms</b>`,
+                `bandwidth      = sent_bytes / total_duration = <b>${(r.bw / GiB).toFixed(1)} GiB/s</b>`,
+              ];
+        $('[data-calc]').innerHTML = lines.join('<br />');
+
+        // ── 曲线：带宽 vs world size ──
+        const svg = root.querySelector<SVGSVGElement>('[data-chart]')!;
+        const W = 640;
+        const H = 200;
+        const pad = { l: 52, r: 12, t: 14, b: 26 };
+        const pts: Array<[number, number]> = [];
+        let ymax = 0;
+        for (let p = 2; p <= 64; p++) {
+          const bw = calc(p, N, d).bw / GiB;
+          pts.push([p, bw]);
+          if (bw > ymax) ymax = bw;
+        }
+        ymax = ymax * 1.12 || 1;
+        const X = (p: number) => pad.l + ((p - 2) / 62) * (W - pad.l - pad.r);
+        const Y = (v: number) => H - pad.b - (v / ymax) * (H - pad.t - pad.b);
+
+        const parts: string[] = [];
+        parts.push(
+          `<line class="axis" x1="${pad.l}" y1="${H - pad.b}" x2="${W - pad.r}" y2="${H - pad.b}" />`,
+        );
+        parts.push(`<line class="axis" x1="${pad.l}" y1="${pad.t}" x2="${pad.l}" y2="${H - pad.b}" />`);
+        for (const p of [2, 8, 16, 32, 64]) {
+          parts.push(`<text x="${X(p)}" y="${H - 10}" text-anchor="middle">${p}</text>`);
+        }
+        for (const f of [0, 0.5, 1]) {
+          const v = ymax * f;
+          parts.push(
+            `<text x="${pad.l - 6}" y="${Y(v) + 3}" text-anchor="end">${v.toFixed(0)}</text>`,
+          );
+        }
+        parts.push(
+          `<text x="${pad.l}" y="${pad.t - 2}" text-anchor="start">GiB/s</text>`,
+          `<text x="${W - pad.r}" y="${H - 10}" text-anchor="end">world size</text>`,
+        );
+        parts.push(
+          `<path class="curve" d="${pts.map((q, i) => (i ? 'L' : 'M') + X(q[0]) + ' ' + Y(q[1])).join(' ')}" />`,
+        );
+        parts.push(`<circle class="dot" cx="${X(P)}" cy="${Y(r.bw / GiB)}" r="4" />`);
+        svg.innerHTML = parts.join('');
+
+        $('[data-note]').textContent =
+          op === 'ar'
+            ? '把公式整理一下是 bandwidth = (2 × size / duration) × (P−1)/P。P 一大，(P−1)/P 就贴到 1，' +
+              '所以曲线从 P=2 起飞之后几乎是平的 —— 这就是课上说的「有效带宽与 world size 无关」。' +
+              '它同样与拓扑无关（环形还是树形由 NCCL 自己决定）。'
+            : '注意这条曲线是斜着上去的，但这不是 reduce-scatter 本身的性质 —— 而是这个基准测试的输入' +
+              '（world size × num_elements 的矩阵）本身就随 world size 变大。真跑的时候耗时也会跟着涨，' +
+              '两者约掉，测出来的带宽仍然落在和 all-reduce 相同的量级上。';
+      }
+
+      root.querySelectorAll<HTMLButtonElement>('[data-op]').forEach((b) => {
+        b.addEventListener('click', () => {
+          op = b.dataset.op as 'ar' | 'rs';
+          root.querySelectorAll('[data-op]').forEach((x) => x.classList.toggle('on', x === b));
+          // 切换时把耗时调到各自能对上「约 400 GB/s」的默认值
+          $<HTMLInputElement>('[data-k="D"]').value = op === 'ar' ? '15' : '26';
+          draw();
+        });
+      });
+      root.querySelectorAll<HTMLInputElement>('[data-k]').forEach((el) => {
+        el.addEventListener('input', draw);
+      });
+
+      draw();
+    });
+  }
+
+  setupL07Bandwidth();
+  document.addEventListener('astro:page-load', setupL07Bandwidth);
+</script>

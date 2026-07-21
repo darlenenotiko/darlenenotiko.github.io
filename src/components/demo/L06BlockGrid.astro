@@ -1,0 +1,397 @@
+---
+// 第 6 讲演示 2：Triton 的 grid / BLOCK_SIZE / program_id / mask 可视化。
+// 对应 triton_gelu 里的四行：
+//   num_blocks = triton.cdiv(num_elements, BLOCK_SIZE)
+//   pid = tl.program_id(axis=0); start = pid * BLOCK_SIZE
+//   offsets = start + tl.arange(0, BLOCK_SIZE)
+//   mask = offsets < num_elements
+// 默认就是课上的 8192 个元素 / BLOCK_SIZE = 1024 → 8 个 block、mask 全 true。
+---
+
+<div class="demo" data-demo="l06-blocks">
+  <div class="knobs">
+    <label>
+      元素个数 num_elements <code data-out="ne"></code>
+      <input type="range" data-k="ne" min="1" max="40" step="1" value="32" />
+    </label>
+    <label>
+      BLOCK_SIZE <code data-out="bs"></code>
+      <input type="range" data-k="bs" min="5" max="11" step="1" value="10" />
+    </label>
+  </div>
+
+  <div class="presets">
+    <span class="plabel">预设：</span>
+    <button data-p="8192,1024">课上的例子（8192 / 1024）</button>
+    <button data-p="8000,1024">除不尽（8000 / 1024）</button>
+    <button data-p="1000,256">小一点（1000 / 256）</button>
+  </div>
+
+  <p class="formula" data-formula></p>
+
+  <div class="strip" data-strip></div>
+
+  <table class="tab" data-tab><tbody></tbody></table>
+
+  <p class="note">
+    条带是整个输入张量，每一段是一个 thread block（一个 program 实例）。
+    实心部分是 mask 为 true、真会被读写的元素；斜纹部分是越界、被 mask 掉的元素 ——
+    <code>tl.load</code> 不去读它，<code>tl.store</code> 不去写它。
+    block 数超过 24 时表格只列头尾几个。
+  </p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+
+  .knobs {
+    display: grid;
+    gap: 0.6rem;
+    grid-template-columns: 1fr;
+  }
+  @media (min-width: 640px) {
+    .knobs {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  .knobs label {
+    display: block;
+    font-size: 0.74rem;
+    letter-spacing: 0.03em;
+    color: var(--ink-faint);
+  }
+  .knobs code {
+    font-family: var(--font-mono);
+    color: var(--indigo);
+  }
+  .knobs input {
+    display: block;
+    width: 100%;
+    margin-top: 0.22rem;
+    padding: 0;
+    background: transparent;
+    border: none;
+    accent-color: var(--indigo);
+  }
+
+  .presets {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.4rem;
+    margin-top: 0.9rem;
+  }
+  .plabel {
+    font-size: 0.78rem;
+    color: var(--ink-faint);
+    letter-spacing: 0.05em;
+  }
+  .presets button {
+    padding: 0.25rem 0.6rem;
+    font: inherit;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    background: transparent;
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .presets button:hover {
+    color: var(--indigo);
+    border-color: var(--indigo);
+  }
+
+  .formula {
+    margin: 1rem 0 0.2rem;
+    padding: 0.5rem 0.7rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.9;
+    white-space: pre-wrap;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    overflow-x: auto;
+  }
+
+  .strip {
+    margin-top: 1rem;
+    overflow-x: auto;
+  }
+  .strip :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 320px;
+    height: auto;
+  }
+  .strip :global(rect.live) {
+    fill: color-mix(in srgb, var(--indigo) 40%, transparent);
+    stroke: var(--indigo);
+    stroke-width: 1;
+  }
+  .strip :global(rect.dead) {
+    fill: url(#l06hatch);
+    stroke: var(--madder);
+    stroke-width: 1;
+  }
+  .strip :global(line.hatch) {
+    stroke: var(--madder);
+    stroke-width: 1;
+  }
+  .strip :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 9px;
+  }
+  .strip :global(text.pid) {
+    fill: var(--ink);
+    font-size: 10px;
+    font-weight: 700;
+  }
+
+  .tab {
+    width: 100%;
+    margin-top: 1rem;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+  }
+  .tab :global(td) {
+    padding: 0.24rem 0.35rem;
+    border-bottom: 1px solid var(--rule);
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink-muted);
+    white-space: nowrap;
+  }
+  .tab :global(tr.head td) {
+    font-family: inherit;
+    font-size: 0.72rem;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+  .tab :global(tr.part td) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+
+  .note {
+    margin: 1rem 0 0;
+    font-size: 0.78rem;
+    line-height: 1.7;
+    color: var(--ink-faint);
+  }
+  .note code {
+    font-family: var(--font-mono);
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupL06Blocks() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l06-blocks"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const inp = (k: string) => root.querySelector(`[data-k="${k}"]`) as HTMLInputElement;
+
+      // 滑块是「档位」，映射到实际数值：元素个数走 250 的整数倍附近的一串好看的数
+      const NE = [
+        1, 2, 4, 8, 16, 32, 64, 100, 128, 200, 250, 256, 400, 500, 512, 640, 750, 1000, 1024, 1500,
+        2000, 2048, 2500, 3000, 4000, 4096, 5000, 6000, 6500, 7000, 8000, 8192, 10000, 12000, 16384,
+        20000, 24576, 32768, 50000, 65536,
+      ];
+      const BS = [32, 64, 128, 256, 512, 1024, 2048];
+
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+
+      function td(tr: HTMLElement, s: string) {
+        const e = document.createElement('td');
+        e.textContent = s;
+        tr.append(e);
+      }
+
+      function draw() {
+        const ne = NE[Number(inp('ne').value) - 1];
+        const bs = BS[Number(inp('bs').value) - 5];
+        const nb = Math.ceil(ne / bs);
+        const tail = ne - (nb - 1) * bs; // 最后一个 block 里有效的元素个数
+        const masked = nb * bs - ne;
+
+        $('[data-out="ne"]').textContent = ne.toLocaleString('en-US');
+        $('[data-out="bs"]').textContent = String(bs);
+
+        $('[data-formula]').textContent =
+          `num_elements = ${ne}\n` +
+          `BLOCK_SIZE   = ${bs}          # 一个 thread block 负责多少个元素\n` +
+          `num_blocks   = triton.cdiv(${ne}, ${bs}) = ${nb}   # grid = (${nb},)\n` +
+          `一共起 ${nb} 个 program 实例，每个实例 tl.program_id(0) 拿到自己的 pid ∈ [0, ${nb - 1}]\n` +
+          (masked === 0
+            ? `${bs} 整除 ${ne}，所有 block 都是满的，mask 恒为 true`
+            : `${bs} 除不尽 ${ne}：最后一个 block 只有 ${tail} 个有效元素，另外 ${masked} 个被 mask 掉`);
+
+        // ── 条带 ──
+        const W = 640,
+          BAR = 34,
+          MT = 16,
+          H = MT + BAR + 22;
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+
+        // 斜纹图案：给被 mask 掉的部分用
+        const defs = svgEl('defs', {});
+        const pat = svgEl('pattern', {
+          id: 'l06hatch',
+          width: 6,
+          height: 6,
+          patternUnits: 'userSpaceOnUse',
+          patternTransform: 'rotate(45)',
+        });
+        pat.append(svgEl('line', { class: 'hatch', x1: 0, y1: 0, x2: 0, y2: 6 }));
+        defs.append(pat);
+        svg.append(defs);
+
+        const total = nb * bs;
+        const px = (v: number) => (v / total) * W;
+        const showLabel = nb <= 16;
+
+        // block 数很多时逐块画会糊成一片，直接画成两段
+        if (nb > 128) {
+          svg.append(svgEl('rect', { class: 'live', x: 0, y: MT, width: px(ne), height: BAR }));
+          if (masked > 0)
+            svg.append(
+              svgEl('rect', {
+                class: 'dead',
+                x: px(ne),
+                y: MT,
+                width: Math.max(px(masked), 1),
+                height: BAR,
+              }),
+            );
+          svg.append(
+            svgEl(
+              'text',
+              { x: W / 2, y: MT + BAR + 15, 'text-anchor': 'middle' },
+              `共 ${nb} 个 thread block，每个 ${bs} 个元素（块太多，不逐块画）`,
+            ),
+          );
+          $('[data-strip]').replaceChildren(svg);
+          drawTable(nb, bs, tail);
+          return;
+        }
+
+        for (let p = 0; p < nb; p++) {
+          const x0 = px(p * bs);
+          const live = p === nb - 1 ? tail : bs;
+          const w = px(live);
+          svg.append(svgEl('rect', { class: 'live', x: x0, y: MT, width: Math.max(w, 0.6), height: BAR }));
+          if (live < bs) {
+            svg.append(
+              svgEl('rect', {
+                class: 'dead',
+                x: x0 + w,
+                y: MT,
+                width: Math.max(px(bs - live), 0.6),
+                height: BAR,
+              }),
+            );
+          }
+          if (showLabel) {
+            svg.append(
+              svgEl(
+                'text',
+                { class: 'pid', x: x0 + px(bs) / 2, y: MT + BAR / 2 + 4, 'text-anchor': 'middle' },
+                `pid=${p}`,
+              ),
+            );
+            svg.append(
+              svgEl(
+                'text',
+                { x: x0 + px(bs) / 2, y: MT + BAR + 14, 'text-anchor': 'middle' },
+                `${p * bs}…${p * bs + bs - 1}`,
+              ),
+            );
+          }
+        }
+        if (!showLabel) {
+          svg.append(svgEl('text', { x: 0, y: MT - 5 }, `pid = 0`));
+          svg.append(
+            svgEl('text', { x: W, y: MT - 5, 'text-anchor': 'end' }, `pid = ${nb - 1}`),
+          );
+          svg.append(
+            svgEl(
+              'text',
+              { x: W / 2, y: MT + BAR + 15, 'text-anchor': 'middle' },
+              `共 ${nb} 个 thread block，每个 ${bs} 个元素`,
+            ),
+          );
+        }
+        $('[data-strip]').replaceChildren(svg);
+        drawTable(nb, bs, tail);
+      }
+
+      function drawTable(nb: number, bs: number, tail: number) {
+        const tb = $('[data-tab] tbody');
+        tb.replaceChildren();
+        const head = document.createElement('tr');
+        head.className = 'head';
+        ['pid', 'start = pid × BLOCK_SIZE', 'offsets 范围', 'mask 为 true 的个数'].forEach((s) =>
+          td(head, s),
+        );
+        tb.append(head);
+
+        const idx: number[] = [];
+        if (nb <= 24) for (let p = 0; p < nb; p++) idx.push(p);
+        else idx.push(0, 1, 2, -1, nb - 2, nb - 1);
+
+        for (const p of idx) {
+          const tr = document.createElement('tr');
+          if (p === -1) {
+            const e = document.createElement('td');
+            e.setAttribute('colspan', '4');
+            e.textContent = '⋮';
+            tr.append(e);
+            tb.append(tr);
+            continue;
+          }
+          const live = p === nb - 1 ? tail : bs;
+          if (live < bs) tr.className = 'part';
+          td(tr, String(p));
+          td(tr, String(p * bs));
+          td(tr, `${p * bs} … ${p * bs + bs - 1}`);
+          td(tr, live === bs ? `${live}（全满）` : `${live} / ${bs}`);
+          tb.append(tr);
+        }
+      }
+
+      root.querySelectorAll<HTMLInputElement>('.knobs input').forEach((el) => {
+        el.addEventListener('input', draw);
+      });
+      root.querySelectorAll<HTMLButtonElement>('.presets button').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const [a, b] = btn.dataset.p!.split(',').map(Number);
+          inp('ne').value = String(NE.indexOf(a) + 1);
+          inp('bs').value = String(BS.indexOf(b) + 5);
+          draw();
+        });
+      });
+
+      draw();
+    });
+  }
+
+  setupL06Blocks();
+  document.addEventListener('astro:page-load', setupL06Blocks);
+</script>

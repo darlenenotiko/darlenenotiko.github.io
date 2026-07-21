@@ -1,0 +1,404 @@
+---
+// 第 6 讲演示 1：融合前后的 HBM 读写对账。
+// 两种工作负载：
+//   （a）逐元素算子链 —— 对应 naive_gelu：PyTorch 计算图里每个原语各起一个 kernel，
+//        每个 kernel 都要「从 HBM 读一遍、往 HBM 写一遍」。
+//   （b）朴素 softmax —— 对应课件 naive_softmax 里那五行注释，
+//        合计 5MN + M 次读、3MN + 2M 次写；融合之后应该只有 MN 读、MN 写。
+// 所有数字都是「元素个数」，再乘每个元素的字节数得到字节。
+---
+
+<div class="demo" data-demo="l06-hbm">
+  <div class="ctrl">
+    <span class="tag">工作负载</span>
+    <button data-wl="chain" class="on">逐元素算子链（GeLU 那种）</button>
+    <button data-wl="softmax">朴素 softmax</button>
+  </div>
+
+  <div class="knobs">
+    <label data-only="chain">
+      算子个数 k <code data-out="k"></code>
+      <input type="range" data-k="k" min="1" max="12" step="1" value="9" />
+    </label>
+    <label data-only="chain">
+      元素个数 n <code data-out="n"></code>
+      <input type="range" data-k="n" min="10" max="28" step="1" value="24" />
+    </label>
+    <label data-only="softmax">
+      行数 M <code data-out="M"></code>
+      <input type="range" data-k="M" min="4" max="16" step="1" value="12" />
+    </label>
+    <label data-only="softmax">
+      列数 N <code data-out="N"></code>
+      <input type="range" data-k="N" min="4" max="16" step="1" value="12" />
+    </label>
+    <label>
+      精度
+      <select data-k="bytes">
+        <option value="2">bf16（2 字节）</option>
+        <option value="4" selected>fp32（4 字节）</option>
+      </select>
+    </label>
+    <label>
+      HBM 带宽
+      <select data-k="bw">
+        <option value="3.35e12">H100（3.35 TB/s）</option>
+        <option value="8e12" selected>B200（8 TB/s）</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="block">
+    <h4>不融合：每个算子各起一个 kernel</h4>
+    <table class="tab" data-steps><tbody></tbody></table>
+  </div>
+
+  <div class="rows" data-rows></div>
+
+  <p class="verdict" data-verdict></p>
+
+  <p class="note">
+    只数 HBM 这一层的读写，不含 L2 命中、寄存器和 shared memory 内部的搬运；
+    也假设融合版本对每个元素恰好读一次写一次。时间那一栏是「访问元素数 × 字节数 ÷ 带宽」，
+    即完全被访存卡住时的下界。
+  </p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.45rem;
+    margin-bottom: 0.9rem;
+  }
+  .tag {
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .ctrl button {
+    padding: 0.28rem 0.7rem;
+    font: inherit;
+    font-size: 0.82rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .ctrl button.on {
+    color: var(--bg);
+    background: var(--indigo);
+    border-color: var(--indigo);
+  }
+
+  .knobs {
+    display: grid;
+    gap: 0.55rem;
+    grid-template-columns: 1fr 1fr;
+  }
+  @media (min-width: 640px) {
+    .knobs {
+      grid-template-columns: repeat(4, 1fr);
+    }
+  }
+  .knobs label {
+    display: block;
+    font-size: 0.74rem;
+    letter-spacing: 0.03em;
+    color: var(--ink-faint);
+  }
+  .knobs label[hidden] {
+    display: none;
+  }
+  .knobs code {
+    font-family: var(--font-mono);
+    color: var(--indigo);
+  }
+  .knobs input,
+  .knobs select {
+    display: block;
+    width: 100%;
+    margin-top: 0.22rem;
+    padding: 0.32rem 0.45rem;
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: 0.83rem;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+  }
+  .knobs input[type='range'] {
+    padding: 0;
+    background: transparent;
+    border: none;
+    accent-color: var(--indigo);
+  }
+  .knobs select:focus {
+    outline: none;
+    border-color: var(--indigo);
+  }
+
+  .block {
+    margin-top: 1.2rem;
+  }
+  .block h4 {
+    margin: 0 0 0.5rem;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+
+  .tab {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+  }
+  .tab :global(td) {
+    padding: 0.26rem 0.35rem;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-muted);
+  }
+  .tab :global(td.op) {
+    font-family: var(--font-mono);
+    color: var(--ink);
+    overflow-wrap: anywhere;
+  }
+  .tab :global(td.v) {
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .tab :global(tr.sum td) {
+    color: var(--madder);
+    font-weight: 700;
+    border-bottom: none;
+  }
+  .tab :global(tr.head td) {
+    font-size: 0.72rem;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+
+  .rows {
+    display: grid;
+    gap: 0.45rem;
+    margin-top: 1.2rem;
+  }
+  .rows :global(.r) {
+    display: grid;
+    grid-template-columns: 4.6rem 1fr;
+    gap: 0.6rem;
+    align-items: center;
+    padding: 0.55rem 0.7rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 7px;
+  }
+  .rows :global(.name) {
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--ink);
+  }
+  .rows :global(.bar) {
+    position: relative;
+    height: 22px;
+    background: color-mix(in srgb, var(--rule) 55%, transparent);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .rows :global(.bar i) {
+    position: absolute;
+    inset: 0 auto 0 0;
+    display: block;
+    transition: width 0.25s var(--ease);
+  }
+  .rows :global(.bar span) {
+    position: absolute;
+    top: 0;
+    left: 0.45rem;
+    line-height: 22px;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .rows :global(.naive i) {
+    background: color-mix(in srgb, var(--madder) 55%, transparent);
+  }
+  .rows :global(.fused i) {
+    background: color-mix(in srgb, var(--indigo) 55%, transparent);
+  }
+
+  .verdict {
+    margin: 1rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(b) {
+    color: var(--madder);
+  }
+
+  .note {
+    margin: 0.9rem 0 0;
+    font-size: 0.78rem;
+    line-height: 1.7;
+    color: var(--ink-faint);
+  }
+</style>
+
+<script>
+  function setupL06Hbm() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l06-hbm"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const g = (k: string) =>
+        Number((root.querySelector(`[data-k="${k}"]`) as HTMLInputElement).value);
+
+      let wl = 'chain';
+
+      const big = (x: number) => {
+        if (x >= 1e9) return (x / 1e9).toFixed(2) + ' G';
+        if (x >= 1e6) return (x / 1e6).toFixed(2) + ' M';
+        if (x >= 1e3) return (x / 1e3).toFixed(2) + ' K';
+        return String(Math.round(x));
+      };
+      const secs = (t: number) => {
+        if (t >= 1) return t.toFixed(3) + ' 秒';
+        if (t >= 1e-3) return (t * 1e3).toFixed(3) + ' 毫秒';
+        return (t * 1e6).toFixed(2) + ' 微秒';
+      };
+
+      function row(tb: HTMLElement, op: string, r: string, w: string, cls = '') {
+        const tr = document.createElement('tr');
+        if (cls) tr.className = cls;
+        const a = document.createElement('td');
+        a.className = cls ? '' : 'op';
+        a.textContent = op;
+        const b = document.createElement('td');
+        b.className = 'v';
+        b.textContent = r;
+        const c = document.createElement('td');
+        c.className = 'v';
+        c.textContent = w;
+        tr.append(a, b, c);
+        tb.append(tr);
+      }
+
+      function calc() {
+        const bytes = Number((root.querySelector('[data-k="bytes"]') as HTMLSelectElement).value);
+        const bw = Number((root.querySelector('[data-k="bw"]') as HTMLSelectElement).value);
+
+        // 逐项算「访问了多少个元素」
+        let steps: [string, number, number][] = [];
+        let fusedR = 0,
+          fusedW = 0;
+        let headline = '';
+
+        if (wl === 'chain') {
+          const k = g('k');
+          const n = 2 ** g('n');
+          $('[data-out="k"]').textContent = String(k);
+          $('[data-out="n"]').textContent = n.toLocaleString('en-US');
+          for (let i = 0; i < k; i++) {
+            steps.push([`第 ${i + 1} 个逐元素算子（各一个 kernel）`, n, n]);
+          }
+          fusedR = n;
+          fusedW = n;
+          headline =
+            `朴素版每个算子读 n 写 n，共 ${k} 个算子 → ${k}n 读 + ${k}n 写；` +
+            `融合成一个 kernel 之后只有 n 读 + n 写。`;
+        } else {
+          const M = 2 ** g('M');
+          const N = 2 ** g('N');
+          $('[data-out="M"]').textContent = M.toLocaleString('en-US');
+          $('[data-out="N"]').textContent = N.toLocaleString('en-US');
+          steps = [
+            ['x.max(dim=1)　　　算每行的最大值', M * N, M],
+            ['x - x_max[:, None]　减掉最大值', M * N + M, M * N],
+            ['torch.exp(x)　　　逐元素取指数', M * N, M * N],
+            ['numerator.sum(1)　算归一化常数', M * N, M],
+            ['numerator / denom　归一化', M * N, M * N],
+          ];
+          fusedR = M * N;
+          fusedW = M * N;
+          headline =
+            `朴素版合计 5MN + M 次读、3MN + 2M 次写；` +
+            `融合成一个 kernel 之后每个元素只读一次写一次，即 MN 读 + MN 写。`;
+        }
+
+        const nr = steps.reduce((a, s) => a + s[1], 0);
+        const nw = steps.reduce((a, s) => a + s[2], 0);
+
+        const tb = $('[data-steps] tbody');
+        tb.replaceChildren();
+        row(tb, '算子', '读（元素）', '写（元素）', 'head');
+        for (const [op, r, w] of steps) row(tb, op, big(r), big(w));
+        row(tb, '合计', big(nr), big(nw), 'sum');
+
+        const naiveTotal = nr + nw;
+        const fusedTotal = fusedR + fusedW;
+        const ratio = naiveTotal / fusedTotal;
+
+        const mk = (name: string, cls: string, total: number, r: number, w: number) => {
+          const wpct = (total / naiveTotal) * 100;
+          const t = (total * bytes) / bw;
+          return (
+            `<div class="r ${cls}"><span class="name">${name}</span>` +
+            `<span class="bar"><i style="width:${wpct}%"></i>` +
+            `<span>${big(r)} 读 + ${big(w)} 写 = ${big(total)} 次元素访问 ｜ ${((total * bytes) / 1024 ** 3).toFixed(3)} GiB ｜ 至少 ${secs(t)}</span>` +
+            `</span></div>`
+          );
+        };
+        $('[data-rows]').innerHTML =
+          mk('不融合', 'naive', naiveTotal, nr, nw) + mk('融合', 'fused', fusedTotal, fusedR, fusedW);
+
+        $('[data-verdict]').innerHTML =
+          `${headline} 这一组参数下，融合把 HBM 流量压到原来的 ` +
+          `<b>1 / ${ratio.toFixed(2)}</b>（省掉 ${(100 - 100 / ratio).toFixed(1)}%）。` +
+          `注意<b>计算量一个字都没变</b> —— 省下来的全是数据搬运。`;
+      }
+
+      function switchWl() {
+        root.querySelectorAll<HTMLElement>('[data-only]').forEach((el) => {
+          el.hidden = el.dataset.only !== wl;
+        });
+        calc();
+      }
+
+      root.querySelectorAll<HTMLButtonElement>('[data-wl]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          wl = btn.dataset.wl!;
+          root.querySelectorAll('[data-wl]').forEach((b) => b.classList.toggle('on', b === btn));
+          switchWl();
+        });
+      });
+      root.querySelectorAll<HTMLElement>('.knobs input, .knobs select').forEach((el) => {
+        el.addEventListener('input', calc);
+        el.addEventListener('change', calc);
+      });
+
+      switchWl();
+    });
+  }
+
+  setupL06Hbm();
+  document.addEventListener('astro:page-load', setupL06Hbm);
+</script>

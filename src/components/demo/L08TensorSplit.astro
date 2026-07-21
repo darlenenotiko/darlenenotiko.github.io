@@ -1,0 +1,289 @@
+---
+// CS336 第 8 讲：张量并行的切分方向。
+// 课件第 40/41 页：MLP 里第一个矩阵按「列」切，第二个矩阵按「行」切。
+// 这个演示画出两块矩阵被切成什么样、每张卡拿到什么形状，
+// 并对比「列→行」（标准）和「行→列」（反过来切）两种顺序各要通信几次。
+---
+
+<div class="demo" data-demo="l08-tensor-split">
+  <div class="row">
+    <label class="chk"
+      ><input type="radio" name="l08tp" data-mode value="cr" checked /> 列切 A → 行切 B（标准做法）</label
+    >
+    <label class="chk"
+      ><input type="radio" name="l08tp" data-mode value="rc" /> 行切 A → 列切 B（反过来切）</label
+    >
+  </div>
+  <div class="row">
+    <label class="sld">
+      张量并行度 t = <span data-t-val>2</span>
+      <input type="range" data-t min="0" max="3" step="1" value="1" />
+    </label>
+    <label class="sld">
+      d_model h = <span data-h-val>4096</span>
+      <input type="range" data-h min="0" max="4" step="1" value="2" />
+    </label>
+    <label class="sld">
+      token 数 b·s = <span data-bs-val>8192</span>
+      <input type="range" data-bs min="0" max="4" step="1" value="2" />
+    </label>
+  </div>
+
+  <div class="two">
+    <div>
+      <canvas data-canvas width="700" height="300"></canvas>
+      <p class="axis" data-axis></p>
+    </div>
+    <div>
+      <table>
+        <tbody data-stats></tbody>
+      </table>
+      <p class="hint" data-hint></p>
+    </div>
+  </div>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1.3rem;
+    margin-bottom: 0.7rem;
+  }
+  .sld,
+  .chk {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.83rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .sld input[type='range'] {
+    width: 130px;
+    accent-color: var(--indigo);
+  }
+  .chk input {
+    accent-color: var(--indigo);
+  }
+  .two {
+    display: grid;
+    gap: 1.2rem;
+    align-items: start;
+  }
+  @media (min-width: 860px) {
+    .two {
+      grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+    }
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .axis {
+    margin: 0.45rem 0 0;
+    font-size: 0.76rem;
+    color: var(--ink-faint);
+    line-height: 1.7;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.81rem;
+    font-variant-numeric: tabular-nums;
+  }
+  table :global(td) {
+    padding: 0.28rem 0.4rem;
+    color: var(--ink-muted);
+    border-bottom: 1px solid var(--rule);
+  }
+  table :global(td.k) {
+    color: var(--ink-faint);
+  }
+  table :global(td.v) {
+    text-align: right;
+    font-family: var(--font-mono);
+    color: var(--ink);
+  }
+  table :global(tr.hi td.v) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+  .hint {
+    margin: 0.9rem 0 0;
+    font-size: 0.83rem;
+    line-height: 1.8;
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupL08TensorSplit() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l08-tensor-split"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const cv = $<HTMLCanvasElement>('[data-canvas]');
+      const ctx = cv.getContext('2d')!;
+      const css = (n: string) =>
+        getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+      const modeEls = [...root.querySelectorAll<HTMLInputElement>('[data-mode]')];
+      const TS = [1, 2, 4, 8];
+      const HS = [1024, 2048, 4096, 8192, 16384];
+      const BSS = [2048, 4096, 8192, 16384, 32768];
+
+      function draw() {
+        const t = TS[parseInt($<HTMLInputElement>('[data-t]').value, 10)];
+        const h = HS[parseInt($<HTMLInputElement>('[data-h]').value, 10)];
+        const bs = BSS[parseInt($<HTMLInputElement>('[data-bs]').value, 10)];
+        const mode = (modeEls.find((e) => e.checked) ?? modeEls[0]).value;
+        const dff = 4 * h;
+        $('[data-t-val]').textContent = String(t);
+        $('[data-h-val]').textContent = String(h);
+        $('[data-bs-val]').textContent = String(bs);
+
+        const indigo = css('--indigo');
+        const madder = css('--madder');
+        const weld = css('--weld');
+        const rule = css('--rule');
+        const faint = css('--ink-faint');
+        const palette = [indigo, madder, weld];
+
+        ctx.clearRect(0, 0, cv.width, cv.height);
+        ctx.font = '12px ui-monospace, monospace';
+        ctx.textBaseline = 'middle';
+        ctx.textAlign = 'center';
+
+        // A 画成一个矮宽的框（h × 4h），B 画成一个高窄的框（4h × h）
+        const ax = 60,
+          ay = 70,
+          aw = 220,
+          ah = 90;
+        const bx = 400,
+          by = 40,
+          bw = 90,
+          bh = 200;
+
+        function block(
+          x: number,
+          y: number,
+          w: number,
+          h2: number,
+          n: number,
+          vertical: boolean,
+        ) {
+          for (let i = 0; i < n; i++) {
+            ctx.fillStyle = palette[i % palette.length];
+            ctx.globalAlpha = 0.28 + 0.42 * (1 - (Math.floor(i / palette.length) % 3) * 0.3);
+            if (vertical) {
+              // 按列切：竖着分成 n 条
+              ctx.fillRect(x + (i * w) / n, y, w / n - 1, h2);
+            } else {
+              // 按行切：横着分成 n 条
+              ctx.fillRect(x, y + (i * h2) / n, w, h2 / n - 1);
+            }
+          }
+          ctx.globalAlpha = 1;
+          ctx.strokeStyle = rule;
+          ctx.lineWidth = 1;
+          ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h2 - 1);
+        }
+
+        const aVertical = mode === 'cr'; // 列切 A
+        block(ax, ay, aw, ah, t, aVertical);
+        block(bx, by, bw, bh, t, !aVertical); // B 的切法总是和 A 相反
+
+        ctx.fillStyle = faint;
+        ctx.fillText(`A：h × d_ff = ${h} × ${dff}`, ax + aw / 2, ay - 14);
+        ctx.fillText(aVertical ? '按列切成 t 份' : '按行切成 t 份', ax + aw / 2, ay + ah + 16);
+        ctx.fillText(`B：d_ff × h`, bx + bw / 2, by - 24);
+        ctx.fillText(`${dff} × ${h}`, bx + bw / 2, by - 10);
+        ctx.fillText(!aVertical ? '按列切成 t 份' : '按行切成 t 份', bx + bw / 2, by + bh + 16);
+
+        // 中间的箭头 + 非线性标注
+        ctx.strokeStyle = faint;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(ax + aw + 14, ay + ah / 2);
+        ctx.lineTo(bx - 14, ay + ah / 2);
+        ctx.stroke();
+        ctx.fillStyle = aVertical ? indigo : madder;
+        ctx.fillText(aVertical ? 'GeLU（逐元素，本地做）' : 'GeLU 之前必须先 all-reduce', (ax + aw + bx) / 2, ay + ah / 2 - 14);
+
+        ctx.fillStyle = faint;
+        ctx.textAlign = 'left';
+        ctx.fillText(
+          aVertical ? '结尾一次 all-reduce（图里的 g）' : '结尾还要一次 all-gather 拼列',
+          30,
+          cv.height - 22,
+        );
+
+        // ── 统计 ──
+        const aPer = aVertical ? `${h} × ${dff / t}` : `${h / t} × ${dff}`;
+        const bPer = aVertical ? `${dff / t} × ${h}` : `${dff} × ${h / t}`;
+        const yPer = aVertical ? `${bs} × ${dff / t}` : `${bs} × ${dff}`;
+        // 课件第 43 页：张量并行每层 8·b·s·h·(t−1)/t 的 all-reduce 通信
+        const commElems = t === 1 ? 0 : 8 * bs * h * ((t - 1) / t);
+        const commBytes = commElems * 2; // bf16
+        const collectives = aVertical ? 1 : 2;
+
+        const rows: [string, string, boolean][] = [
+          ['每卡拿到的 A 分块', aPer, false],
+          ['每卡拿到的 B 分块', bPer, false],
+          ['每卡算出的中间激活 Y', yPer, false],
+          ['每卡权重元素数', ((h * dff) / t + (dff * h) / t).toExponential(2), false],
+          ['每个 MLP 块要做几次集合通信', `${collectives} 次`, true],
+          ['每层通信量 8·b·s·h·(t−1)/t', `${(commBytes / 1e9).toFixed(2)} GB`, true],
+        ];
+        const tb = $('[data-stats]');
+        tb.replaceChildren();
+        for (const [k, v, hi] of rows) {
+          const tr = document.createElement('tr');
+          if (hi) tr.className = 'hi';
+          const a = document.createElement('td');
+          a.className = 'k';
+          a.textContent = k;
+          const b = document.createElement('td');
+          b.className = 'v';
+          b.textContent = v;
+          tr.append(a, b);
+          tb.append(tr);
+        }
+
+        $('[data-axis]').textContent =
+          '每种颜色 = 一张 GPU 分到的那一块。左边是 MLP 的升维矩阵 A，右边是降维矩阵 B。';
+
+        $('[data-hint]').textContent = aVertical
+          ? '列切 A 之后，每张卡手上是 Y 的一整段列。GeLU 是逐元素的，对着自己那段列直接算就行 —— ' +
+            '不需要任何通信。接着 B 按行切，每张卡算出一个 h 维的部分和，最后一次 all-reduce 把部分和加起来。' +
+            '整个 MLP 块只通信一次。'
+          : '反过来切就坏了：A 按行切之后，每张卡算出的是 Y 的一个部分和，而不是 Y 的一部分。' +
+            'GeLU 是非线性的，对部分和取 GeLU 再相加 ≠ 对总和取 GeLU，所以必须先 all-reduce 把 Y 凑齐才能过非线性。' +
+            '结果一个 MLP 块要通信两次 —— 这就是为什么必须先列切、后行切。';
+      }
+
+      root.querySelectorAll('input').forEach((el) => el.addEventListener('input', draw));
+      new MutationObserver(draw).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-theme'],
+      });
+      draw();
+    });
+  }
+
+  setupL08TensorSplit();
+  document.addEventListener('astro:page-load', setupL08TensorSplit);
+</script>

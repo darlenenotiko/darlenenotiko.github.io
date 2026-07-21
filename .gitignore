@@ -14,6 +14,8 @@ private/*
 
 # build output
 dist/
+# 并行写讲义时各自的隔离构建输出
+dist-*/
 # generated types
 .astro/
 

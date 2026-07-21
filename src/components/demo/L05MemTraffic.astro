@@ -1,0 +1,256 @@
+---
+// CS336 第 5 讲：融合与重计算的内存账。
+// 上半：一条逐点算子链，未融合 = 每个算子都读一遍写一遍；融合 = 全程只读一次写一次。
+//       把字节数、在给定带宽下的时间、加速比都摆出来。
+// 下半：L 层 sigmoid 的反向传播，存激活 vs 反向时重算，访存次数分别是 2L+2 和 5。
+---
+
+<div class="demo" data-demo="l05-memtraffic">
+  <h4>一、算子融合：sin²(x) + cos²(x)</h4>
+
+  <div class="ctrl">
+    <label class="sld">
+      逐点算子个数 = <span data-kval>5</span>
+      <input type="range" data-k min="1" max="12" step="1" value="5" />
+    </label>
+    <label class="sld">
+      张量元素个数 n = <span data-nval>1.34 × 10⁸</span>
+      <input type="range" data-n min="20" max="30" step="1" value="27" />
+    </label>
+    <span class="tag">精度</span>
+    <select data-bytes>
+      <option value="4">FP32（4 字节）</option>
+      <option value="2" selected>BF16（2 字节）</option>
+      <option value="1">FP8（1 字节）</option>
+    </select>
+  </div>
+
+  <table class="out"><tbody data-fuse></tbody></table>
+  <p class="verdict" data-fusenote></p>
+
+  <hr />
+
+  <h4>二、重计算：把激活扔掉，反向时重新算一遍</h4>
+
+  <div class="ctrl">
+    <label class="sld">
+      堆几层 sigmoid：L = <span data-lval>3</span>
+      <input type="range" data-l min="1" max="8" step="1" value="3" />
+    </label>
+  </div>
+
+  <div class="two">
+    <table class="out"><tbody data-recomp></tbody></table>
+    <div class="verdictbox">
+      <p class="verdict" data-recompnote></p>
+    </div>
+  </div>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  h4 {
+    margin: 0 0 0.8rem;
+    font-size: 0.82rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.45rem 1rem;
+    margin-bottom: 0.7rem;
+  }
+  .tag {
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .sld {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.82rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .sld input[type='range'] {
+    width: 150px;
+    accent-color: var(--indigo);
+  }
+  .ctrl select {
+    padding: 0.24rem 0.4rem;
+    font: inherit;
+    font-size: 0.8rem;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+  }
+  hr {
+    margin: 1.4rem 0 1.1rem;
+    border: none;
+    border-top: 1px solid var(--rule);
+  }
+  .two {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 1rem;
+    align-items: start;
+  }
+  @media (max-width: 640px) {
+    .two {
+      grid-template-columns: 1fr;
+    }
+  }
+  table.out {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+  }
+  table.out :global(td) {
+    padding: 0.24rem 0.4rem;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-muted);
+    font-family: var(--font-mono);
+  }
+  table.out :global(td.k) {
+    font-family: inherit;
+    color: var(--ink-faint);
+    white-space: nowrap;
+  }
+  .verdictbox {
+    padding: 0.2rem 0;
+  }
+  .verdict {
+    margin: 0.9rem 0 0;
+    padding: 0.6rem 0.8rem;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+</style>
+
+<script>
+  function setupL05MemTraffic() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l05-memtraffic"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const BW = 3.35e12; // H100 SXM 的 HBM 带宽，3.35 TB/s
+
+      const sci = (x: number) => {
+        const e = Math.floor(Math.log10(x));
+        return `${(x / 10 ** e).toFixed(2)} × 10${String(e)
+          .split('')
+          .map((d) => '⁰¹²³⁴⁵⁶⁷⁸⁹'[+d])
+          .join('')}`;
+      };
+      const mkrows = (host: HTMLElement, rows: [string, string][]) => {
+        host.replaceChildren();
+        for (const [k, v] of rows) {
+          const tr = document.createElement('tr');
+          const a = document.createElement('td');
+          a.className = 'k';
+          a.textContent = k;
+          const b = document.createElement('td');
+          b.textContent = v;
+          tr.append(a, b);
+          host.append(tr);
+        }
+      };
+
+      function fuse() {
+        const k = parseInt($<HTMLInputElement>('[data-k]').value, 10);
+        const nExp = parseInt($<HTMLInputElement>('[data-n]').value, 10);
+        const n = 2 ** nExp;
+        const bytes = parseInt($<HTMLSelectElement>('[data-bytes]').value, 10);
+        $('[data-kval]').textContent = String(k);
+        $('[data-nval]').textContent = sci(n);
+
+        // 未融合：每个算子从全局内存读一遍、写回一遍 → 2k 次访存
+        // 融合  ：整条链只读一次、写一次       → 2 次访存
+        const naive = 2 * k * n * bytes;
+        const fused = 2 * n * bytes;
+
+        mkrows($('[data-fuse]'), [
+          ['算子个数', `${k}（每个算子读 1 次写 1 次）`],
+          ['每个元素', `${bytes} 字节`],
+          ['未融合搬运量', `2 × ${k} × n × ${bytes} = ${sci(naive)} 字节`],
+          ['融合后搬运量', `2 × n × ${bytes} = ${sci(fused)} 字节`],
+          ['未融合耗时 @3.35 TB/s', `${((naive / BW) * 1e3).toFixed(2)} 毫秒`],
+          ['融合后耗时 @3.35 TB/s', `${((fused / BW) * 1e3).toFixed(2)} 毫秒`],
+          ['加速比', `${k.toFixed(0)} ×`],
+        ]);
+
+        $('[data-fusenote]').textContent =
+          `每多一个逐点算子，未融合的方案就多搬一整个张量的来回。这些算子本身几乎不花算力 —— ` +
+          `${k} 个算子加起来也不过每个元素 ${k} 次浮点运算，` +
+          `却要在慢内存和计算单元之间跑 ${k} 个来回。融合的意思就是：读一次进来，在 SM 里把 ${k} 步全做完，` +
+          `再写一次出去。搬运量从 ${sci(naive)} 字节掉到 ${sci(fused)} 字节，正好省下 ${k} 倍。` +
+          `torch.compile 这类编译器可以自动做这种简单融合。`;
+      }
+
+      function recomp() {
+        const L = parseInt($<HTMLInputElement>('[data-l]').value, 10);
+        $('[data-lval]').textContent = String(L);
+
+        // 存激活：前向 1 读 x + L 次写（L-1 个中间激活 + 1 个输出）
+        //         反向 (L-1) 个激活读 + 1 个 dout 读 + 1 个 dx 写  → 合计 2L+2
+        // 重计算：前向 1 读 + 1 写；反向 2 读（x 和 dout）+ 1 写   → 合计 5
+        const store = 2 * L + 2;
+        const rec = 5;
+
+        mkrows($('[data-recomp]'), [
+          ['存激活 · 前向', `1 次读（x）+ ${L} 次写`],
+          ['存激活 · 反向', `${L} 次读 + 1 次写（dx）`],
+          ['存激活 · 合计', `${store} 次访存`],
+          ['重计算 · 前向', `1 次读（x）+ 1 次写（out）`],
+          ['重计算 · 反向', `2 次读（x 和 dout）+ 1 次写（dx）`],
+          ['重计算 · 合计', `${rec} 次访存`],
+          ['访存量之比', `${rec} / ${store}`],
+          ['额外算力代价', `反向时多做 ${L} 次 sigmoid`],
+        ]);
+
+        $('[data-recompnote]').textContent =
+          L === 3
+            ? '这就是课上的那个例子：8 次访存变成 5 次，也就是 5/8。' +
+              '代价是反向传播时把 3 个 sigmoid 重算一遍 —— 而 sigmoid 的算术强度本来就极低，' +
+              '这点算力根本不是瓶颈。用便宜的资源（算力）换贵的资源（内存带宽），净赚。'
+            : rec < store
+              ? `堆 ${L} 层时，存激活要 ${store} 次访存，重计算只要 ${rec} 次 —— ` +
+                `而且重计算这一边永远是 5 次，跟层数无关（前向只留输出，反向从 x 一路重算）。` +
+                `层数越多，重计算越划算。`
+              : `只有 ${L} 层时两边差不多（${store} vs ${rec}），重计算不划算 —— ` +
+                `它省下的中间激活本来就没几个。这个技巧要堆得够深才有意义。`;
+      }
+
+      root
+        .querySelectorAll<HTMLElement>('input, select')
+        .forEach((el) =>
+          el.addEventListener('input', () => {
+            fuse();
+            recomp();
+          }),
+        );
+      fuse();
+      recomp();
+    });
+  }
+
+  setupL05MemTraffic();
+  document.addEventListener('astro:page-load', setupL05MemTraffic);
+</script>

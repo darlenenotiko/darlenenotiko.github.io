@@ -1,0 +1,300 @@
+---
+// CS336 第 8 讲：4D 并行配置器。
+// 所有数字都直接来自课上给的三条公式，没有别的来源：
+//   参数 + 梯度 + 优化器状态 = 12 字节/参数（纯 BF16 + fp32 主权重，课件第 28 页）
+//   每层激活显存 = sbh(34 + 5as/h)，张量并行后 sbh(10 + 24/t + 5as/(ht))，
+//                 再加序列并行 sbh(34/t + 5as/(ht))，再加选择性重算 sbh(34/t)（课件第 46–49 页）
+//   张量并行每层通信 8bsh(t−1)/t，流水线每个 micro-batch 每个阶段边界 bsh（课件第 43 页）
+//   数据并行每步 2×参数（ZeRO 0/1/2）或 3×参数（ZeRO-3）（课件第 27 页）
+---
+
+<div class="demo" data-demo="l08-config">
+  <div class="row">
+    <label class="sld">
+      模型
+      <select data-model data-default="2">
+        <option value="0">Llama-3 8B（32 层 / h=4096 / 32 头）</option>
+        <option value="1">Llama-3 70B（80 层 / h=8192 / 64 头）</option>
+        <option value="2" selected>Llama-3 405B（126 层 / h=16384 / 128 头）</option>
+      </select>
+    </label>
+    <label class="sld">
+      总 GPU 数
+      <select data-ngpu data-default="16384">
+        <option value="8">8</option>
+        <option value="64">64</option>
+        <option value="256">256</option>
+        <option value="1024">1024</option>
+        <option value="8192">8192</option>
+        <option value="16384" selected>16384</option>
+      </select>
+    </label>
+    <label class="sld">
+      单卡显存
+      <select data-mem data-default="80">
+        <option value="80" selected>80 GB</option>
+        <option value="141">141 GB</option>
+        <option value="180">180 GB</option>
+      </select>
+    </label>
+  </div>
+
+  <div class="row">
+    <label class="sld">
+      张量并行 TP = <span data-t-val>8</span>
+      <input type="range" data-t min="0" max="4" step="1" value="3" />
+    </label>
+    <label class="sld">
+      流水线并行 PP = <span data-p-val>16</span>
+      <input type="range" data-p min="0" max="5" step="1" value="4" />
+    </label>
+    <label class="sld">
+      序列长度 s = <span data-s-val>8192</span>
+      <input type="range" data-s min="0" max="3" step="1" value="1" />
+    </label>
+    <label class="sld">
+      micro-batch b = <span data-b-val>1</span>
+      <input type="range" data-b min="0" max="3" step="1" value="0" />
+    </label>
+  </div>
+
+  <div class="row">
+    <label class="chk"><input type="checkbox" data-zero3 /> 数据并行维度上用 ZeRO-3（FSDP）</label>
+    <label class="chk"><input type="checkbox" data-sp checked /> 序列并行（SP）</label>
+    <label class="chk"><input type="checkbox" data-recomp checked /> 选择性激活重算</label>
+  </div>
+
+  <p class="verdict" data-verdict></p>
+
+  <div class="wrap">
+    <table>
+      <tbody data-rows></tbody>
+    </table>
+  </div>
+
+  <p class="hint" data-hint></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1.3rem;
+    margin-bottom: 0.65rem;
+  }
+  .sld,
+  .chk {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.83rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .sld input[type='range'] {
+    width: 110px;
+    accent-color: var(--indigo);
+  }
+  .chk input {
+    accent-color: var(--indigo);
+  }
+  select {
+    font: inherit;
+    font-size: 0.8rem;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 0.15rem 0.3rem;
+  }
+  .verdict {
+    margin: 0.9rem 0 0.4rem;
+    padding: 0.5rem 0.7rem;
+    font-size: 0.85rem;
+    line-height: 1.7;
+    border-radius: 6px;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    color: var(--ink);
+  }
+  .verdict.bad {
+    color: var(--madder);
+  }
+  .wrap {
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    min-width: 420px;
+    border-collapse: collapse;
+    font-size: 0.81rem;
+    font-variant-numeric: tabular-nums;
+  }
+  table :global(td) {
+    padding: 0.28rem 0.45rem;
+    color: var(--ink-muted);
+    border-bottom: 1px solid var(--rule);
+  }
+  table :global(td.k) {
+    color: var(--ink-faint);
+  }
+  table :global(td.v) {
+    text-align: right;
+    font-family: var(--font-mono);
+    color: var(--ink);
+    white-space: nowrap;
+  }
+  table :global(tr.hi td.v) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+  .hint {
+    margin: 0.9rem 0 0;
+    font-size: 0.83rem;
+    line-height: 1.8;
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupL08Config() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l08-config"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const MODELS = [
+        { name: 'Llama-3 8B', L: 32, h: 4096, a: 32, P: 8.0e9 },
+        { name: 'Llama-3 70B', L: 80, h: 8192, a: 64, P: 70e9 },
+        { name: 'Llama-3 405B', L: 126, h: 16384, a: 128, P: 405e9 },
+      ];
+      const TS = [1, 2, 4, 8, 16];
+      const PS = [1, 2, 4, 8, 16, 32];
+      const SS = [4096, 8192, 32768, 131072];
+      const BS = [1, 2, 4, 8];
+
+      function draw() {
+        const M = MODELS[parseInt($<HTMLSelectElement>('[data-model]').value, 10)];
+        const N = parseInt($<HTMLSelectElement>('[data-ngpu]').value, 10);
+        const memGB = parseInt($<HTMLSelectElement>('[data-mem]').value, 10);
+        const t = TS[parseInt($<HTMLInputElement>('[data-t]').value, 10)];
+        const p = PS[parseInt($<HTMLInputElement>('[data-p]').value, 10)];
+        const s = SS[parseInt($<HTMLInputElement>('[data-s]').value, 10)];
+        const b = BS[parseInt($<HTMLInputElement>('[data-b]').value, 10)];
+        const zero3 = $<HTMLInputElement>('[data-zero3]').checked;
+        const sp = $<HTMLInputElement>('[data-sp]').checked;
+        const recomp = $<HTMLInputElement>('[data-recomp]').checked;
+
+        $('[data-t-val]').textContent = String(t);
+        $('[data-p-val]').textContent = String(p);
+        $('[data-s-val]').textContent = String(s);
+        $('[data-b-val]').textContent = String(b);
+
+        const modelShards = t * p;
+        const dp = N / modelShards;
+        const dpOK = Number.isInteger(dp) && dp >= 1;
+
+        // ── 参数 + 梯度 + 优化器状态：12 字节/参数 ──
+        const paramDivisor = modelShards * (zero3 && dpOK ? dp : 1);
+        const stateGB = (12 * M.P) / paramDivisor / 1e9;
+
+        // ── 激活显存 ──
+        // 系数完全照课件第 49 页那张表
+        const coefMain = sp ? 34 / t : 10 + 24 / t;
+        const coefAttn = recomp ? 0 : (5 * M.a * s) / (M.h * t);
+        const perLayer = s * b * M.h * (coefMain + coefAttn); // 字节
+        const layersPerRank = M.L / p;
+        const actGB = (perLayer * layersPerRank) / 1e9;
+
+        const totalGB = stateGB + actGB;
+
+        // ── 通信量（每步，每张卡）──
+        // 张量并行：每层 8bsh(t−1)/t 个元素，bf16 → ×2 字节
+        const tpBytes = t === 1 ? 0 : 8 * b * s * M.h * ((t - 1) / t) * 2 * layersPerRank;
+        // 流水线：每个 micro-batch 在每个阶段边界传一次 bsh（前向 + 反向 → ×2）
+        const ppBytes = p === 1 ? 0 : b * s * M.h * 2 * 2;
+        // 数据并行：每步 2×参数（ZeRO 0/1/2）或 3×参数（ZeRO-3），bf16
+        const dpBytes = dpOK && dp > 1 ? (zero3 ? 3 : 2) * M.P * 2 : 0;
+
+        const fmtGB = (x: number) => (x >= 1 ? `${x.toFixed(2)} GB` : `${(x * 1000).toFixed(0)} MB`);
+
+        const rows: [string, string, boolean][] = [
+          ['数据并行度 DP = 总卡数 ÷ (TP × PP)', dpOK ? String(dp) : '整除不了', !dpOK],
+          ['每卡参数 + 梯度 + 优化器状态', fmtGB(stateGB), false],
+          [
+            `每卡激活（每层系数 ${(coefMain + coefAttn).toFixed(1)}，摊到 ${(Math.round(layersPerRank * 10) / 10).toString()} 层）`,
+            fmtGB(actGB),
+            false,
+          ],
+          ['每卡显存合计', fmtGB(totalGB), totalGB > memGB],
+          ['张量并行通信（每步每卡）', fmtGB(tpBytes / 1e9), false],
+          ['流水线通信（每 micro-batch 每个边界）', fmtGB(ppBytes / 1e9), false],
+          ['数据并行通信（每步每卡）', fmtGB(dpBytes / 1e9), false],
+        ];
+        const tb = $('[data-rows]');
+        tb.replaceChildren();
+        for (const [k, v, hi] of rows) {
+          const tr = document.createElement('tr');
+          if (hi) tr.className = 'hi';
+          const a = document.createElement('td');
+          a.className = 'k';
+          a.textContent = k;
+          const c = document.createElement('td');
+          c.className = 'v';
+          c.textContent = v;
+          tr.append(a, c);
+          tb.append(tr);
+        }
+
+        const vd = $('[data-verdict]');
+        if (!dpOK) {
+          vd.className = 'verdict bad';
+          vd.textContent = `TP × PP = ${modelShards} 除不尽总卡数 ${N} —— 这套配置排不出来，换一组。`;
+        } else if (totalGB > memGB) {
+          vd.className = 'verdict bad';
+          vd.textContent = `装不下：每卡要 ${totalGB.toFixed(1)} GB，只有 ${memGB} GB。继续加 TP 或 PP，或者打开 ZeRO-3 / 序列并行 / 激活重算。`;
+        } else {
+          vd.className = 'verdict';
+          vd.textContent = `装得下：每卡 ${totalGB.toFixed(1)} GB / ${memGB} GB，全局批大小 = DP × micro-batch = ${dp * b} 条序列（还要再乘上梯度累积的次数）。`;
+        }
+
+        let hint = '';
+        if (t > 8) {
+          hint +=
+            `TP = ${t} 已经超出一台机器的 8 张卡了 —— 张量并行要跨节点通信，性能会掉一大截。课上的经验法则是 TP 最多到 8。`;
+        } else if (t === 8) {
+          hint += 'TP = 8 正好占满一台机器的 NVLink 域，这是课上说的最常见配置。';
+        }
+        if (!sp) {
+          hint +=
+            ` 关掉序列并行之后，每层系数里那个 10 是死的 —— LayerNorm、Dropout、残差输入都不被张量并行切开，加再多卡也降不下去。`;
+        }
+        if (dpOK && dp === 1) {
+          hint += ' DP = 1，等于完全没有数据并行 —— 全局批大小只有一个 micro-batch，得靠梯度累积撑起来。';
+        }
+        $('[data-hint]').textContent = hint.trim();
+      }
+
+      // 不依赖 <option selected> —— 有些解析器不认，显式把默认值写进去
+      root.querySelectorAll<HTMLSelectElement>('select[data-default]').forEach((el) => {
+        el.value = el.dataset.default!;
+      });
+      root.querySelectorAll('input, select').forEach((el) => {
+        el.addEventListener('input', draw);
+        el.addEventListener('change', draw);
+      });
+      draw();
+    });
+  }
+
+  setupL08Config();
+  document.addEventListener('astro:page-load', setupL08Config);
+</script>

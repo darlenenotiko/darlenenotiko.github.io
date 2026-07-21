@@ -287,9 +287,25 @@ pre:hover .code-bar,
 :where(p, li, td, dd) math {
   margin: 0 0.12em;
 }
-/* 独立公式：上下留白，长公式独立横向滚动而非撑破页面 */
+/* 独立公式：上下留白。
+   横向滚动放在外层 .math-scroll 上，不放在 math 元素本身 ——
+   Temml 给它带了内联的 display:block math，在数学布局模式下 Chromium
+   会按内容宽度撑开盒子，overflow-x 写在 math 上不成立（实测无效）。
+   外层 div 由 astro.config.mjs 里的 rehypeMathScroll 插件包上。 */
 math[display='block'] {
+  margin: 0;
+}
+.math-scroll {
   margin: 1.4em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+/* 兜底：偶尔会有很长的行内公式（本该写成独立公式的那种）。
+   Temml 的行内公式是 inline-flex，只能在顶层子元素之间断行；
+   整条表达式包在单个 mrow 里时没有断点，窄屏上就会顶出页面。
+   让它自己横向滚动，而不是把整页撑破。 */
+.mdx-body math:not([display='block']) {
+  max-width: 100%;
   overflow-x: auto;
   overflow-y: hidden;
 }
@@ -350,6 +366,21 @@ thead th {
 }
 
 .scroll-x { overflow-x: auto; }
+
+/* 窄屏上让表格自己横向滚动，而不是把整个页面撑出横向滚动条。
+   课程讲义里有大量四到六列的数值表（显存对账、并行配置、scaling 系数），
+   手机宽度下必然放不下。
+   只在窄屏改 display —— 桌面端保持原来的 width:100% 表格布局不变。 */
+@media (max-width: 640px) {
+  .mdx-body table,
+  [data-demo] table {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    /* 滚动容器里不要让单元格被压成一列一个字 */
+    white-space: nowrap;
+  }
+}
 
 /* ── 布局 ───────────────────────────────────────────────────── */
 .page {

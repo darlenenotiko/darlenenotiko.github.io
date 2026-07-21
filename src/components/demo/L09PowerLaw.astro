@@ -1,0 +1,450 @@
+---
+// 幂律 L = A · D^(-α)：左边线性坐标，右边双对数坐标。
+// 拖动指数 α 和系数 A，看双对数下永远是直线、斜率恒等于 -α，而 A 只上下平移这条线。
+// 默认值就是 Kaplan+ 2020 语言模型的数据 scaling law：L = (D / 5.4e13)^(-0.095)，
+// 即 A = (5.4e13)^0.095 ≈ 20.16，α = 0.095。
+---
+
+<div class="demo" data-demo="l09-powerlaw">
+  <div class="ctrl">
+    <label>指数 α <input type="range" data-alpha min="0.02" max="0.6" step="0.005" value="0.095" /></label>
+    <span class="val" data-alpha-v></span>
+  </div>
+  <div class="ctrl">
+    <label>系数 A <input type="range" data-a min="0.4" max="2.4" step="0.0001" value="1.3046" /></label>
+    <span class="val" data-a-v></span>
+    <button data-reset>回到 Kaplan 的那条曲线</button>
+  </div>
+
+  <p class="formula" data-formula></p>
+
+  <div class="two">
+    <div class="plot" data-plot-lin></div>
+    <div class="plot" data-plot-log></div>
+  </div>
+
+  <table class="out" data-out>
+    <thead>
+      <tr>
+        <th>数据量 D</th><th>log₁₀ D</th><th>损失 L</th><th>log₁₀ L</th><th>比上一行</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.5rem;
+  }
+  .ctrl label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+  }
+  .ctrl input[type='range'] {
+    width: 190px;
+    accent-color: var(--indigo);
+  }
+  .val {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--madder);
+    font-variant-numeric: tabular-nums;
+  }
+  .ctrl button {
+    padding: 0.26rem 0.65rem;
+    font: inherit;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .ctrl button:hover {
+    color: var(--indigo);
+    border-color: var(--indigo);
+  }
+
+  .formula {
+    margin: 0.8rem 0 0.2rem;
+    padding: 0.5rem 0.7rem;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    line-height: 1.8;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+  }
+
+  .two {
+    display: grid;
+    gap: 0.8rem;
+    margin-top: 0.8rem;
+  }
+  @media (min-width: 700px) {
+    .two {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  .plot {
+    overflow-x: auto;
+  }
+  .plot :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 280px;
+    height: auto;
+  }
+  .plot :global(.axis) {
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .plot :global(.grid) {
+    stroke: var(--rule);
+    stroke-width: 0.6;
+    stroke-dasharray: 2 3;
+  }
+  .plot :global(.curve) {
+    fill: none;
+    stroke: var(--indigo);
+    stroke-width: 2;
+  }
+  .plot :global(.ghost) {
+    fill: none;
+    stroke: var(--ink-faint);
+    stroke-width: 1;
+    stroke-dasharray: 4 3;
+  }
+  .plot :global(.pt) {
+    fill: var(--madder);
+  }
+  .plot :global(.drop) {
+    stroke: var(--madder);
+    stroke-width: 0.8;
+    stroke-dasharray: 2 2;
+  }
+  .plot :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 9px;
+  }
+  .plot :global(text.title) {
+    fill: var(--indigo);
+    font-size: 10.5px;
+    font-weight: 700;
+  }
+  .plot :global(text.note) {
+    fill: var(--madder);
+    font-size: 9.5px;
+  }
+
+  .out {
+    width: 100%;
+    margin-top: 0.9rem;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+  }
+  .out :global(th) {
+    padding: 0.25rem 0.35rem;
+    text-align: right;
+    font-weight: 400;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(th:first-child) {
+    text-align: left;
+  }
+  .out :global(td) {
+    padding: 0.25rem 0.35rem;
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(td:first-child) {
+    text-align: left;
+  }
+  .out :global(td.hi) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL09PowerLaw() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l09-powerlaw"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const alphaEl = $<HTMLInputElement>('[data-alpha]');
+      const aEl = $<HTMLInputElement>('[data-a]');
+      // 滑块有步长，会把默认值吸附到网格上；所以 logA 单独用一个变量存，
+      // 只有用户真的拖动时才从滑块读，这样默认值能精确等于 Kaplan 那条曲线
+      let logA = 0;
+
+      // Kaplan 的默认值：L = (D / 5.4e13)^(-0.095)
+      const KAPLAN_ALPHA = 0.095;
+      // 滑块调的是 log10(A)，这样对数坐标下的平移是线性的
+      const KAPLAN_LOG_A = KAPLAN_ALPHA * Math.log10(5.4e13); // ≈ 1.3045
+
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+
+      const W = 340,
+        H = 250,
+        ML = 44,
+        MR = 12,
+        MT = 24,
+        MB = 32;
+
+      // 三个标记点：每次横轴乘以 10
+      const MARKS = [1e8, 1e9, 1e10];
+
+      // ── 线性坐标图 ──
+      function drawLinear(A: number, alpha: number) {
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+        const X1 = 1e10; // 横轴 0 → 1e10，线性
+        const L = (D: number) => A * Math.pow(D, -alpha);
+        const Y1 = L(1e7) * 1.05; // 纵轴上界
+        const px = (x: number) => ML + (x / X1) * (W - ML - MR);
+        const py = (y: number) => H - MB - (y / Y1) * (H - MT - MB);
+
+        for (let i = 0; i <= 5; i++) {
+          const x = px((i / 5) * X1);
+          svg.append(svgEl('line', { class: 'grid', x1: x, y1: MT, x2: x, y2: H - MB }));
+          svg.append(
+            svgEl('text', { x, y: H - MB + 12, 'text-anchor': 'middle' }, `${(i * 2).toFixed(0)}e9`),
+          );
+        }
+        for (let i = 0; i <= 4; i++) {
+          const v = (i / 4) * Y1;
+          const y = py(v);
+          svg.append(svgEl('line', { class: 'grid', x1: ML, y1: y, x2: W - MR, y2: y }));
+          svg.append(svgEl('text', { x: ML - 4, y: y + 3, 'text-anchor': 'end' }, v.toFixed(1)));
+        }
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: H - MB, x2: W - MR, y2: H - MB }));
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: MT, x2: ML, y2: H - MB }));
+        svg.append(svgEl('text', { class: 'title', x: ML, y: 14 }, '线性坐标：一条弯到没眼看的曲线'));
+        svg.append(
+          svgEl('text', { x: (ML + W - MR) / 2, y: H - 3, 'text-anchor': 'middle' }, '数据量 D（线性）'),
+        );
+
+        const pts: string[] = [];
+        for (let i = 0; i <= 240; i++) {
+          const D = (i / 240) * X1;
+          if (D < 1e6) continue;
+          pts.push(`${px(D)},${py(Math.min(L(D), Y1))}`);
+        }
+        svg.append(svgEl('polyline', { class: 'curve', points: pts.join(' ') }));
+
+        for (const D of MARKS) {
+          svg.append(svgEl('circle', { class: 'pt', cx: px(D), cy: py(L(D)), r: 3 }));
+        }
+        svg.append(
+          svgEl(
+            'text',
+            { class: 'note', x: W - MR - 2, y: MT + 12, 'text-anchor': 'end' },
+            '前面几乎垂直，后面几乎水平',
+          ),
+        );
+        return svg;
+      }
+
+      // ── 双对数坐标图 ──
+      function drawLog(A: number, alpha: number) {
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+        const LX0 = 7,
+          LX1 = 12; // log10 D 从 7 到 12
+        const L = (D: number) => A * Math.pow(D, -alpha);
+        // 纵轴范围固定，方便看清 A 只是上下平移
+        const LY0 = -0.5,
+          LY1 = 1.3;
+        const px = (lx: number) => ML + ((lx - LX0) / (LX1 - LX0)) * (W - ML - MR);
+        const py = (ly: number) => H - MB - ((ly - LY0) / (LY1 - LY0)) * (H - MT - MB);
+
+        for (let e = LX0; e <= LX1; e++) {
+          const x = px(e);
+          svg.append(svgEl('line', { class: 'grid', x1: x, y1: MT, x2: x, y2: H - MB }));
+          svg.append(svgEl('text', { x, y: H - MB + 12, 'text-anchor': 'middle' }, `10^${e}`));
+        }
+        for (const ly of [-0.5, 0, 0.5, 1.0]) {
+          const y = py(ly);
+          svg.append(svgEl('line', { class: 'grid', x1: ML, y1: y, x2: W - MR, y2: y }));
+          svg.append(
+            svgEl(
+              'text',
+              { x: ML - 4, y: y + 3, 'text-anchor': 'end' },
+              Math.pow(10, ly).toFixed(2),
+            ),
+          );
+        }
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: H - MB, x2: W - MR, y2: H - MB }));
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: MT, x2: ML, y2: H - MB }));
+        svg.append(svgEl('text', { class: 'title', x: ML, y: 14 }, '双对数坐标：一条笔直的直线'));
+        svg.append(
+          svgEl('text', { x: (ML + W - MR) / 2, y: H - 3, 'text-anchor': 'middle' }, '数据量 D（对数）'),
+        );
+
+        // 参考线：Kaplan 原始那条，方便对比
+        const gp: string[] = [];
+        for (let lx = LX0; lx <= LX1; lx += 0.1) {
+          gp.push(`${px(lx)},${py(KAPLAN_LOG_A - KAPLAN_ALPHA * lx)}`);
+        }
+        svg.append(svgEl('polyline', { class: 'ghost', points: gp.join(' ') }));
+
+        const logA = Math.log10(A);
+        const cp: string[] = [];
+        for (let lx = LX0; lx <= LX1; lx += 0.1) {
+          cp.push(`${px(lx)},${py(logA - alpha * lx)}`);
+        }
+        svg.append(svgEl('polyline', { class: 'curve', points: cp.join(' ') }));
+
+        // 三个标记点 + 「横走一格、纵掉 α 格」的直角提示
+        for (const D of MARKS) {
+          const lx = Math.log10(D);
+          svg.append(svgEl('circle', { class: 'pt', cx: px(lx), cy: py(logA - alpha * lx), r: 3 }));
+        }
+        const lx0 = 9,
+          lx1 = 10;
+        const y0 = py(logA - alpha * lx0),
+          y1 = py(logA - alpha * lx1);
+        svg.append(svgEl('line', { class: 'drop', x1: px(lx0), y1: y0, x2: px(lx1), y2: y0 }));
+        svg.append(svgEl('line', { class: 'drop', x1: px(lx1), y1: y0, x2: px(lx1), y2: y1 }));
+        svg.append(
+          svgEl(
+            'text',
+            { class: 'note', x: px(lx1) + 4, y: (y0 + y1) / 2 + 3 },
+            `↓ ${alpha.toFixed(3)} 格`,
+          ),
+        );
+        svg.append(
+          svgEl('text', { class: 'note', x: (px(lx0) + px(lx1)) / 2, y: y0 - 4, 'text-anchor': 'middle' }, '→ 1 格'),
+        );
+        return svg;
+      }
+
+      function fmtD(D: number) {
+        const e = Math.round(Math.log10(D));
+        return `10^${e}`;
+      }
+
+      function draw() {
+        const alpha = parseFloat(alphaEl.value);
+        const A = Math.pow(10, logA);
+
+        $('[data-alpha-v]').textContent = `α = ${alpha.toFixed(3)}`;
+        $('[data-a-v]').textContent = `A = ${A.toFixed(2)}`;
+
+        $('[data-formula]').textContent =
+          `L(D) = A · D^(-α) = ${A.toFixed(2)} · D^(-${alpha.toFixed(3)})\n` +
+          `两边取以 10 为底的对数：log₁₀L = log₁₀A - α·log₁₀D = ${logA.toFixed(4)} - ${alpha.toFixed(3)}·log₁₀D\n` +
+          `→ 以 log₁₀D 为横轴、log₁₀L 为纵轴，这是一条斜率 -${alpha.toFixed(3)}、截距 ${logA.toFixed(4)} 的直线`;
+
+        $('[data-plot-lin]').replaceChildren(drawLinear(A, alpha));
+        $('[data-plot-log]').replaceChildren(drawLog(A, alpha));
+
+        const tb = $('[data-out] tbody');
+        tb.replaceChildren();
+        let prev: number | null = null;
+        for (const D of [1e7, 1e8, 1e9, 1e10, 1e11, 1e12]) {
+          const L = A * Math.pow(D, -alpha);
+          const tr = document.createElement('tr');
+          const cells = [
+            fmtD(D),
+            Math.log10(D).toFixed(0),
+            L.toFixed(4),
+            Math.log10(L).toFixed(4),
+            prev === null ? '—' : (L / prev).toFixed(4),
+          ];
+          cells.forEach((c, i) => {
+            const td = document.createElement('td');
+            td.textContent = c;
+            if (i === 4 && prev !== null) td.className = 'hi';
+            tr.append(td);
+          });
+          tb.append(tr);
+          prev = L;
+        }
+
+        const ratio = Math.pow(10, -alpha);
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        const s1 = document.createElement('strong');
+        s1.textContent = `10^(-α) = ${ratio.toFixed(4)}`;
+        v.append(
+          document.createTextNode('最后一列永远是同一个数：D 每乘以 10，L 就乘以 '),
+          s1,
+          document.createTextNode(
+            `。这就是「幂律」的全部含义 —— 横轴乘一个固定倍数，纵轴也乘一个固定倍数，跟你现在站在哪个规模上无关（所以又叫「无标度 / scale-free」）。` +
+              `取对数之后「乘固定倍数」变成「加固定量」，于是画出来是直线，斜率恰好是 −α = −${alpha.toFixed(3)}。`,
+          ),
+        );
+        const s2 = document.createElement('strong');
+        s2.textContent = '斜率一动不动';
+        v.append(
+          document.createTextNode('　拖「系数 A」看看：右图的直线上下平移，但 '),
+          s2,
+          document.createTextNode(
+            '。这正是这一讲反复出现的那个现象 —— 换优化器、换数据配方，往往只改截距，不改斜率。',
+          ),
+        );
+      }
+
+      alphaEl.addEventListener('input', draw);
+      aEl.addEventListener('input', () => {
+        logA = parseFloat(aEl.value);
+        draw();
+      });
+      $('[data-reset]').addEventListener('click', () => {
+        alphaEl.value = String(KAPLAN_ALPHA);
+        aEl.value = KAPLAN_LOG_A.toFixed(4);
+        logA = KAPLAN_LOG_A;
+        draw();
+      });
+
+      aEl.value = KAPLAN_LOG_A.toFixed(4);
+      logA = KAPLAN_LOG_A;
+      draw();
+    });
+  }
+
+  setupL09PowerLaw();
+  document.addEventListener('astro:page-load', setupL09PowerLaw);
+</script>

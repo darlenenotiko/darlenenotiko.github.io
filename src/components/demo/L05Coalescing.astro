@@ -1,0 +1,324 @@
+---
+// CS336 第 5 讲：内存合并访问。
+// 一个 8×8 的行主序矩阵，按线性地址被切成若干「突发段」（同色 = 同一段）。
+// 8 个线程一起取数：一种取法每步落在 8 个不同的突发段里，另一种落在 2 个里。
+// 一步步走完，把 DRAM 请求次数数出来。
+---
+
+<div class="demo" data-demo="l05-coalescing">
+  <div class="ctrl">
+    <span class="tag">取数方式</span>
+    <button data-mode="row" class="on">线程各走一行（不合并）</button>
+    <button data-mode="col">线程共走一行（合并）</button>
+    <span class="tag">突发段大小</span>
+    <select data-burst>
+      <option value="4" selected>4 个元素</option>
+      <option value="8">8 个元素</option>
+    </select>
+  </div>
+
+  <div class="ctrl">
+    <button data-prev>上一步</button>
+    <button data-next>下一步</button>
+    <button data-reset>回到第 0 步</button>
+    <span class="sld">第 <span data-step>0</span> / 7 步</span>
+  </div>
+
+  <div class="stage">
+    <div>
+      <p class="cap">矩阵 A（8 × 8），格子里是它在内存里的线性地址 <code>r × 8 + c</code></p>
+      <div class="gridwrap"><div class="grid" data-grid></div></div>
+    </div>
+    <div>
+      <p class="cap">这一步碰到的突发段（每段捎回来几个元素，其中几个真被用上）</p>
+      <div class="gridwrap"><div class="mem" data-mem></div></div>
+    </div>
+  </div>
+
+  <table class="out"><tbody data-out></tbody></table>
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.45rem 0.9rem;
+    margin-bottom: 0.7rem;
+  }
+  .tag {
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .ctrl button {
+    padding: 0.26rem 0.66rem;
+    font: inherit;
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .ctrl button.on {
+    color: var(--bg);
+    background: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .ctrl select {
+    padding: 0.24rem 0.4rem;
+    font: inherit;
+    font-size: 0.8rem;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+  }
+  .sld {
+    font-size: 0.82rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .stage {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 1.2rem;
+    margin: 0.4rem 0 0.2rem;
+  }
+  .cap {
+    margin: 0 0 0.45rem;
+    font-size: 0.78rem;
+    color: var(--ink-faint);
+  }
+  .cap code {
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+  }
+  .gridwrap {
+    overflow-x: auto;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(8, 1.85rem);
+    gap: 2px;
+    width: max-content;
+  }
+  .mem {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+  .mem :global(.sechead) {
+    font-size: 0.7rem;
+    color: var(--ink-faint);
+    font-variant-numeric: tabular-nums;
+    margin-bottom: 1px;
+  }
+  .mem :global(.strip) {
+    display: flex;
+    gap: 2px;
+  }
+  .grid :global(.c),
+  .mem :global(.c) {
+    width: 1.85rem;
+    height: 1.5rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-size: 0.62rem;
+    color: var(--ink-muted);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+  }
+  .grid :global(.c.hit),
+  .mem :global(.c.hit) {
+    color: var(--bg);
+    background: var(--madder);
+    border-color: var(--madder);
+    font-weight: 700;
+  }
+  .grid :global(.c.touched) {
+    outline: 2px solid var(--madder);
+    outline-offset: -2px;
+  }
+
+  table.out {
+    width: 100%;
+    margin-top: 1rem;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+  }
+  table.out :global(td) {
+    padding: 0.24rem 0.4rem;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-muted);
+    font-family: var(--font-mono);
+  }
+  table.out :global(td.k) {
+    font-family: inherit;
+    color: var(--ink-faint);
+    white-space: nowrap;
+  }
+  .verdict {
+    margin: 0.9rem 0 0;
+    padding: 0.6rem 0.8rem;
+    font-size: 0.86rem;
+    line-height: 1.7;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+</style>
+
+<script>
+  function setupL05Coalescing() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l05-coalescing"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const N = 8; // 矩阵边长，也是线程数
+      let mode = 'row';
+      let step = 0;
+
+      // 第 j 步，第 t 号线程读哪个元素？
+      // row 模式：线程 t 一直待在第 t 行，沿行往右走 —— 这一步它们合起来读的是「一列」
+      // col 模式：线程 t 一直待在第 t 列，一步读一行 —— 这一步它们合起来读的是「一行」
+      const addrOf = (t: number, j: number) => (mode === 'row' ? t * N + j : j * N + t);
+
+      function render() {
+        const burst = parseInt($<HTMLSelectElement>('[data-burst]').value, 10);
+        $('[data-step]').textContent = String(step);
+
+        const hits = new Set<number>();
+        for (let t = 0; t < N; t++) hits.add(addrOf(t, step));
+        const sections = new Set<number>();
+        for (const a of hits) sections.add(Math.floor(a / burst));
+
+        const COLORS = ['--indigo', '--weld', '--madder', '--ink-faint'];
+        const paint = (host: HTMLElement, addrAt: (i: number) => number) => {
+          host.replaceChildren();
+          for (let i = 0; i < N * N; i++) {
+            const a = addrAt(i);
+            const sec = Math.floor(a / burst);
+            const d = document.createElement('span');
+            d.className = 'c';
+            if (hits.has(a)) d.classList.add('hit');
+            else
+              d.style.background = `color-mix(in srgb, var(${COLORS[sec % 4]}) 16%, transparent)`;
+            if (!hits.has(a) && sections.has(sec)) d.classList.add('touched');
+            d.textContent = String(a);
+            host.append(d);
+          }
+        };
+        // 左图：矩阵按行主序摆放，格子 i 就是地址 i
+        paint($('[data-grid]'), (i) => i);
+
+        // 右图：把这一步碰到的突发段一段一段列出来，标出「捎回来几个 / 真用上几个」
+        const memHost = $('[data-mem]');
+        memHost.replaceChildren();
+        const secList = [...sections].sort((a, b) => a - b);
+        for (const sec of secList) {
+          const used = [...hits].filter((a) => Math.floor(a / burst) === sec).length;
+          const box = document.createElement('div');
+          box.className = 'sec';
+          const head = document.createElement('div');
+          head.className = 'sechead';
+          head.textContent = `段 ${sec}：地址 ${sec * burst}–${sec * burst + burst - 1}，用上 ${used}/${burst}`;
+          const strip = document.createElement('div');
+          strip.className = 'strip';
+          for (let k = 0; k < burst; k++) {
+            const a = sec * burst + k;
+            const d = document.createElement('span');
+            d.className = 'c';
+            if (hits.has(a)) d.classList.add('hit');
+            d.textContent = String(a);
+            strip.append(d);
+          }
+          box.append(head, strip);
+          memHost.append(box);
+        }
+
+        // 走完全部 8 步的总账
+        let total = 0;
+        for (let j = 0; j < N; j++) {
+          const s = new Set<number>();
+          for (let t = 0; t < N; t++) s.add(Math.floor(addrOf(t, j) / burst));
+          total += s.size;
+        }
+        const ideal = (N * N) / burst;
+
+        const rows: [string, string][] = [
+          ['这一步 8 个线程读的地址', [...hits].sort((a, b) => a - b).join(', ')],
+          ['落在几个突发段里', `${sections.size} 个`],
+          ['这一步要发几次 DRAM 请求', `${sections.size} 次`],
+          ['走完 8 步一共发多少次', `${total} 次`],
+          ['理论下限（整个矩阵 ÷ 突发段）', `${ideal} 次`],
+          ['浪费倍数', `${(total / ideal).toFixed(1)} ×`],
+        ];
+        const tb = $('[data-out]');
+        tb.replaceChildren();
+        for (const [k, v] of rows) {
+          const tr = document.createElement('tr');
+          const a = document.createElement('td');
+          a.className = 'k';
+          a.textContent = k;
+          const b = document.createElement('td');
+          b.textContent = v;
+          tr.append(a, b);
+          tb.append(tr);
+        }
+
+        $('[data-verdict]').textContent =
+          mode === 'row'
+            ? `不合并：8 个线程各自待在自己那一行，这一步它们要的 8 个地址在内存里相距 8 个格子，` +
+              `分散在 ${sections.size} 个不同的突发段里。每个突发段只用上了 1 个元素，` +
+              `另外 ${burst - 1} 个是白读的 —— 但你还是得付这笔时间。走完 8 步共 ${total} 次请求。`
+            : `合并：8 个线程这一步读的是内存里连续的 8 个地址，只落在 ${sections.size} 个突发段里。` +
+              `一个突发段捎回来的 ${burst} 个元素全都被用上了，一次请求也没浪费。` +
+              `走完 8 步共 ${total} 次请求 —— 和理论下限一样。`;
+      }
+
+      root.querySelectorAll<HTMLButtonElement>('[data-mode]').forEach((b) =>
+        b.addEventListener('click', () => {
+          root.querySelectorAll('[data-mode]').forEach((x) => x.classList.remove('on'));
+          b.classList.add('on');
+          mode = b.dataset.mode!;
+          render();
+        }),
+      );
+      $('[data-next]').addEventListener('click', () => {
+        step = (step + 1) % N;
+        render();
+      });
+      $('[data-prev]').addEventListener('click', () => {
+        step = (step + N - 1) % N;
+        render();
+      });
+      $('[data-reset]').addEventListener('click', () => {
+        step = 0;
+        render();
+      });
+      $<HTMLSelectElement>('[data-burst]').addEventListener('change', render);
+
+      render();
+    });
+  }
+
+  setupL05Coalescing();
+  document.addEventListener('astro:page-load', setupL05Coalescing);
+</script>

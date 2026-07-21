@@ -1,0 +1,592 @@
+---
+// 第 7 讲演示 2：同一个 MLP，三种并行怎么切。
+// 模型和课件 lecture_07.py 一致：batch_size × num_dim 的数据，num_layers 个 num_dim × num_dim 的方阵，
+// 每层「矩阵乘 + GELU」。默认参数就是课上的 128 × 1024、4 层、4 张卡（流水线那一节课上用的是 2 张卡）。
+// 通信量按 fp32 折算，用的是和演示 1 一致的点对点计数：
+//   all-reduce 总量 = 载荷 × 2 × (P-1)；all-gather / reduce-scatter 总量 = 载荷 × (P-1)。
+---
+
+<div class="demo" data-demo="l07-sharding">
+  <div class="tabs">
+    <button data-tab="dp" class="on">数据并行</button>
+    <button data-tab="tp">张量并行</button>
+    <button data-tab="pp">流水线并行</button>
+  </div>
+
+  <div class="knobs">
+    <label>批大小 B<input type="range" data-k="B" min="0" max="8" step="1" value="2" /><output data-o="B"></output></label>
+    <label>维度 D<input type="range" data-k="D" min="0" max="4" step="1" value="2" /><output data-o="D"></output></label>
+    <label>层数 L<input type="range" data-k="L" min="0" max="4" step="1" value="1" /><output data-o="L"></output></label>
+    <label>world size P<input type="range" data-k="P" min="0" max="2" step="1" value="1" /><output data-o="P"></output></label>
+    <label data-mb>微批数 M<input type="range" data-k="M" min="0" max="3" step="1" value="2" /><output data-o="M"></output></label>
+  </div>
+
+  <p class="desc" data-desc></p>
+
+  <div class="block">
+    <h4 data-viz-title></h4>
+    <div class="viz" data-viz></div>
+    <div class="legend" data-legend></div>
+  </div>
+
+  <div class="block">
+    <h4>每张卡手里有什么</h4>
+    <div class="tw">
+      <table data-table>
+        <thead></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="block">
+    <h4>通信</h4>
+    <div class="comm" data-comm></div>
+  </div>
+
+  <div class="block">
+    <h4>三种并行每步的跨卡通信量（前向 + 反向）</h4>
+    <div class="bars" data-bars></div>
+    <p class="note" data-note></p>
+  </div>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.1rem 1.1rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+
+  .tabs {
+    display: flex;
+    gap: 0.4rem;
+    margin-bottom: 1rem;
+    border-bottom: 1px solid var(--rule);
+  }
+  .tabs button {
+    padding: 0.4rem 0.85rem;
+    font: inherit;
+    font-size: 0.87rem;
+    color: var(--ink-muted);
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    margin-bottom: -1px;
+  }
+  .tabs button.on {
+    color: var(--indigo);
+    border-bottom-color: var(--indigo);
+  }
+
+  .knobs {
+    display: grid;
+    gap: 0.55rem 1.1rem;
+  }
+  @media (min-width: 640px) {
+    .knobs {
+      grid-template-columns: repeat(5, 1fr);
+    }
+  }
+  .knobs label {
+    display: block;
+    font-size: 0.74rem;
+    color: var(--ink-faint);
+  }
+  .knobs label[hidden] {
+    display: none;
+  }
+  .knobs input[type='range'] {
+    display: block;
+    width: 100%;
+    margin-top: 0.25rem;
+    accent-color: var(--indigo);
+  }
+  .knobs output {
+    display: block;
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .desc {
+    margin: 0.9rem 0 0;
+    font-size: 0.86rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+
+  .block {
+    margin-top: 1.1rem;
+  }
+  .block h4 {
+    margin: 0 0 0.45rem;
+    font-size: 0.76rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+
+  .viz {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1.1rem;
+    padding: 0.7rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .viz :global(.unit) {
+    flex: none;
+  }
+  .viz :global(.ulabel) {
+    font-size: 0.7rem;
+    color: var(--ink-faint);
+    margin-bottom: 0.25rem;
+    font-family: var(--font-mono);
+  }
+  .viz :global(.mat) {
+    display: grid;
+    gap: 2px;
+    border: 1px solid var(--rule);
+    padding: 2px;
+    border-radius: 3px;
+  }
+  .viz :global(.piece) {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-size: 0.62rem;
+    color: var(--ink);
+    border-radius: 2px;
+    min-width: 1.6rem;
+    min-height: 1.2rem;
+  }
+  .viz :global(.r0) {
+    background: color-mix(in srgb, var(--indigo) 34%, transparent);
+  }
+  .viz :global(.r1) {
+    background: color-mix(in srgb, var(--madder) 30%, transparent);
+  }
+  .viz :global(.r2) {
+    background: color-mix(in srgb, var(--weld) 40%, transparent);
+  }
+  .viz :global(.r3) {
+    background: color-mix(in srgb, var(--indigo-soft) 40%, transparent);
+  }
+  .viz :global(.r4) {
+    background: color-mix(in srgb, var(--indigo) 16%, transparent);
+  }
+  .viz :global(.r5) {
+    background: color-mix(in srgb, var(--madder) 14%, transparent);
+  }
+  .viz :global(.r6) {
+    background: color-mix(in srgb, var(--weld) 20%, transparent);
+  }
+  .viz :global(.r7) {
+    background: color-mix(in srgb, var(--indigo-soft) 20%, transparent);
+  }
+  .legend {
+    margin-top: 0.4rem;
+    font-size: 0.74rem;
+    color: var(--ink-faint);
+  }
+
+  .tw {
+    overflow-x: auto;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.79rem;
+    font-variant-numeric: tabular-nums;
+  }
+  table :global(th) {
+    padding: 0.3rem 0.5rem;
+    text-align: left;
+    font-weight: 700;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+  table :global(td) {
+    padding: 0.28rem 0.5rem;
+    color: var(--ink-muted);
+    border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+    font-family: var(--font-mono);
+  }
+  table :global(td.rk) {
+    color: var(--ink);
+  }
+
+  .comm {
+    display: grid;
+    gap: 0.5rem;
+  }
+  @media (min-width: 640px) {
+    .comm {
+      grid-template-columns: repeat(4, 1fr);
+    }
+  }
+  .comm :global(.cc) {
+    padding: 0.55rem 0.65rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .comm :global(.cc.hot) {
+    border-color: var(--madder);
+  }
+  .comm :global(.ct) {
+    font-size: 0.7rem;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+  }
+  .comm :global(.cv) {
+    margin-top: 0.18rem;
+    font-family: var(--font-mono);
+    font-size: 0.88rem;
+    color: var(--ink);
+  }
+  .comm :global(.cc.hot .cv) {
+    color: var(--madder);
+  }
+
+  .bars {
+    display: grid;
+    gap: 0.45rem;
+  }
+  .bars :global(.brow) {
+    display: grid;
+    grid-template-columns: 6.5rem 1fr;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+  }
+  .bars :global(.btrack) {
+    position: relative;
+    height: 1.35rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .bars :global(.bfill) {
+    position: absolute;
+    inset: 0 auto 0 0;
+    background: color-mix(in srgb, var(--indigo) 26%, transparent);
+    transition: width 0.35s var(--ease);
+  }
+  .bars :global(.brow.on .bfill) {
+    background: color-mix(in srgb, var(--madder) 30%, transparent);
+  }
+  .bars :global(.bnum) {
+    position: absolute;
+    left: 0.45rem;
+    top: 0;
+    line-height: 1.35rem;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+  }
+  .note {
+    margin: 0.6rem 0 0;
+    font-size: 0.78rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupL07Sharding() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l07-sharding"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const MiB = 1024 * 1024;
+      const ELEM = 4; // fp32
+
+      const BS = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
+      const DS = [256, 512, 1024, 2048, 4096];
+      const LS = [2, 4, 8, 16, 32];
+      const PS = [2, 4, 8];
+      const MS = [1, 2, 4, 8];
+
+      let tab: 'dp' | 'tp' | 'pp' = 'dp';
+
+      const gi = (k: string) => +$<HTMLInputElement>(`[data-k="${k}"]`).value;
+
+      const fmt = (b: number) => {
+        if (b >= 1024 * MiB) return (b / (1024 * MiB)).toFixed(2) + ' GiB';
+        if (b >= MiB) return (b / MiB).toFixed(1) + ' MiB';
+        if (b >= 1024) return (b / 1024).toFixed(1) + ' KiB';
+        return b + ' B';
+      };
+      const num = (n: number) => n.toLocaleString('en-US');
+
+      function mat(rows: number, cols: number, cls: (r: number, c: number) => string, label: (r: number, c: number) => string) {
+        const d = document.createElement('div');
+        d.className = 'mat';
+        d.style.gridTemplateColumns = `repeat(${cols}, minmax(1.6rem, 1fr))`;
+        for (let r = 0; r < rows; r++)
+          for (let cc = 0; cc < cols; cc++) {
+            const p = document.createElement('div');
+            p.className = 'piece ' + cls(r, cc);
+            p.textContent = label(r, cc);
+            d.append(p);
+          }
+        return d;
+      }
+
+      function unit(label: string, el: HTMLElement) {
+        const u = document.createElement('div');
+        u.className = 'unit';
+        const t = document.createElement('div');
+        t.className = 'ulabel';
+        t.textContent = label;
+        u.append(t, el);
+        return u;
+      }
+
+      function draw() {
+        const B = BS[gi('B')];
+        const D = DS[gi('D')];
+        const L = LS[gi('L')];
+        const P = PS[gi('P')];
+        const M = MS[gi('M')];
+
+        $('[data-o="B"]').textContent = String(B);
+        $('[data-o="D"]').textContent = String(D);
+        $('[data-o="L"]').textContent = String(L) + ' 层';
+        $('[data-o="P"]').textContent = String(P) + ' 张卡';
+        $('[data-o="M"]').textContent = String(M) + ' 个';
+        $('[data-mb]').hidden = tab !== 'pp';
+
+        const params = L * D * D; // 完整模型的参数个数
+        const paramBytes = params * ELEM;
+
+        // 每步跨卡通信量（前向 + 反向）
+        const dpComm = paramBytes * 2 * (P - 1); // 梯度 all-reduce，每步一次
+        const tpComm = 2 * L * B * D * ELEM * (P - 1); // 每层 all-gather + 反向 reduce-scatter
+        const ppComm = 2 * (P - 1) * B * D * ELEM; // 每个边界上所有微批加起来
+
+        const viz = $('[data-viz]');
+        viz.replaceChildren();
+        const table = $<HTMLTableElement>('[data-table]');
+        const thead = table.querySelector('thead')!;
+        const tbody = table.querySelector('tbody')!;
+        thead.replaceChildren();
+        tbody.replaceChildren();
+
+        const head = (cols: string[]) => {
+          const tr = document.createElement('tr');
+          for (const c of cols) {
+            const th = document.createElement('th');
+            th.textContent = c;
+            tr.append(th);
+          }
+          thead.append(tr);
+        };
+        const row = (cells: string[]) => {
+          const tr = document.createElement('tr');
+          cells.forEach((c, i) => {
+            const td = document.createElement('td');
+            if (i === 0) td.className = 'rk';
+            td.textContent = c;
+            tr.append(td);
+          });
+          tbody.append(tr);
+        };
+
+        let comm: Array<[string, string, boolean]> = [];
+
+        if (tab === 'dp') {
+          $('[data-desc]').textContent =
+            `分片策略：每个 rank 拿到数据的一个切片，参数完整复制。` +
+            `${B} 行数据切成 ${P} 块，每张卡 ${B / P} 行；每张卡都持有全部 ${num(params)} 个参数和自己的一份优化器状态。` +
+            `反向传播之后插一句 all-reduce 把梯度平均掉 —— 这是标准训练和 DDP 之间唯一的区别。`;
+          $('[data-viz-title]').textContent = '沿批维度切：数据被横着切开，参数在每张卡上各存一份完整的';
+          viz.append(
+            unit(`数据 ${B} × ${D}（按行切）`, mat(P, 1, (r) => 'r' + (r % 4), (r) => 'B' + r)),
+          );
+          for (let i = 0; i < P; i++) {
+            viz.append(
+              unit(`rank ${i} 的参数（每层 ${D}×${D}）`, mat(1, 1, () => 'r' + (i % 4), () => '全部')),
+            );
+          }
+          $('[data-legend]').textContent =
+            '每张卡的参数块都是完整的一整层 —— 这就是「复制」；只有数据被分片。';
+          head(['rank', '本地数据', '参数（每层）', '本地参数量', '本地激活值']);
+          for (let i = 0; i < P; i++)
+            row([
+              'rank ' + i,
+              `${B / P} × ${D}`,
+              `${D} × ${D}（完整）`,
+              num(params) + `（${fmt(paramBytes)}）`,
+              `${(B / P) * D * L} 个`,
+            ]);
+          comm = [
+            ['做什么', 'all-reduce 梯度（AVG）', true],
+            ['在哪里', '反向传播之后，参数更新之前', false],
+            ['多久一次', '每个训练步 1 次', false],
+            ['每步跨卡总量', fmt(dpComm) + `（= ${fmt(paramBytes)} × 2 × ${P - 1}）`, true],
+          ];
+        } else if (tab === 'tp') {
+          $('[data-desc]').textContent =
+            `分片策略：不切数据，切每一层的参数矩阵。每层的 ${D} × ${D} 沿列切成 ${P} 份，` +
+            `每张卡拿 ${D} × ${D / P}（这叫列张量并行）。每张卡算出 ${B} × ${D / P} 的激活值切片，` +
+            `然后 all-gather 拼回完整的 ${B} × ${D}，才能进下一层。反向对偶地做 reduce-scatter。`;
+          $('[data-viz-title]').textContent = '沿宽度维度切：每层的参数矩阵被竖着切开，数据每张卡都有一份完整的';
+          viz.append(unit(`数据 ${B} × ${D}（不切）`, mat(1, 1, () => 'r4', () => '全部')));
+          viz.append(
+            unit(
+              `每层参数 ${D} × ${D}（按列切）`,
+              mat(1, P, (_r, c) => 'r' + (c % 4), (_r, c) => 'W' + c),
+            ),
+          );
+          viz.append(
+            unit(
+              `每层的激活值 ${B} × ${D}`,
+              mat(1, P, (_r, c) => 'r' + (c % 4), (_r, c) => 'a' + c),
+            ),
+          );
+          $('[data-legend]').textContent =
+            '同色表示归同一张卡所有。激活值那一条就是每层都要 all-gather 凑齐的东西。';
+          head(['rank', '本地数据', '参数（每层）', '本地参数量', '本地算出的激活值']);
+          for (let i = 0; i < P; i++)
+            row([
+              'rank ' + i,
+              `${B} × ${D}（全部）`,
+              `${D} × ${D / P}（第 ${i} 段列）`,
+              num(params / P) + `（${fmt(paramBytes / P)}）`,
+              `${B} × ${D / P}`,
+            ]);
+          comm = [
+            ['做什么', '前向 all-gather 激活值 / 反向 reduce-scatter 梯度', true],
+            ['在哪里', '每一层算完之后，进下一层之前', false],
+            ['多久一次', `每步 ${L} 次（每层各一次），且都在关键路径上`, true],
+            [
+              '每步跨卡总量',
+              fmt(tpComm) + `（= 2 × ${L} 层 × ${fmt(B * D * ELEM)} × ${P - 1}）`,
+              false,
+            ],
+          ];
+        } else {
+          $('[data-desc]').textContent =
+            `分片策略：按深度切，每个 rank 拿 ${L / P} 层，但每层的维度是完整的。` +
+            `数据以微批的形式从第一张卡一路流到最后一张卡，用点对点的 send / recv 传激活值。` +
+            `批被切成 ${M} 个微批，每个 ${B / M} 行 —— 微批越小，流水线气泡越小。` +
+            `（课上这一节用的是 2 张卡、4 层、4 个微批。）`;
+          $('[data-viz-title]').textContent = '沿深度维度切：层被切成若干段，每段归一张卡';
+          viz.append(
+            unit(
+              `${L} 层，切成 ${P} 段`,
+              mat(P, 1, (r) => 'r' + (r % 4), (r) => `第 ${r * (L / P) + 1}–${(r + 1) * (L / P)} 层`),
+            ),
+          );
+          viz.append(
+            unit(
+              `数据 ${B} × ${D} 切成 ${M} 个微批`,
+              mat(M, 1, () => 'r4', (r) => 'm' + r),
+            ),
+          );
+          $('[data-legend]').textContent =
+            '每个微批依次经过 rank 0 → rank 1 → …，边界上用 dist.send / dist.recv 传激活值。';
+          head(['rank', '负责的层', '参数（每层）', '本地参数量', '每次收发的张量']);
+          for (let i = 0; i < P; i++)
+            row([
+              'rank ' + i,
+              `第 ${i * (L / P) + 1}–${(i + 1) * (L / P)} 层`,
+              `${D} × ${D}（完整）`,
+              num(params / P) + `（${fmt(paramBytes / P)}）`,
+              `${B / M} × ${D}（${fmt((B / M) * D * ELEM)}）`,
+            ]);
+          comm = [
+            ['做什么', 'dist.send / dist.recv 传激活值（点对点，不是集合通信）', true],
+            ['在哪里', `${P - 1} 个 rank 边界上`, false],
+            ['多久一次', `每步 ${(P - 1) * M} 次（每个边界 × 每个微批）`, false],
+            [
+              '每步跨卡总量',
+              fmt(ppComm) + `（= 2 × ${P - 1} 个边界 × ${fmt(B * D * ELEM)}，与微批数无关）`,
+              true,
+            ],
+          ];
+        }
+
+        const commEl = $('[data-comm]');
+        commEl.replaceChildren();
+        for (const [t, v, hot] of comm) {
+          const d = document.createElement('div');
+          d.className = 'cc' + (hot ? ' hot' : '');
+          const a = document.createElement('div');
+          a.className = 'ct';
+          a.textContent = t;
+          const b = document.createElement('div');
+          b.className = 'cv';
+          b.textContent = v;
+          d.append(a, b);
+          commEl.append(d);
+        }
+
+        // ── 三条对比柱 ──
+        const rows: Array<[string, number, string]> = [
+          ['数据并行', dpComm, 'dp'],
+          ['张量并行', tpComm, 'tp'],
+          ['流水线并行', ppComm, 'pp'],
+        ];
+        const mx = Math.max(...rows.map((r) => r[1]), 1);
+        const bars = $('[data-bars]');
+        bars.replaceChildren();
+        for (const [name, v, key] of rows) {
+          const r = document.createElement('div');
+          r.className = 'brow' + (key === tab ? ' on' : '');
+          const lab = document.createElement('span');
+          lab.textContent = name;
+          const track = document.createElement('div');
+          track.className = 'btrack';
+          const fill = document.createElement('div');
+          fill.className = 'bfill';
+          fill.style.width = Math.max((v / mx) * 100, 0.6) + '%';
+          const n = document.createElement('span');
+          n.className = 'bnum';
+          n.textContent = fmt(v);
+          track.append(fill, n);
+          r.append(lab, track);
+          bars.append(r);
+        }
+
+        $('[data-note]').textContent =
+          `注意两者的比例关系完全不同：数据并行的通信量正比于【参数量】L·D²（这里 ${fmt(paramBytes)}），` +
+          `和批大小无关；张量并行和流水线并行的通信量正比于【激活值】B·D，和参数量无关。` +
+          `所以把批大小从 ${B} 调大，张量并行的柱子会一路追上来 —— 而且它的次数是每层一次、` +
+          `全在关键路径上，这就是「张量并行只能放在 NVLink 域里做」的原因。` +
+          `流水线并行每步只在 ${P - 1} 个边界上收发，所以它能容忍慢得多的互联。`;
+      }
+
+      root.querySelectorAll<HTMLButtonElement>('[data-tab]').forEach((b) => {
+        b.addEventListener('click', () => {
+          tab = b.dataset.tab as 'dp' | 'tp' | 'pp';
+          root.querySelectorAll('[data-tab]').forEach((x) => x.classList.toggle('on', x === b));
+          draw();
+        });
+      });
+      root.querySelectorAll<HTMLInputElement>('[data-k]').forEach((el) => {
+        el.addEventListener('input', draw);
+      });
+
+      draw();
+    });
+  }
+
+  setupL07Sharding();
+  document.addEventListener('astro:page-load', setupL07Sharding);
+</script>

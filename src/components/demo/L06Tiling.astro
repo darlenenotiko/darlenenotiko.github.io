@@ -1,0 +1,547 @@
+---
+// 第 6 讲演示 3：分块（tiling）矩阵乘法。
+// 左边三张网格是 A（M×K）、B（K×N）、C（M×N），画的是 **tile**，不是元素。
+// 点 C 上任意一块选定输出 tile（对应 pid_m / pid_n），然后一步步走 k 循环：
+// 每一步把 A 的一个行 tile 和 B 的一个列 tile 读进 shared memory，做 tl.dot，累加。
+// 右边是三种做法的 HBM 读取量对账：朴素 2MNK、分块 MNK(1/BM + 1/BN)、理想化 MK + KN。
+---
+
+<div class="demo" data-demo="l06-tiling">
+  <div class="knobs">
+    <label>
+      M（A 的行数 = C 的行数）
+      <select data-k="M"></select>
+    </label>
+    <label>
+      N（B 的列数 = C 的列数）
+      <select data-k="N"></select>
+    </label>
+    <label>
+      K（A 的列数 = B 的行数）
+      <select data-k="K"></select>
+    </label>
+    <label>
+      BLOCK_M
+      <select data-k="BM"></select>
+    </label>
+    <label>
+      BLOCK_N
+      <select data-k="BN"></select>
+    </label>
+    <label>
+      BLOCK_K
+      <select data-k="BK"></select>
+    </label>
+  </div>
+
+  <div class="ctrl">
+    <button data-act="prev">← 上一步</button>
+    <button data-act="next">下一步 k →</button>
+    <button data-act="play">自动播放</button>
+    <button data-act="reset">回到 k = 0</button>
+    <span class="stat" data-stat></span>
+  </div>
+
+  <div class="stage" data-stage></div>
+
+  <p class="formula" data-formula></p>
+
+  <div class="block">
+    <h4>整个 C 算完，一共要从 HBM 读多少个元素</h4>
+    <div class="rows" data-rows></div>
+  </div>
+
+  <p class="note">
+    只数从 HBM 读 A 和 B 的元素个数（写 C 的 MN 次三种做法都一样，不影响比较）。
+    朴素做法对每个 <code>(m, n, k)</code> 各读一次 A 和一次 B，所以是 2MNK；
+    分块做法每个输出 tile 读 (K/BK)·(BM·BK + BK·BN) 个元素，乘上 (M/BM)·(N/BN) 个输出 tile，
+    化简正好是 MNK·(1/BN + 1/BM) —— <b>只和 BLOCK_M、BLOCK_N 有关，和 BLOCK_K 无关</b>。
+    理想化做法（A 和 B 整个装进 shared memory）是 MK + KN，装不下，只能当下界看。
+  </p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+
+  .knobs {
+    display: grid;
+    gap: 0.55rem;
+    grid-template-columns: repeat(3, 1fr);
+  }
+  @media (min-width: 640px) {
+    .knobs {
+      grid-template-columns: repeat(6, 1fr);
+    }
+  }
+  .knobs label {
+    display: block;
+    font-size: 0.72rem;
+    letter-spacing: 0.03em;
+    color: var(--ink-faint);
+  }
+  .knobs select {
+    display: block;
+    width: 100%;
+    margin-top: 0.22rem;
+    padding: 0.3rem 0.4rem;
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+  }
+  .knobs select:focus {
+    outline: none;
+    border-color: var(--indigo);
+  }
+
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.45rem;
+    margin-top: 1rem;
+  }
+  .ctrl button {
+    padding: 0.28rem 0.7rem;
+    font: inherit;
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .ctrl button:hover {
+    color: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .ctrl button.on {
+    color: var(--bg);
+    background: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .stat {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+  }
+
+  .stage {
+    margin-top: 1rem;
+    overflow-x: auto;
+  }
+  .stage :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 380px;
+    height: auto;
+  }
+  .stage :global(rect.cell) {
+    fill: none;
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .stage :global(line.gl) {
+    stroke: var(--rule);
+    stroke-width: 0.6;
+  }
+  .stage :global(rect.hotA) {
+    fill: color-mix(in srgb, var(--weld) 55%, transparent);
+    stroke: var(--weld);
+    stroke-width: 1.2;
+  }
+  .stage :global(rect.hotB) {
+    fill: color-mix(in srgb, var(--weld) 55%, transparent);
+    stroke: var(--weld);
+    stroke-width: 1.2;
+  }
+  .stage :global(rect.done) {
+    fill: color-mix(in srgb, var(--indigo) 22%, transparent);
+    stroke: var(--rule);
+    stroke-width: 0.7;
+  }
+  .stage :global(rect.out) {
+    fill: color-mix(in srgb, var(--madder) 45%, transparent);
+    stroke: var(--madder);
+    stroke-width: 1.4;
+  }
+  .stage :global(rect.pick) {
+    fill: transparent;
+    stroke: none;
+    cursor: pointer;
+  }
+  .stage :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 10px;
+  }
+  .stage :global(text.title) {
+    fill: var(--ink);
+    font-size: 11px;
+    font-weight: 700;
+  }
+  .stage :global(text.op) {
+    fill: var(--ink-muted);
+    font-size: 16px;
+  }
+
+  .formula {
+    margin: 1rem 0 0;
+    padding: 0.5rem 0.7rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.9;
+    white-space: pre-wrap;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    overflow-x: auto;
+  }
+
+  .block {
+    margin-top: 1.2rem;
+  }
+  .block h4 {
+    margin: 0 0 0.5rem;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+
+  .rows {
+    display: grid;
+    gap: 0.45rem;
+  }
+  .rows :global(.r) {
+    display: grid;
+    grid-template-columns: 5rem 1fr;
+    gap: 0.6rem;
+    align-items: center;
+    padding: 0.55rem 0.7rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 7px;
+  }
+  .rows :global(.name) {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--ink);
+  }
+  .rows :global(.bar) {
+    position: relative;
+    height: 22px;
+    background: color-mix(in srgb, var(--rule) 55%, transparent);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .rows :global(.bar i) {
+    position: absolute;
+    inset: 0 auto 0 0;
+    display: block;
+    transition: width 0.25s var(--ease);
+  }
+  .rows :global(.bar span) {
+    position: absolute;
+    top: 0;
+    left: 0.45rem;
+    line-height: 22px;
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .rows :global(.naive i) {
+    background: color-mix(in srgb, var(--madder) 55%, transparent);
+  }
+  .rows :global(.tiled i) {
+    background: color-mix(in srgb, var(--indigo) 55%, transparent);
+  }
+  .rows :global(.ideal i) {
+    background: color-mix(in srgb, var(--weld) 55%, transparent);
+  }
+
+  .note {
+    margin: 1rem 0 0;
+    font-size: 0.78rem;
+    line-height: 1.7;
+    color: var(--ink-faint);
+  }
+  .note code {
+    font-family: var(--font-mono);
+    color: var(--ink-muted);
+  }
+  .note :global(b) {
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupL06Tiling() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l06-tiling"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const sel = (k: string) => root.querySelector(`[data-k="${k}"]`) as HTMLSelectElement;
+      const g = (k: string) => Number(sel(k).value);
+
+      const DIMS = [128, 256, 512, 1024, 2048, 4096];
+      const BLKS = [16, 32, 64, 128];
+      const fill = (k: string, arr: number[], def: number) => {
+        const s = sel(k);
+        for (const v of arr) {
+          const o = document.createElement('option');
+          o.value = String(v);
+          o.textContent = String(v);
+          s.append(o);
+        }
+        s.value = String(def); // 显式设默认值，不靠 option.selected
+      };
+      fill('M', DIMS, 256);
+      fill('N', DIMS, 256);
+      fill('K', DIMS, 256);
+      fill('BM', BLKS, 64);
+      fill('BN', BLKS, 64);
+      fill('BK', BLKS, 32);
+
+      let pm = 0,
+        pn = 0,
+        kstep = 0,
+        timer: number | null = null;
+
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+      const big = (x: number) => {
+        if (x >= 1e9) return (x / 1e9).toFixed(2) + ' G';
+        if (x >= 1e6) return (x / 1e6).toFixed(2) + ' M';
+        if (x >= 1e3) return (x / 1e3).toFixed(1) + ' K';
+        return String(Math.round(x));
+      };
+
+      function draw() {
+        const M = g('M'),
+          N = g('N'),
+          K = g('K'),
+          BM = g('BM'),
+          BN = g('BN'),
+          BK = g('BK');
+        const tm = Math.ceil(M / BM),
+          tn = Math.ceil(N / BN),
+          tk = Math.ceil(K / BK);
+
+        pm = Math.min(pm, tm - 1);
+        pn = Math.min(pn, tn - 1);
+        kstep = Math.min(kstep, tk);
+
+        // ── 画三张 tile 网格 ──
+        const W = 700,
+          H = 240,
+          PAD = 8,
+          TOP = 26;
+        const boxW = (W - 2 * 26 - 4 * PAD) / 3; // 中间留两个符号位
+        const boxH = H - TOP - 26;
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+
+        type Grid = { x: number; rows: number; cols: number };
+        const gA: Grid = { x: PAD, rows: tm, cols: tk };
+        const gB: Grid = { x: PAD + boxW + 26 + PAD, rows: tk, cols: tn };
+        const gC: Grid = { x: PAD + 2 * (boxW + 26 + PAD), rows: tm, cols: tn };
+
+        const cw = (gr: Grid) => boxW / gr.cols;
+        const ch = (gr: Grid) => boxH / gr.rows;
+
+        // 只画外框 + 网格线（太密就不画线），高亮的部分用「整块矩形」画，
+        // 这样元素数是常数，切到 4096×4096 也不会卡
+        function grid(gr: Grid, label: string) {
+          svg.append(svgEl('text', { class: 'title', x: gr.x, y: 14 }, label));
+          svg.append(
+            svgEl('rect', { class: 'cell', x: gr.x, y: TOP, width: boxW, height: boxH }),
+          );
+          if (cw(gr) >= 3.5)
+            for (let c = 1; c < gr.cols; c++)
+              svg.append(
+                svgEl('line', {
+                  class: 'gl',
+                  x1: gr.x + c * cw(gr),
+                  y1: TOP,
+                  x2: gr.x + c * cw(gr),
+                  y2: TOP + boxH,
+                }),
+              );
+          if (ch(gr) >= 3.5)
+            for (let r = 1; r < gr.rows; r++)
+              svg.append(
+                svgEl('line', {
+                  class: 'gl',
+                  x1: gr.x,
+                  y1: TOP + r * ch(gr),
+                  x2: gr.x + boxW,
+                  y2: TOP + r * ch(gr),
+                }),
+              );
+        }
+        const band = (gr: Grid, cls: string, r0: number, c0: number, nr: number, nc: number) => {
+          if (nr <= 0 || nc <= 0) return;
+          svg.append(
+            svgEl('rect', {
+              class: cls,
+              x: gr.x + c0 * cw(gr),
+              y: TOP + r0 * ch(gr),
+              width: Math.max(nc * cw(gr), 1),
+              height: Math.max(nr * ch(gr), 1),
+            }),
+          );
+        };
+
+        grid(gA, `A  ${M}×${K}　tile ${tm}×${tk}`);
+        band(gA, 'done', pm, 0, 1, kstep); // 已经扫过的行 tile
+        band(gA, 'hotA', pm, kstep, 1, kstep < tk ? 1 : 0); // 当前这一块
+
+        grid(gB, `B  ${K}×${N}　tile ${tk}×${tn}`);
+        band(gB, 'done', 0, pn, kstep, 1);
+        band(gB, 'hotB', kstep, pn, kstep < tk ? 1 : 0, 1);
+
+        grid(gC, `C  ${M}×${N}　tile ${tm}×${tn}`);
+        band(gC, 'out', pm, pn, 1, 1);
+
+        // C 上一整块透明层，点哪儿就换哪个输出 tile
+        const hit = svgEl('rect', {
+          class: 'pick',
+          x: gC.x,
+          y: TOP,
+          width: boxW,
+          height: boxH,
+        });
+        hit.addEventListener('click', (ev) => {
+          const rect = (ev.currentTarget as SVGRectElement).getBoundingClientRect();
+          if (!rect.width || !rect.height) return; // 拿不到尺寸就别算，免得出 NaN
+          const e = ev as MouseEvent;
+          const fx = (e.clientX - rect.left) / rect.width;
+          const fy = (e.clientY - rect.top) / rect.height;
+          pn = Math.min(gC.cols - 1, Math.max(0, Math.floor(fx * gC.cols)));
+          pm = Math.min(gC.rows - 1, Math.max(0, Math.floor(fy * gC.rows)));
+          kstep = 0;
+          draw();
+        });
+        svg.append(hit);
+
+        svg.append(
+          svgEl('text', { class: 'op', x: gA.x + boxW + 13, y: TOP + boxH / 2, 'text-anchor': 'middle' }, '×'),
+        );
+        svg.append(
+          svgEl('text', { class: 'op', x: gB.x + boxW + 13, y: TOP + boxH / 2, 'text-anchor': 'middle' }, '='),
+        );
+        svg.append(
+          svgEl('text', { x: gC.x, y: H - 8 }, '点 C 上任意一块换输出 tile'),
+        );
+        $('[data-stage]').replaceChildren(svg);
+
+        // ── 状态 + 逐步说明 ──
+        const done = kstep >= tk;
+        $('[data-stat]').textContent = done
+          ? `pid_m=${pm}, pid_n=${pn} ｜ k 循环走完 ${tk} 步，写回 HBM`
+          : `pid_m=${pm}, pid_n=${pn} ｜ k = ${kstep * BK}（第 ${kstep + 1} / ${tk} 步）`;
+
+        const perStep = BM * BK + BK * BN;
+        $('[data-formula]').textContent = done
+          ? `这个 thread block 结束：\n` +
+            `  acc = tl.maximum(acc, 0.0)          # 顺手把 ReLU 融合进来，不额外读写 HBM\n` +
+            `  tl.store(c_ptrs, acc, mask=...)     # 把 ${BM}×${BN} = ${(BM * BN).toLocaleString('en-US')} 个结果写回 HBM\n` +
+            `整个 k 循环从 HBM 读了 ${tk} × (${BM}×${BK} + ${BK}×${BN}) = ${(tk * perStep).toLocaleString('en-US')} 个元素，\n` +
+            `而它算出了 ${(BM * BN).toLocaleString('en-US')} 个结果、做了 2×${BM}×${BN}×${K} = ${(2 * BM * BN * K).toLocaleString('en-US')} 次浮点运算。`
+          : `第 ${kstep + 1} 步（k = ${kstep * BK}）：\n` +
+            `  a = tl.load(a_ptrs, ...)   # 读 A 的 [${pm * BM}:${pm * BM + BM}, ${kstep * BK}:${kstep * BK + BK}] 这一块 → shared memory，${(BM * BK).toLocaleString('en-US')} 个元素\n` +
+            `  b = tl.load(b_ptrs, ...)   # 读 B 的 [${kstep * BK}:${kstep * BK + BK}, ${pn * BN}:${pn * BN + BN}] 这一块 → shared memory，${(BK * BN).toLocaleString('en-US')} 个元素\n` +
+            `  acc += tl.dot(a, b)        # ${BM}×${BK} 乘 ${BK}×${BN}，累加进 ${BM}×${BN} 的 acc（不碰 HBM）\n` +
+            `  a_ptrs += BLOCK_K * stride_ak   b_ptrs += BLOCK_K * stride_bk`;
+
+        // ── 三种做法的读取量对账 ──
+        const naive = 2 * M * N * K;
+        const tiled = tm * tn * tk * perStep;
+        const ideal = M * K + K * N;
+        const max = naive;
+
+        const mk = (name: string, cls: string, v: number, how: string) =>
+          `<div class="r ${cls}"><span class="name">${name}</span>` +
+          `<span class="bar"><i style="width:${Math.max((v / max) * 100, 0.4)}%"></i>` +
+          `<span>${big(v)} 个元素　${how}　相对朴素 ${((v / naive) * 100).toFixed(2)}%</span>` +
+          `</span></div>`;
+
+        $('[data-rows]').innerHTML =
+          mk('朴素', 'naive', naive, `2MNK = 2×${M}×${N}×${K}`) +
+          mk(
+            '分块',
+            'tiled',
+            tiled,
+            `${tm}×${tn}×${tk}×(${BM}×${BK}+${BK}×${BN}) = MNK(1/${BN}+1/${BM})`,
+          ) +
+          mk('理想化', 'ideal', ideal, `MK + KN = ${M}×${K} + ${K}×${N}（装不下，只是下界）`);
+      }
+
+      function step(d: number) {
+        const tk = Math.ceil(g('K') / g('BK'));
+        kstep = Math.max(0, Math.min(tk, kstep + d));
+        draw();
+      }
+
+      $('[data-act="next"]').addEventListener('click', () => step(1));
+      $('[data-act="prev"]').addEventListener('click', () => step(-1));
+      $('[data-act="reset"]').addEventListener('click', () => {
+        kstep = 0;
+        draw();
+      });
+      const playBtn = $<HTMLButtonElement>('[data-act="play"]');
+      playBtn.addEventListener('click', () => {
+        if (timer !== null) {
+          clearInterval(timer);
+          timer = null;
+          playBtn.classList.remove('on');
+          return;
+        }
+        playBtn.classList.add('on');
+        kstep = 0;
+        draw();
+        timer = window.setInterval(() => {
+          const tk = Math.ceil(g('K') / g('BK'));
+          if (kstep >= tk) {
+            kstep = 0;
+          } else {
+            kstep += 1;
+          }
+          draw();
+        }, 550);
+      });
+
+      root.querySelectorAll<HTMLSelectElement>('.knobs select').forEach((el) => {
+        el.addEventListener('change', () => {
+          kstep = 0;
+          pm = 0;
+          pn = 0;
+          draw();
+        });
+      });
+
+      draw();
+    });
+  }
+
+  setupL06Tiling();
+  document.addEventListener('astro:page-load', setupL06Tiling);
+</script>

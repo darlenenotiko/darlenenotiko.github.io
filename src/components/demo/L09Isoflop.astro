@@ -1,0 +1,658 @@
+---
+// Chinchilla 方法二：IsoFLOP 曲线。
+// 固定若干 FLOPs 预算 C，在每个预算内扫模型大小 N（数据量 D = C / 6N 被动跟着变），
+// 每条曲线拟合一条抛物线取谷底，再把所有谷底 (log C, log N*) 拿去做最小二乘直线拟合，
+// 得到 N_opt ∝ C^a，最后把这条直线外推到 Gopher 的预算 5.76e23 FLOPs。
+// 损失用 Hoffmann+ 2022 的参数化形式 L(N,D) = E + A/N^α + B/D^β 生成，
+// 拟合是真跑的最小二乘，没有写死任何结果。
+---
+
+<div class="demo" data-demo="l09-isoflop">
+  <div class="ctrl">
+    <label>每个点的噪声 σ <input type="range" data-noise min="0" max="0.06" step="0.002" value="0" /></label>
+    <span class="val" data-noise-v></span>
+    <button data-reseed>重新掷一次噪声</button>
+  </div>
+  <div class="ctrl">
+    <label>每条曲线扫几个模型 <input type="range" data-npts min="4" max="13" step="1" value="11" /></label>
+    <span class="val" data-npts-v></span>
+    <label><input type="checkbox" data-narrow /> 只用最小的 3 个预算来拟合</label>
+  </div>
+
+  <div class="two">
+    <div class="plot" data-plot-iso></div>
+    <div class="plot" data-plot-fit></div>
+  </div>
+
+  <p class="formula" data-formula></p>
+
+  <table class="out" data-out>
+    <thead>
+      <tr>
+        <th>FLOPs 预算 C</th><th>谷底 N*</th><th>D* = C/6N*</th><th>D*/N*</th><th>该点损失</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.5rem;
+  }
+  .ctrl label {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+  }
+  .ctrl input[type='range'] {
+    width: 160px;
+    accent-color: var(--indigo);
+  }
+  .ctrl input[type='checkbox'] {
+    accent-color: var(--madder);
+  }
+  .val {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--madder);
+    font-variant-numeric: tabular-nums;
+  }
+  .ctrl button {
+    padding: 0.26rem 0.65rem;
+    font: inherit;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .ctrl button:hover {
+    color: var(--indigo);
+    border-color: var(--indigo);
+  }
+
+  .two {
+    display: grid;
+    gap: 0.8rem;
+    margin-top: 0.8rem;
+  }
+  @media (min-width: 700px) {
+    .two {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  .plot {
+    overflow-x: auto;
+  }
+  .plot :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 300px;
+    height: auto;
+  }
+  .plot :global(.axis) {
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .plot :global(.grid) {
+    stroke: var(--rule);
+    stroke-width: 0.6;
+    stroke-dasharray: 2 3;
+  }
+  .plot :global(.iso) {
+    fill: none;
+    stroke: var(--indigo);
+    stroke-width: 1.4;
+  }
+  .plot :global(.isopt) {
+    fill: var(--indigo);
+  }
+  .plot :global(.minpt) {
+    fill: var(--madder);
+  }
+  .plot :global(.minlink) {
+    fill: none;
+    stroke: var(--madder);
+    stroke-width: 1.2;
+    stroke-dasharray: 3 3;
+  }
+  .plot :global(.fitline) {
+    fill: none;
+    stroke: var(--weld);
+    stroke-width: 2;
+  }
+  .plot :global(.fitline.extra) {
+    stroke-dasharray: 5 3;
+  }
+  .plot :global(.truth) {
+    fill: none;
+    stroke: var(--ink-faint);
+    stroke-width: 1;
+    stroke-dasharray: 2 3;
+  }
+  .plot :global(.target) {
+    stroke: var(--weld);
+    stroke-width: 0.8;
+    stroke-dasharray: 2 2;
+  }
+  .plot :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 9px;
+  }
+  .plot :global(text.title) {
+    fill: var(--indigo);
+    font-size: 10.5px;
+    font-weight: 700;
+  }
+  .plot :global(text.note) {
+    fill: var(--madder);
+    font-size: 9px;
+  }
+  .plot :global(text.gold) {
+    fill: var(--weld);
+    font-size: 9.5px;
+    font-weight: 700;
+  }
+
+  .formula {
+    margin: 0.9rem 0 0.2rem;
+    padding: 0.5rem 0.7rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.85;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+  }
+
+  .out {
+    width: 100%;
+    margin-top: 0.9rem;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+  }
+  .out :global(th) {
+    padding: 0.25rem 0.35rem;
+    text-align: right;
+    font-weight: 400;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(th:first-child) {
+    text-align: left;
+  }
+  .out :global(td) {
+    padding: 0.25rem 0.35rem;
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(td:first-child) {
+    text-align: left;
+  }
+  .out :global(tr.off td) {
+    color: var(--ink-faint);
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL09Isoflop() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l09-isoflop"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+
+      // ── 用来生成「实验数据」的真实损失曲面：Hoffmann+ 2022 的参数化拟合 ──
+      const E = 1.69,
+        A = 406.4,
+        B = 410.7,
+        AL = 0.34,
+        BE = 0.28;
+      const loss = (N: number, D: number) => E + A * Math.pow(N, -AL) + B * Math.pow(D, -BE);
+      // 解析最优：N* = k · C^(β/(α+β))
+      const TRUE_EXP = BE / (AL + BE);
+      const kOpt = Math.pow((AL * A) / (BE * B * Math.pow(6, BE)), 1 / (AL + BE));
+      const trueNstar = (C: number) => kOpt * Math.pow(C, TRUE_EXP);
+
+      const BUDGETS = [6e18, 1e19, 3e19, 1e20, 3e20, 1e21];
+      const TARGET = 5.76e23; // Gopher 的训练预算
+
+      // 简单的可复现伪随机数（每次点「重新掷」换一个种子）
+      let seed = 20260721;
+      function rng() {
+        seed = (seed * 1664525 + 1013904223) % 4294967296;
+        return seed / 4294967296;
+      }
+      function gauss() {
+        // Box–Muller
+        const u = Math.max(rng(), 1e-9),
+          v = rng();
+        return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+      }
+
+      // ── 最小二乘 ──
+      function fitQuad(xs: number[], ys: number[]) {
+        // 拟合 y = c0 + c1 x + c2 x^2，解 3×3 正规方程
+        const n = xs.length;
+        const S = (p: number) => xs.reduce((a, x) => a + Math.pow(x, p), 0);
+        const T = (p: number) => xs.reduce((a, x, i) => a + Math.pow(x, p) * ys[i], 0);
+        const M = [
+          [n, S(1), S(2), T(0)],
+          [S(1), S(2), S(3), T(1)],
+          [S(2), S(3), S(4), T(2)],
+        ];
+        // 高斯消元
+        for (let i = 0; i < 3; i++) {
+          let p = i;
+          for (let r = i + 1; r < 3; r++) if (Math.abs(M[r][i]) > Math.abs(M[p][i])) p = r;
+          [M[i], M[p]] = [M[p], M[i]];
+          if (Math.abs(M[i][i]) < 1e-14) return null;
+          for (let r = 0; r < 3; r++) {
+            if (r === i) continue;
+            const f = M[r][i] / M[i][i];
+            for (let c = i; c < 4; c++) M[r][c] -= f * M[i][c];
+          }
+        }
+        const c = [M[0][3] / M[0][0], M[1][3] / M[1][1], M[2][3] / M[2][2]];
+        return { c0: c[0], c1: c[1], c2: c[2] };
+      }
+
+      function fitLine(xs: number[], ys: number[]) {
+        const n = xs.length;
+        const mx = xs.reduce((a, b) => a + b, 0) / n;
+        const my = ys.reduce((a, b) => a + b, 0) / n;
+        let num = 0,
+          den = 0;
+        for (let i = 0; i < n; i++) {
+          num += (xs[i] - mx) * (ys[i] - my);
+          den += (xs[i] - mx) * (xs[i] - mx);
+        }
+        const slope = num / den;
+        return { slope, intercept: my - slope * mx };
+      }
+
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+
+      const fmtSci = (x: number, d = 2) => {
+        if (!isFinite(x) || x <= 0) return '—';
+        const e = Math.floor(Math.log10(x));
+        return `${(x / Math.pow(10, e)).toFixed(d)}e${e}`;
+      };
+      const fmtParam = (x: number) => {
+        if (x >= 1e12) return (x / 1e12).toFixed(2) + 'T';
+        if (x >= 1e9) return (x / 1e9).toFixed(2) + 'B';
+        if (x >= 1e6) return (x / 1e6).toFixed(0) + 'M';
+        return x.toFixed(0);
+      };
+
+      const W = 340,
+        H = 260,
+        ML = 44,
+        MR = 14,
+        MT = 24,
+        MB = 34;
+
+      function draw() {
+        const sigma = parseFloat($<HTMLInputElement>('[data-noise]').value);
+        const npts = parseInt($<HTMLInputElement>('[data-npts]').value, 10);
+        const narrow = $<HTMLInputElement>('[data-narrow]').checked;
+
+        $('[data-noise-v]').textContent = `σ = ${sigma.toFixed(3)}`;
+        $('[data-npts-v]').textContent = `${npts} 个`;
+
+        seed = curSeed; // 每次重画都从同一个种子开始，除非点了「重新掷」
+
+        // ── 生成每个预算的一条 IsoFLOP 曲线 ──
+        type Curve = {
+          C: number;
+          Ns: number[];
+          Ls: number[];
+          nStar: number | null;
+          lStar: number | null;
+        };
+        const curves: Curve[] = [];
+        for (const C of BUDGETS) {
+          const center = Math.log10(trueNstar(C));
+          const Ns: number[] = [];
+          const Ls: number[] = [];
+          for (let i = 0; i < npts; i++) {
+            const t = npts === 1 ? 0 : (i / (npts - 1)) * 2 - 1; // -1 … 1
+            const lx = center + t * 0.85; // 谷底两侧各扫约 7 倍
+            const N = Math.pow(10, lx);
+            const D = C / (6 * N);
+            Ns.push(N);
+            Ls.push(loss(N, D) + sigma * gauss());
+          }
+          const q = fitQuad(Ns.map(Math.log10), Ls);
+          let nStar: number | null = null,
+            lStar: number | null = null;
+          if (q && q.c2 > 0) {
+            const xs = -q.c1 / (2 * q.c2);
+            nStar = Math.pow(10, xs);
+            lStar = q.c0 + q.c1 * xs + q.c2 * xs * xs;
+          }
+          curves.push({ C, Ns, Ls, nStar, lStar });
+        }
+
+        const used = narrow ? curves.slice(0, 3) : curves;
+        const good = used.filter((c) => c.nStar !== null && isFinite(c.nStar!));
+        const fit =
+          good.length >= 2
+            ? fitLine(good.map((c) => Math.log10(c.C)), good.map((c) => Math.log10(c.nStar!)))
+            : null;
+
+        // ── 左图：IsoFLOP 曲线 ──
+        {
+          const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+          const allL = curves.flatMap((c) => c.Ls);
+          const Y0 = Math.min(...allL) - 0.06,
+            Y1 = Math.max(...allL) + 0.06;
+          const allX = curves.flatMap((c) => c.Ns.map(Math.log10));
+          const X0 = Math.min(...allX) - 0.1,
+            X1 = Math.max(...allX) + 0.1;
+          const px = (lx: number) => ML + ((lx - X0) / (X1 - X0)) * (W - ML - MR);
+          const py = (y: number) => H - MB - ((y - Y0) / (Y1 - Y0)) * (H - MT - MB);
+
+          for (let e = Math.ceil(X0); e <= Math.floor(X1); e++) {
+            const x = px(e);
+            svg.append(svgEl('line', { class: 'grid', x1: x, y1: MT, x2: x, y2: H - MB }));
+            svg.append(svgEl('text', { x, y: H - MB + 12, 'text-anchor': 'middle' }, `10^${e}`));
+          }
+          for (let i = 0; i <= 4; i++) {
+            const v = Y0 + ((Y1 - Y0) * i) / 4;
+            const y = py(v);
+            svg.append(svgEl('line', { class: 'grid', x1: ML, y1: y, x2: W - MR, y2: y }));
+            svg.append(svgEl('text', { x: ML - 4, y: y + 3, 'text-anchor': 'end' }, v.toFixed(2)));
+          }
+          svg.append(svgEl('line', { class: 'axis', x1: ML, y1: H - MB, x2: W - MR, y2: H - MB }));
+          svg.append(svgEl('line', { class: 'axis', x1: ML, y1: MT, x2: ML, y2: H - MB }));
+          svg.append(svgEl('text', { class: 'title', x: ML, y: 14 }, '每条曲线 = 一个固定的 FLOPs 预算'));
+          svg.append(
+            svgEl('text', { x: (ML + W - MR) / 2, y: H - 3, 'text-anchor': 'middle' }, '模型参数量 N（对数）'),
+          );
+          svg.append(
+            svgEl(
+              'text',
+              {
+                x: 9,
+                y: (MT + H - MB) / 2,
+                'text-anchor': 'middle',
+                transform: `rotate(-90 9 ${(MT + H - MB) / 2})`,
+              },
+              '最终损失',
+            ),
+          );
+
+          curves.forEach((c, i) => {
+            const op = 0.35 + (0.65 * i) / (curves.length - 1);
+            svg.append(
+              svgEl('polyline', {
+                class: 'iso',
+                'stroke-opacity': op.toFixed(2),
+                points: c.Ns.map((N, k) => `${px(Math.log10(N))},${py(c.Ls[k])}`).join(' '),
+              }),
+            );
+            c.Ns.forEach((N, k) => {
+              svg.append(
+                svgEl('circle', {
+                  class: 'isopt',
+                  'fill-opacity': op.toFixed(2),
+                  cx: px(Math.log10(N)),
+                  cy: py(c.Ls[k]),
+                  r: 2,
+                }),
+              );
+            });
+            svg.append(
+              svgEl(
+                'text',
+                { x: px(Math.log10(c.Ns[0])) - 2, y: py(c.Ls[0]) - 3, 'text-anchor': 'end' },
+                fmtSci(c.C, 0),
+              ),
+            );
+          });
+
+          // 把所有谷底连起来
+          const mins = curves.filter((c) => c.nStar !== null);
+          svg.append(
+            svgEl('polyline', {
+              class: 'minlink',
+              points: mins.map((c) => `${px(Math.log10(c.nStar!))},${py(c.lStar!)}`).join(' '),
+            }),
+          );
+          mins.forEach((c) => {
+            svg.append(
+              svgEl('circle', { class: 'minpt', cx: px(Math.log10(c.nStar!)), cy: py(c.lStar!), r: 3.2 }),
+            );
+          });
+          svg.append(svgEl('text', { class: 'note', x: W - MR - 2, y: MT + 10, 'text-anchor': 'end' }, '红点 = 抛物线拟合的谷底'));
+          $('[data-plot-iso]').replaceChildren(svg);
+        }
+
+        // ── 右图：log N* 对 log C 的拟合与外推 ──
+        {
+          const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+          const X0 = 18,
+            X1 = 24.2; // log10 C
+          const Y0 = 7.5,
+            Y1 = 11.6; // log10 N
+          const px = (lx: number) => ML + ((lx - X0) / (X1 - X0)) * (W - ML - MR);
+          const py = (ly: number) => H - MB - ((ly - Y0) / (Y1 - Y0)) * (H - MT - MB);
+
+          for (let e = 18; e <= 24; e += 2) {
+            const x = px(e);
+            svg.append(svgEl('line', { class: 'grid', x1: x, y1: MT, x2: x, y2: H - MB }));
+            svg.append(svgEl('text', { x, y: H - MB + 12, 'text-anchor': 'middle' }, `10^${e}`));
+          }
+          for (let e = 8; e <= 11; e++) {
+            const y = py(e);
+            svg.append(svgEl('line', { class: 'grid', x1: ML, y1: y, x2: W - MR, y2: y }));
+            svg.append(svgEl('text', { x: ML - 4, y: y + 3, 'text-anchor': 'end' }, `10^${e}`));
+          }
+          svg.append(svgEl('line', { class: 'axis', x1: ML, y1: H - MB, x2: W - MR, y2: H - MB }));
+          svg.append(svgEl('line', { class: 'axis', x1: ML, y1: MT, x2: ML, y2: H - MB }));
+          svg.append(svgEl('text', { class: 'title', x: ML, y: 14 }, '把谷底连起来，再外推到大预算'));
+          svg.append(
+            svgEl('text', { x: (ML + W - MR) / 2, y: H - 3, 'text-anchor': 'middle' }, 'FLOPs 预算 C（对数）'),
+          );
+          svg.append(
+            svgEl(
+              'text',
+              {
+                x: 9,
+                y: (MT + H - MB) / 2,
+                'text-anchor': 'middle',
+                transform: `rotate(-90 9 ${(MT + H - MB) / 2})`,
+              },
+              '最优 N*（对数）',
+            ),
+          );
+
+          // 真值曲线（灰虚线）
+          const tp: string[] = [];
+          for (let lx = X0; lx <= X1; lx += 0.2) {
+            tp.push(`${px(lx)},${py(Math.log10(trueNstar(Math.pow(10, lx))))}`);
+          }
+          svg.append(svgEl('polyline', { class: 'truth', points: tp.join(' ') }));
+
+          // 目标预算竖线
+          svg.append(
+            svgEl('line', {
+              class: 'target',
+              x1: px(Math.log10(TARGET)),
+              y1: MT,
+              x2: px(Math.log10(TARGET)),
+              y2: H - MB,
+            }),
+          );
+
+          if (fit) {
+            const lxA = Math.min(...good.map((c) => Math.log10(c.C)));
+            const lxB = Math.max(...good.map((c) => Math.log10(c.C)));
+            svg.append(
+              svgEl('polyline', {
+                class: 'fitline',
+                points: [
+                  `${px(lxA)},${py(fit.intercept + fit.slope * lxA)}`,
+                  `${px(lxB)},${py(fit.intercept + fit.slope * lxB)}`,
+                ].join(' '),
+              }),
+            );
+            svg.append(
+              svgEl('polyline', {
+                class: 'fitline extra',
+                points: [
+                  `${px(lxB)},${py(fit.intercept + fit.slope * lxB)}`,
+                  `${px(X1)},${py(fit.intercept + fit.slope * X1)}`,
+                ].join(' '),
+              }),
+            );
+            const lyPred = fit.intercept + fit.slope * Math.log10(TARGET);
+            svg.append(
+              svgEl('circle', {
+                class: 'minpt',
+                cx: px(Math.log10(TARGET)),
+                cy: py(Math.min(Math.max(lyPred, Y0), Y1)),
+                r: 3.5,
+              }),
+            );
+            svg.append(
+              svgEl(
+                'text',
+                { class: 'gold', x: px(Math.log10(TARGET)) - 4, y: py(Math.min(Math.max(lyPred, Y0), Y1)) - 6, 'text-anchor': 'end' },
+                `外推 ${fmtParam(Math.pow(10, lyPred))}`,
+              ),
+            );
+          }
+
+          curves.forEach((c) => {
+            if (c.nStar === null) return;
+            const isUsed = used.includes(c);
+            svg.append(
+              svgEl('circle', {
+                class: 'minpt',
+                'fill-opacity': isUsed ? '1' : '0.28',
+                cx: px(Math.log10(c.C)),
+                cy: py(Math.log10(c.nStar)),
+                r: 3,
+              }),
+            );
+          });
+          $('[data-plot-fit]').replaceChildren(svg);
+        }
+
+        // ── 文字输出 ──
+        const predAtTarget = fit ? Math.pow(10, fit.intercept + fit.slope * Math.log10(TARGET)) : NaN;
+        const truthAtTarget = trueNstar(TARGET);
+
+        $('[data-formula]').textContent =
+          `第 1 步  固定 C，扫 N；每个 N 对应的数据量由 C = 6ND 定死：D = C / (6N)\n` +
+          `第 2 步  对每条曲线做最小二乘二次拟合  L ≈ c₀ + c₁·log₁₀N + c₂·(log₁₀N)²，谷底在 log₁₀N* = -c₁ / (2c₂)\n` +
+          `第 3 步  对所有谷底做最小二乘直线拟合  log₁₀N* = a·log₁₀C + b\n` +
+          (fit
+            ? `　　　　拟合结果 a = ${fit.slope.toFixed(4)}，b = ${fit.intercept.toFixed(4)}　（生成数据用的真值 a = ${TRUE_EXP.toFixed(4)}）\n`
+            : '　　　　点太少，拟合不出来\n') +
+          `第 4 步  外推到 Gopher 的预算 C = 5.76e23 FLOPs：` +
+          (fit
+            ? `预测 N* = ${fmtParam(predAtTarget)}，真值 ${fmtParam(truthAtTarget)}，差 ${(
+                (predAtTarget / truthAtTarget - 1) *
+                100
+              ).toFixed(1)}%`
+            : '—');
+
+        const tb = $('[data-out] tbody');
+        tb.replaceChildren();
+        for (const c of curves) {
+          const tr = document.createElement('tr');
+          if (!used.includes(c)) tr.className = 'off';
+          const N = c.nStar;
+          const D = N ? c.C / (6 * N) : NaN;
+          const cells = [
+            fmtSci(c.C, 2),
+            N ? fmtParam(N) : '—',
+            N ? fmtParam(D) : '—',
+            N ? (D / N).toFixed(1) : '—',
+            c.lStar !== null ? c.lStar.toFixed(4) : '—',
+          ];
+          cells.forEach((t) => {
+            const td = document.createElement('td');
+            td.textContent = t;
+            tr.append(td);
+          });
+          tb.append(tr);
+        }
+
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        if (fit) {
+          const err = Math.abs(predAtTarget / truthAtTarget - 1) * 100;
+          const s = document.createElement('strong');
+          s.textContent = `a = ${fit.slope.toFixed(3)}`;
+          v.append(
+            document.createTextNode('拟合出来的指数 '),
+            s,
+            document.createTextNode(
+              `：模型大小随算力预算按 N* 正比于 C 的 ${fit.slope.toFixed(3)} 次方增长。` +
+                `把噪声 σ 拖到 0.02 以上再看右图 —— 谷底会开始乱跳，斜率跟着变，` +
+                `而外推到 5.76e23 这个量级时误差被放大成 ${err.toFixed(0)}%。` +
+                `再勾上「只用最小的 3 个预算」，你会看到拟合区间越窄，外推越不可信 —— ` +
+                `这就是「点乱飞的时候，不该对自己的外推有任何信心」的具体含义。`,
+            ),
+          );
+        }
+      }
+
+      let curSeed = 20260721;
+      $('[data-reseed]').addEventListener('click', () => {
+        curSeed = Math.floor(Math.random() * 4294967296);
+        draw();
+      });
+      root.querySelectorAll('input').forEach((el) => el.addEventListener('input', draw));
+
+      draw();
+    });
+  }
+
+  setupL09Isoflop();
+  document.addEventListener('astro:page-load', setupL09Isoflop);
+</script>

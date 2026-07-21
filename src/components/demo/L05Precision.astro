@@ -1,0 +1,495 @@
+---
+// CS336 第 5 讲：低精度数字格式 + 屋顶线判定。
+// 上半：六种浮点格式的位分布、可表示范围，以及「同一段计算换个精度，算术强度怎么变」。
+//       工作负载选逐元素 ReLU 或 N×N 方阵矩阵乘，右边直接判定内存受限 / 算力受限。
+// 下半：MX 系列的分块缩放因子 —— 为什么转置一个 MXFP8 矩阵不再是免费的。
+---
+
+<div class="demo" data-demo="l05-precision">
+  <div class="ctrl">
+    <span class="tag">格式</span>
+    <button data-fmt="fp32">FP32</button>
+    <button data-fmt="fp16">FP16</button>
+    <button data-fmt="bf16" class="on">BF16</button>
+    <button data-fmt="e4m3">FP8 E4M3</button>
+    <button data-fmt="e5m2">FP8 E5M2</button>
+    <button data-fmt="e2m1">FP4 E2M1</button>
+  </div>
+
+  <div class="bits" data-bits></div>
+  <p class="note" data-fmtnote></p>
+
+  <hr />
+
+  <div class="ctrl">
+    <span class="tag">工作负载</span>
+    <button data-wl="relu" class="on">逐元素 ReLU</button>
+    <button data-wl="matmul">N×N 方阵矩阵乘</button>
+    <span class="tag">硬件</span>
+    <select data-hw>
+      <option value="a100">A100 SXM 80GB</option>
+      <option value="h100" selected>H100 SXM</option>
+      <option value="b200">B200</option>
+    </select>
+  </div>
+
+  <div class="ctrl" data-nrow>
+    <label class="sld">
+      N = <span data-nval>4096</span>
+      <input type="range" data-n min="128" max="8192" step="128" value="4096" />
+    </label>
+  </div>
+
+  <div class="two">
+    <table class="out"><tbody data-out></tbody></table>
+    <div class="verdictbox">
+      <p class="verdict" data-verdict></p>
+      <p class="note" data-explain></p>
+    </div>
+  </div>
+
+  <hr />
+
+  <h4>MX 分块缩放：为什么转置忽然变贵了</h4>
+  <div class="ctrl">
+    <label class="chk"><input type="checkbox" data-transpose /> 把矩阵转置</label>
+    <span class="note">同色格子 = 共用一个缩放因子的一组元素（这里画成 8 个一组；MXFP8 实际是 32 个一组）。</span>
+  </div>
+  <div class="mxwrap">
+    <div class="mx" data-mx></div>
+  </div>
+  <p class="note" data-mxnote></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.45rem 0.8rem;
+    margin-bottom: 0.7rem;
+  }
+  .tag {
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .ctrl button {
+    padding: 0.26rem 0.66rem;
+    font: inherit;
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .ctrl button.on {
+    color: var(--bg);
+    background: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .ctrl select {
+    padding: 0.24rem 0.4rem;
+    font: inherit;
+    font-size: 0.8rem;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+  }
+  .chk,
+  .sld {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.82rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .chk input {
+    accent-color: var(--indigo);
+  }
+  .sld input[type='range'] {
+    width: 180px;
+    accent-color: var(--indigo);
+  }
+  .note {
+    margin: 0.5rem 0 0;
+    font-size: 0.79rem;
+    line-height: 1.7;
+    color: var(--ink-faint);
+  }
+
+  .bits {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+    margin: 0.8rem 0 0;
+  }
+  .bits :global(.b) {
+    width: 1.35rem;
+    height: 1.5rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-size: 0.68rem;
+    color: var(--bg);
+    border-radius: 3px;
+  }
+  .bits :global(.b.s) {
+    background: var(--indigo);
+  }
+  .bits :global(.b.e) {
+    background: var(--madder);
+  }
+  .bits :global(.b.m) {
+    background: var(--weld);
+  }
+
+  hr {
+    margin: 1.3rem 0 1rem;
+    border: none;
+    border-top: 1px solid var(--rule);
+  }
+  h4 {
+    margin: 0 0 0.7rem;
+    font-size: 0.82rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+
+  .two {
+    display: grid;
+    grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+    gap: 1rem;
+    align-items: start;
+  }
+  @media (max-width: 640px) {
+    .two {
+      grid-template-columns: 1fr;
+    }
+  }
+  table.out {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+    font-variant-numeric: tabular-nums;
+  }
+  table.out :global(td) {
+    padding: 0.24rem 0.4rem;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-muted);
+    font-family: var(--font-mono);
+  }
+  table.out :global(td.k) {
+    font-family: inherit;
+    color: var(--ink-faint);
+    white-space: nowrap;
+  }
+  .verdictbox {
+    padding: 0.7rem 0.85rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .verdict {
+    margin: 0;
+    font-size: 0.9rem;
+    font-weight: 700;
+    line-height: 1.6;
+    color: var(--ink);
+  }
+
+  .mxwrap {
+    overflow-x: auto;
+  }
+  .mx {
+    display: grid;
+    grid-template-columns: repeat(8, 2rem);
+    gap: 2px;
+    width: max-content;
+  }
+  .mx :global(.c) {
+    width: 2rem;
+    height: 1.6rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-size: 0.6rem;
+    color: var(--ink);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+  }
+</style>
+
+<script>
+  function setupL05Precision() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l05-precision"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+
+      // 六种格式：符号位 1 位固定，e = 指数位，m = 尾数位，bytes = 每个元素占多少字节
+      // maxv / minv 是该格式能表示的最大 / 最小正规值（都按 IEEE / OCP 规则算好写死）
+      type Fmt = {
+        name: string;
+        e: number;
+        m: number;
+        bytes: number;
+        maxv: string;
+        minv: string;
+        note: string;
+      };
+      const FMT: Record<string, Fmt> = {
+        fp32: {
+          name: 'FP32',
+          e: 8,
+          m: 23,
+          bytes: 4,
+          maxv: '3.40e38',
+          minv: '1.18e-38',
+          note: '老老实实的单精度。训练里现在基本只用来存主权重和做累加，不用来搬数据。',
+        },
+        fp16: {
+          name: 'FP16',
+          e: 5,
+          m: 10,
+          bytes: 2,
+          maxv: '65504',
+          minv: '6.10e-5',
+          note: '尾数多但指数少，最大只能到 65504 —— 梯度一大就溢出，所以要配损失缩放。',
+        },
+        bf16: {
+          name: 'BF16',
+          e: 8,
+          m: 7,
+          bytes: 2,
+          maxv: '3.39e38',
+          minv: '1.18e-38',
+          note: '指数位和 FP32 一样多，尾数砍到 7 位。范围不变、精度变粗 —— 这正是训练想要的取舍，所以 16 位这一档大家几乎都用它。',
+        },
+        e4m3: {
+          name: 'FP8 E4M3',
+          e: 4,
+          m: 3,
+          bytes: 1,
+          maxv: '448',
+          minv: '0.015625',
+          note: '4 位指数 + 3 位尾数。尾数相对多，用来存激活和权重；只有 448 的动态范围，必须靠缩放因子把数值拉回可表示区间。',
+        },
+        e5m2: {
+          name: 'FP8 E5M2',
+          e: 5,
+          m: 2,
+          bytes: 1,
+          maxv: '57344',
+          minv: '6.10e-5',
+          note: '5 位指数 + 2 位尾数。范围大、精度更粗，一般用在梯度那一侧。到了 8 位就没有「一种格式打天下」这回事了。',
+        },
+        e2m1: {
+          name: 'FP4 E2M1',
+          e: 2,
+          m: 1,
+          bytes: 0.5,
+          maxv: '6',
+          minv: '1（次正规到 0.5）',
+          note: '整个格式一共只能表示 16 个数：0、±0.5、±1、±1.5、±2、±3、±4、±6。一个元素半个字节。',
+        },
+      };
+
+      // 硬件：峰值算力按稠密（非结构化稀疏）张量核数字，带宽是 HBM 带宽
+      const HW: Record<string, { name: string; bw: number; peak: Record<string, number> }> = {
+        a100: {
+          name: 'A100 SXM 80GB',
+          bw: 2.039e12,
+          peak: { fp32: 19.5e12, fp16: 312e12, bf16: 312e12 },
+        },
+        h100: {
+          name: 'H100 SXM',
+          bw: 3.35e12,
+          peak: { fp32: 67e12, fp16: 989.5e12, bf16: 989.5e12, e4m3: 1979e12, e5m2: 1979e12 },
+        },
+        b200: {
+          name: 'B200',
+          bw: 8e12,
+          peak: {
+            fp32: 75e12,
+            fp16: 2250e12,
+            bf16: 2250e12,
+            e4m3: 4500e12,
+            e5m2: 4500e12,
+            e2m1: 9000e12,
+          },
+        },
+      };
+
+      let fmt = 'bf16';
+      let wl = 'relu';
+
+      const fnum = (x: number) => {
+        if (x >= 1e12) return (x / 1e12).toFixed(2) + ' × 10¹²';
+        if (x >= 1e9) return (x / 1e9).toFixed(2) + ' × 10⁹';
+        if (x >= 1e6) return (x / 1e6).toFixed(2) + ' × 10⁶';
+        return x.toLocaleString('en-US');
+      };
+
+      function drawBits() {
+        const f = FMT[fmt];
+        const box = $('[data-bits]');
+        box.replaceChildren();
+        const mk = (cls: string, label: string) => {
+          const d = document.createElement('span');
+          d.className = 'b ' + cls;
+          d.textContent = label;
+          box.append(d);
+        };
+        mk('s', 'S');
+        for (let i = 0; i < f.e; i++) mk('e', 'E');
+        for (let i = 0; i < f.m; i++) mk('m', 'M');
+        $('[data-fmtnote]').textContent =
+          `${f.name}：1 位符号 + ${f.e} 位指数 + ${f.m} 位尾数 = ${1 + f.e + f.m} 位，` +
+          `每个元素 ${f.bytes} 字节。最大正规值 ${f.maxv}，最小正规值 ${f.minv}。${f.note}`;
+      }
+
+      function compute() {
+        const f = FMT[fmt];
+        const hw = HW[$<HTMLSelectElement>('[data-hw]').value];
+        const n = parseInt($<HTMLInputElement>('[data-n]').value, 10);
+        $('[data-nrow]').style.display = wl === 'matmul' ? 'flex' : 'none';
+        $('[data-nval]').textContent = String(n);
+
+        let flops: number, bytes: number, desc: string, formula: string;
+        if (wl === 'relu') {
+          // 一个元素：读 1 次、写 1 次，做 1 次比较（算 1 FLOP）
+          flops = 1;
+          bytes = 2 * f.bytes;
+          desc = '每个元素';
+          formula = `读 1 个元素 + 写 1 个元素 = ${2 * f.bytes} 字节，做 1 次 max 比较 = 1 FLOP`;
+        } else {
+          // N×N 乘 N×N：2N³ 次浮点运算，最理想情况下只读两个输入、写一个输出
+          flops = 2 * n ** 3;
+          bytes = 3 * n * n * f.bytes;
+          desc = `N = ${n}`;
+          formula = `2N³ = ${fnum(2 * n ** 3)} FLOPs，最理想只搬 3N² 个元素 = ${fnum(3 * n * n * f.bytes)} 字节`;
+        }
+        const ai = flops / bytes;
+        const peak = hw.peak[fmt];
+        const ridge = peak ? peak / hw.bw : null;
+
+        const rows: [string, string][] = [
+          ['规模', desc],
+          ['怎么算的', formula],
+          ['算术强度', `${ai < 1 ? ai.toFixed(4) : ai.toFixed(1)} FLOP/字节`],
+          ['硬件', `${hw.name}，带宽 ${(hw.bw / 1e12).toFixed(2)} TB/s`],
+          [
+            '该精度峰值算力',
+            peak ? `${(peak / 1e12).toFixed(1)} TFLOP/s` : '该硬件不支持这个格式',
+          ],
+          [
+            '机器平衡点',
+            ridge ? `${ridge.toFixed(1)} FLOP/字节（= 峰值算力 ÷ 带宽）` : '—',
+          ],
+        ];
+        const tb = $('[data-out]');
+        tb.replaceChildren();
+        for (const [k, v] of rows) {
+          const tr = document.createElement('tr');
+          const a = document.createElement('td');
+          a.className = 'k';
+          a.textContent = k;
+          const b = document.createElement('td');
+          b.textContent = v;
+          tr.append(a, b);
+          tb.append(tr);
+        }
+
+        if (!ridge) {
+          $('[data-verdict]').textContent = `${hw.name} 没有 ${f.name} 的张量核`;
+          $('[data-explain]').textContent =
+            '换一个这块卡支持的格式再看。低精度的算力收益是硬件里烧进电路的，软件层面模拟没有意义。';
+          return;
+        }
+        const bound = ai < ridge;
+        const achieved = Math.min(peak, ai * hw.bw);
+        $('[data-verdict]').textContent = bound
+          ? `内存受限：${ai < 1 ? ai.toFixed(4) : ai.toFixed(1)} < ${ridge.toFixed(1)}`
+          : `算力受限：${ai.toFixed(1)} ≥ ${ridge.toFixed(1)}`;
+        $('[data-explain]').textContent = bound
+          ? `算术强度低于机器平衡点，计算单元喂不饱。实际能跑出的速度约 ${(achieved / 1e12).toFixed(1)} TFLOP/s，` +
+            `只有峰值的 ${((achieved / peak) * 100).toFixed(2)}%。想往上走只有一条路：减少搬运的字节数。`
+          : `算术强度已经越过机器平衡点，理论上能吃满 ${(peak / 1e12).toFixed(1)} TFLOP/s。` +
+            `注意这里假设输入只从全局内存读一次 —— 真做到这一点靠的正是分块（tiling）。`;
+      }
+
+      function drawMx() {
+        const t = $<HTMLInputElement>('[data-transpose]').checked;
+        const grid = $('[data-mx]');
+        grid.replaceChildren();
+        const COLORS = ['--indigo', '--madder', '--weld', '--ink-faint'];
+        // 8×8 矩阵，行主序线性地址 idx = r*8 + c，每 8 个连续地址共用一个缩放因子
+        for (let r = 0; r < 8; r++) {
+          for (let c = 0; c < 8; c++) {
+            // 转置后显示的是 A^T[r][c] = A[c][r]，它在原矩阵里的线性地址是 c*8+r
+            const src = t ? c * 8 + r : r * 8 + c;
+            const g = Math.floor(src / 8); // 第几组（共用同一个缩放因子）
+            const d = document.createElement('span');
+            d.className = 'c';
+            d.style.background = `color-mix(in srgb, var(${COLORS[g % 4]}) ${g < 4 ? 22 : 40}%, transparent)`;
+            d.textContent = String(g);
+            grid.append(d);
+          }
+        }
+        $('[data-mxnote]').textContent = t
+          ? '转置之后，同一组（同色、同编号）的 8 个元素不再是内存里连续的一条 —— 它们散成了一列。' +
+            '缩放因子是按「内存里连续 32 个元素」定义的，所以转置后的矩阵必须重新分组、重新求缩放因子、重新量化。' +
+            '实际实现的办法很直接：训练时把每个量化矩阵存两份，原始的一份和转置的一份，要哪份就取哪份。'
+          : '未转置：每一行正好是一组，同一组的元素在内存里是连续的 8 个地址，共用一个缩放因子。' +
+            '勾上「转置」看会发生什么。';
+      }
+
+      function all() {
+        drawBits();
+        compute();
+        drawMx();
+      }
+
+      root.querySelectorAll<HTMLButtonElement>('[data-fmt]').forEach((b) =>
+        b.addEventListener('click', () => {
+          root.querySelectorAll('[data-fmt]').forEach((x) => x.classList.remove('on'));
+          b.classList.add('on');
+          fmt = b.dataset.fmt!;
+          all();
+        }),
+      );
+      root.querySelectorAll<HTMLButtonElement>('[data-wl]').forEach((b) =>
+        b.addEventListener('click', () => {
+          root.querySelectorAll('[data-wl]').forEach((x) => x.classList.remove('on'));
+          b.classList.add('on');
+          wl = b.dataset.wl!;
+          compute();
+        }),
+      );
+      $<HTMLSelectElement>('[data-hw]').addEventListener('change', compute);
+      $<HTMLInputElement>('[data-n]').addEventListener('input', compute);
+      $<HTMLInputElement>('[data-transpose]').addEventListener('change', drawMx);
+
+      all();
+    });
+  }
+
+  setupL05Precision();
+  document.addEventListener('astro:page-load', setupL05Precision);
+</script>

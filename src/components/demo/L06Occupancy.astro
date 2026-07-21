@@ -1,0 +1,377 @@
+---
+// 第 6 讲演示 4：两个「占用率」——
+//   上半：warp occupancy。寄存器用量怎么把能同时驻留的 warp 数压下去。
+//         默认就是课上的算例：128 线程/块 × 160 寄存器/线程 → 3 块 → 12 warp → 18.75%。
+//   下半：block occupancy / 波次量化（wave quantization）。
+//         默认也是课上的数：B200 有 148 个 SM，起 160 个 thread block → 148 + 12。
+---
+
+<div class="demo" data-demo="l06-occupancy">
+  <div class="block">
+    <h4>其一：warp occupancy —— 寄存器把线程挤掉</h4>
+
+    <div class="knobs">
+      <label>
+        每块线程数 <code data-out="T"></code>
+        <input type="range" data-k="T" min="1" max="10" step="1" value="4" />
+      </label>
+      <label>
+        每线程寄存器数 <code data-out="R"></code>
+        <input type="range" data-k="R" min="16" max="255" step="1" value="160" />
+      </label>
+      <label>
+        SM 寄存器总数
+        <select data-k="MAXREG">
+          <option value="65536" selected>65536（B200 / H100 / A100）</option>
+          <option value="32768">32768</option>
+        </select>
+      </label>
+      <label>
+        SM 最多驻留 warp 数
+        <select data-k="MAXWARP">
+          <option value="64" selected>64</option>
+          <option value="48">48</option>
+        </select>
+      </label>
+    </div>
+
+    <p class="formula" data-f1></p>
+
+    <div class="meter">
+      <div class="track"><i data-bar1></i></div>
+      <span class="pct" data-pct1></span>
+    </div>
+
+    <p class="verdict" data-v1></p>
+  </div>
+
+  <div class="block">
+    <h4>其二：block occupancy —— 最后一波没填满</h4>
+
+    <div class="knobs">
+      <label>
+        起了多少个 thread block <code data-out="B"></code>
+        <input type="range" data-k="B" min="1" max="600" step="1" value="160" />
+      </label>
+      <label>
+        SM 个数
+        <select data-k="SM">
+          <option value="148" selected>148（B200）</option>
+          <option value="132">132（H100）</option>
+          <option value="108">108（A100）</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="waves" data-waves></div>
+
+    <p class="formula" data-f2></p>
+    <p class="verdict" data-v2></p>
+  </div>
+
+  <p class="note">
+    这里假设一个 SM 上同时只跑一波、每块占一个 SM，是课上那个「分波」模型的简化版；
+    真实调度器会在块结束时立刻补新块上去，尾巴不会像图里这么整齐。
+    但结论是一样的：<b>块数不是 SM 数的整数倍时，最后一波会让一部分 SM 闲着。</b>
+  </p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+
+  .block + .block {
+    margin-top: 1.6rem;
+    padding-top: 1.3rem;
+    border-top: 1px solid var(--rule);
+  }
+  .block h4 {
+    margin: 0 0 0.7rem;
+    font-size: 0.8rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--ink);
+  }
+
+  .knobs {
+    display: grid;
+    gap: 0.55rem;
+    grid-template-columns: 1fr 1fr;
+  }
+  @media (min-width: 640px) {
+    .knobs {
+      grid-template-columns: repeat(4, 1fr);
+    }
+  }
+  .knobs label {
+    display: block;
+    font-size: 0.73rem;
+    letter-spacing: 0.03em;
+    color: var(--ink-faint);
+  }
+  .knobs code {
+    font-family: var(--font-mono);
+    color: var(--indigo);
+  }
+  .knobs input,
+  .knobs select {
+    display: block;
+    width: 100%;
+    margin-top: 0.22rem;
+    padding: 0.3rem 0.4rem;
+    font: inherit;
+    font-family: var(--font-mono);
+    font-size: 0.82rem;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+  }
+  .knobs input[type='range'] {
+    padding: 0;
+    background: transparent;
+    border: none;
+    accent-color: var(--indigo);
+  }
+  .knobs select:focus {
+    outline: none;
+    border-color: var(--indigo);
+  }
+
+  .formula {
+    margin: 0.9rem 0 0;
+    padding: 0.5rem 0.7rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.9;
+    white-space: pre-wrap;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    overflow-x: auto;
+  }
+
+  .meter {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-top: 0.8rem;
+  }
+  .track {
+    position: relative;
+    flex: 1;
+    height: 20px;
+    background: color-mix(in srgb, var(--rule) 55%, transparent);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+  .track i {
+    position: absolute;
+    inset: 0 auto 0 0;
+    display: block;
+    background: color-mix(in srgb, var(--indigo) 60%, transparent);
+    transition: width 0.25s var(--ease);
+  }
+  .pct {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--madder);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .waves {
+    margin-top: 0.9rem;
+    overflow-x: auto;
+  }
+  .waves :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 320px;
+    height: auto;
+  }
+  .waves :global(rect.slot) {
+    fill: color-mix(in srgb, var(--indigo) 45%, transparent);
+  }
+  .waves :global(rect.idle) {
+    fill: none;
+    stroke: var(--madder);
+    stroke-width: 0.8;
+    stroke-dasharray: 2 2;
+  }
+  .waves :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 9px;
+  }
+
+  .verdict {
+    margin: 0.8rem 0 0;
+    font-size: 0.84rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(b) {
+    color: var(--madder);
+  }
+
+  .note {
+    margin: 1.2rem 0 0;
+    font-size: 0.78rem;
+    line-height: 1.7;
+    color: var(--ink-faint);
+  }
+  .note :global(b) {
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupL06Occ() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l06-occupancy"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const g = (k: string) =>
+        Number((root.querySelector(`[data-k="${k}"]`) as HTMLInputElement).value);
+
+      // 每块线程数走 2 的幂：32…16384（滑块 1..10 → 32·2^(i-1)）
+      const TVALS = [32, 64, 96, 128, 192, 256, 384, 512, 768, 1024];
+
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+
+      function part1() {
+        const T = TVALS[g('T') - 1];
+        const R = g('R');
+        const MAXREG = g('MAXREG');
+        const MAXWARP = g('MAXWARP');
+
+        $('[data-out="T"]').textContent = String(T);
+        $('[data-out="R"]').textContent = String(R);
+
+        const rpb = T * R;
+        const blocks = Math.floor(MAXREG / rpb);
+        const warps = (blocks * T) / 32;
+        const occ = Math.min(warps / MAXWARP, 1);
+
+        $('[data-f1]').textContent =
+          `assert ${R} <= 255                                  # 硬件上限：每线程最多 255 个寄存器\n` +
+          `每块用的寄存器 = ${T} × ${R} = ${rpb.toLocaleString('en-US')}\n` +
+          `同时能驻留的块数 = ${MAXREG.toLocaleString('en-US')} // ${rpb.toLocaleString('en-US')} = ${blocks}   # 被寄存器卡住\n` +
+          `对应的 warp 数 = ${blocks} × ${T} / 32 = ${warps}\n` +
+          `occupancy = ${warps} / ${MAXWARP} = ${(occ * 100).toFixed(2)}%`;
+
+        $<HTMLElement>('[data-bar1]').style.width = `${occ * 100}%`;
+        $('[data-pct1]').textContent = `${(occ * 100).toFixed(1)}%`;
+
+        const v = $('[data-v1]');
+        if (blocks === 0) {
+          v.innerHTML = `<b>一个块都放不下</b>：${T} × ${R} 已经超过一个 SM 的寄存器总量，这个 kernel 根本起不来。`;
+        } else if (occ < 0.35) {
+          v.innerHTML =
+            `occupancy <b>${(occ * 100).toFixed(1)}%</b> —— SM 上只驻留了 ${warps} 个 warp，` +
+            `离上限 ${MAXWARP} 差很远。warp 少意味着<b>没多少别的 warp 可以在等 HBM 时顶上来</b>，` +
+            `延迟藏不住。但这不一定是坏事：如果每个线程干的活足够多（thread coarsening），低 occupancy 也可以很快。`;
+        } else {
+          v.innerHTML =
+            `occupancy <b>${(occ * 100).toFixed(1)}%</b> —— 驻留 ${warps} 个 warp。` +
+            `warp 多，一个 warp 卡在 HBM 读上时 SM 有别的 warp 可以立刻切过去，延迟被藏起来了。`;
+        }
+      }
+
+      function part2() {
+        const B = g('B');
+        const SM = g('SM');
+        $('[data-out="B"]').textContent = String(B);
+
+        const waves = Math.ceil(B / SM);
+        const tail = B - (waves - 1) * SM;
+        const overall = B / (waves * SM);
+
+        // 画波次
+        const W = 640,
+          GAP = 10,
+          H = 92;
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+        const showWaves = Math.min(waves, 6);
+        const bw = (W - (showWaves - 1) * GAP) / showWaves;
+        const rows = 8; // 每波画 8 行槽位，纯示意
+        const cols = Math.ceil(SM / rows);
+        for (let w = 0; w < showWaves; w++) {
+          const x0 = w * (bw + GAP);
+          const filled = w === waves - 1 ? tail : SM;
+          const cwid = bw / cols,
+            chei = 60 / rows;
+          for (let i = 0; i < SM; i++) {
+            const r = i % rows,
+              c = Math.floor(i / rows);
+            svg.append(
+              svgEl('rect', {
+                class: i < filled ? 'slot' : 'idle',
+                x: x0 + c * cwid + 0.4,
+                y: 14 + r * chei + 0.4,
+                width: Math.max(cwid - 0.8, 0.5),
+                height: Math.max(chei - 0.8, 0.5),
+              }),
+            );
+          }
+          svg.append(
+            svgEl(
+              'text',
+              { x: x0 + bw / 2, y: 88, 'text-anchor': 'middle' },
+              waves > showWaves && w === showWaves - 1
+                ? `…共 ${waves} 波`
+                : `第 ${w + 1} 波：${filled} / ${SM}`,
+            ),
+          );
+        }
+        svg.append(svgEl('text', { x: 0, y: 8 }, `时间 →　每个小格 = 一个 SM`));
+        $('[data-waves]').replaceChildren(svg);
+
+        $('[data-f2]').textContent =
+          `波数 = ceil(${B} / ${SM}) = ${waves}\n` +
+          `最后一波只有 ${tail} 个 block，剩下 ${SM - tail} 个 SM 空着\n` +
+          `整体 SM 利用率 = ${B} / (${waves} × ${SM}) = ${(overall * 100).toFixed(1)}%`;
+
+        const best = waves * SM;
+        const v = $('[data-v2]');
+        if (tail === SM) {
+          v.innerHTML = `${B} 正好是 ${SM} 的整数倍，<b>每一波都填满</b>，没有波次量化损失。`;
+        } else {
+          v.innerHTML =
+            `尾波只填了 <b>${((tail / SM) * 100).toFixed(1)}%</b>，整机在这 ${waves} 波里的平均利用率是 ` +
+            `<b>${(overall * 100).toFixed(1)}%</b>。` +
+            `把 block 数调成 ${best}（或者调 BLOCK_SIZE 让块数正好是 ${SM} 的倍数），` +
+            `同样的 ${waves} 波就能多算 ${best - B} 个 block 的活 —— 时间一点没多花。`;
+        }
+      }
+
+      function draw() {
+        part1();
+        part2();
+      }
+
+      root.querySelectorAll<HTMLElement>('input, select').forEach((el) => {
+        el.addEventListener('input', draw);
+        el.addEventListener('change', draw);
+      });
+
+      draw();
+    });
+  }
+
+  setupL06Occ();
+  document.addEventListener('astro:page-load', setupL06Occ);
+</script>
