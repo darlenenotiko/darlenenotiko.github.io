@@ -76,6 +76,14 @@
     gap: 1.2rem;
     align-items: start;
   }
+  /* 网格项默认 min-width: auto，会被内容的 min-content 顶住不肯收缩：
+     右边那格里的统计表在窄屏下本该自己横向滚动（global.css 的 @media 640px
+     把 [data-demo] table 改成了 overflow-x:auto 的滚动容器），但 min-width:auto
+     让它先把格子撑到 374px，超出 demo 内容框 296px，整页于是横向溢出 23px。
+     允许收缩之后表格才真的滚起来。和 L12Contamination 里是同一个坑。 */
+  .two > * {
+    min-width: 0;
+  }
   @media (min-width: 700px) {
     .two {
       grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);

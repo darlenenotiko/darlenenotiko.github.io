@@ -84,6 +84,11 @@
     gap: 1.2rem;
     align-items: start;
   }
+  /* 同 L03AttentionMask：网格项默认 min-width: auto，会被统计表的 min-content
+     顶住不肯收缩，表格因此不肯启用自己的横向滚动，把整页撑出 2px。 */
+  .two > * {
+    min-width: 0;
+  }
   @media (min-width: 860px) {
     .two {
       grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr);
