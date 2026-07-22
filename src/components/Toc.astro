@@ -1,7 +1,7 @@
 ---
 // 文章目录。两种形态，由 .page 的容器查询切换（见 global.css 的 .note-layout）：
 //   窄屏 —— 正文上方的一张卡片（原来的样子）
-//   宽屏 —— 正文左侧的常驻栏，随页面滚动吸顶
+//   宽屏 —— 正文左侧的常驻栏，随页面滚动吸顶，并跟踪「现在读到哪儿了」
 // 布局（grid 分栏、sticky 的定位）在 global.css 里，这里只管目录自己长什么样。
 import type { MarkdownHeading } from 'astro';
 
@@ -21,13 +21,19 @@ const items = headings.filter((h) => h.depth <= 3);
     <aside class="toc-rail">
       <nav class="toc" aria-label="目录" data-reveal>
         <span class="toc-title">目录</span>
-        <ul>
-          {items.map((h) => (
-            <li data-depth={h.depth}>
-              <a href={`#${h.slug}`}>{h.text}</a>
-            </li>
-          ))}
-        </ul>
+        <div class="toc-body">
+          {/* 滑块必须写在模板里而不是 JS 里创建：Astro 的 scoped 样式靠给
+              模板元素加 data-astro-* 属性生效，运行时插进来的元素没这个属性，
+              下面那一堆 .toc-marker 样式一条都不会命中。 */}
+          <span class="toc-marker" aria-hidden="true" />
+          <ul>
+            {items.map((h) => (
+              <li data-depth={h.depth}>
+                <a href={`#${h.slug}`}>{h.text}</a>
+              </li>
+            ))}
+          </ul>
+        </div>
       </nav>
     </aside>
   )
@@ -49,6 +55,9 @@ const items = headings.filter((h) => h.depth <= 3);
     color: var(--ink-faint);
     text-transform: uppercase;
   }
+  .toc-body {
+    position: relative;
+  }
   .toc ul {
     margin: 0.6rem 0 0;
     padding: 0;
@@ -68,10 +77,17 @@ const items = headings.filter((h) => h.depth <= 3);
   .toc a:hover {
     color: var(--accent);
   }
+  /* 卡片形态不做「读到哪儿了」的跟踪 —— 目录就在正文正上方，
+     滚下去以后根本看不见，点亮了也没人看。滑块因此默认不存在。 */
+  .toc-marker {
+    display: none;
+  }
 
   /* ── 宽屏：左侧常驻栏 ───────────────────────────────────────
      阈值与 .note-layout 分栏的阈值必须是同一个值，否则会出现
-     「已经分栏了但目录还是卡片」这种中间态。改一个记得改另一个。 */
+     「已经分栏了但目录还是卡片」这种中间态。改一个记得改另一个。
+     JS 也靠这条规则判断当前是不是栏形态（读 position 是否为 sticky），
+     所以这里的 position: sticky 同时是布局和特性开关，别改成别的实现。 */
   @container (min-width: 900px) {
     .toc {
       position: sticky;
@@ -83,14 +99,41 @@ const items = headings.filter((h) => h.depth <= 3);
       overflow-y: auto;
       overscroll-behavior: contain;
       scrollbar-width: thin;
+      scrollbar-color: var(--rule) transparent;
       margin: 0;
-      /* 卡片的底色和圆角在这里是噪音，换成一条竖线把它和正文分开 */
-      padding: 0 1rem 0 0;
+      /* 卡片的底色和圆角在这里是噪音；分隔靠的是与正文之间 3.5rem 的空当 */
+      padding: 0 0.6rem 0 0;
       background: none;
       border-radius: 0;
-      border-right: 1px solid var(--rule);
       font-size: 0.84rem;
       line-height: 1.5;
+
+      /* 上下渐隐：提示「上面/下面还有」。--fade-t / --fade-b 由 JS 按滚动位置
+         给到 0 或 26px。用 mask 而不是覆一层渐变，是因为 .toc 自己就是滚动容器，
+         贴在它里面的绝对定位层会跟着内容一起滚走。 */
+      --fade-t: 0px;
+      --fade-b: 0px;
+      mask-image: linear-gradient(
+        to bottom,
+        transparent 0,
+        #000 var(--fade-t),
+        #000 calc(100% - var(--fade-b)),
+        transparent 100%
+      );
+      transition: mask-image 0.2s linear;
+    }
+    .toc-title {
+      display: block;
+      padding-left: 0.95rem;
+      margin-bottom: 0.2rem;
+    }
+    /* 滑块的滑轨 */
+    .toc-body {
+      border-left: 1px solid var(--rule);
+      padding-left: 0.95rem;
+    }
+    .toc ul {
+      margin: 0;
     }
     .toc li {
       padding: 0.3rem 0;
@@ -98,11 +141,251 @@ const items = headings.filter((h) => h.depth <= 3);
     .toc li[data-depth='3'] {
       padding-left: 0.9rem;
       font-size: 0.8rem;
-      color: var(--ink-faint);
     }
     .toc a {
       display: block;
       text-wrap: pretty;
+      transition: color 0.2s var(--ease), transform 0.2s var(--ease);
+    }
+    .toc a:hover {
+      transform: translateX(2px);
+    }
+    .toc li[data-depth='3'] a {
+      color: var(--ink-faint);
+    }
+
+    /* 当前所在的那一条 */
+    .toc a.is-active {
+      color: var(--accent);
+      font-weight: 500;
+    }
+    /* 当前 h3 所属的那个 h2：比正常亮、比 active 淡，用来交代「在哪一章」 */
+    .toc a.is-section {
+      color: var(--ink);
+    }
+
+    /* 沿滑轨滑动的那一小段。位置和高度由 JS 写在 style 上。 */
+    .toc-marker {
+      display: block;
+      position: absolute;
+      left: -1px;
+      top: 0;
+      width: 2px;
+      height: 0;
+      border-radius: 1px;
+      background: var(--accent);
+      opacity: 0;
+      transition: transform 0.28s var(--ease), height 0.28s var(--ease),
+        opacity 0.2s var(--ease);
+      will-change: transform;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .toc-marker,
+    .toc a {
+      transition: none;
+    }
+    .toc a:hover {
+      transform: none;
     }
   }
 </style>
+
+<script>
+  // 「我读到哪儿了」：把正文里当前那个标题在左侧目录里点亮。
+  //
+  // 判定用的是缓存下来的标题绝对位置 + 滚动事件，而不是 IntersectionObserver：
+  // 讲义里一节能有好几屏长，用 IO 的话「视口里没有任何标题」是常态，
+  // 那时候 IO 不发事件，高亮就卡在上一个不动了。缓存位置则永远能算出
+  // 「最后一个已经越过判定线的标题」。
+  const HEADER = 60; // 站点头高度，与 global.css 的 scroll-margin-top 对应
+  const LINE = HEADER + 24; // 判定线：视口顶部往下这么多像素
+
+  const reduced = matchMedia('(prefers-reduced-motion: reduce)');
+
+  function initToc() {
+    const toc = document.querySelector<HTMLElement>('.toc');
+    const article = document.querySelector<HTMLElement>('.prose');
+    const marker = toc?.querySelector<HTMLElement>('.toc-marker');
+    const body = toc?.querySelector<HTMLElement>('.toc-body');
+    if (!toc || !article || !marker || !body) return null;
+
+    const links = Array.from(toc.querySelectorAll<HTMLAnchorElement>('a[href^="#"]'));
+    const byId = new Map<string, HTMLAnchorElement>();
+    for (const a of links) byId.set(decodeURIComponent(a.hash.slice(1)), a);
+
+    // 每个 h3 条目挂到它上面最近的那个 h2 条目
+    const sectionOf = new Map<HTMLAnchorElement, HTMLAnchorElement>();
+    let lastH2: HTMLAnchorElement | null = null;
+    for (const a of links) {
+      const depth = (a.parentElement as HTMLElement).dataset.depth;
+      if (depth === '2') lastH2 = a;
+      else if (lastH2) sectionOf.set(a, lastH2);
+    }
+
+    // 栏形态才做跟踪。用 computedStyle 反查容器查询的结果 ——
+    // 容器查询没法从 JS 直接 match，但 position 是否 sticky 是它唯一的产物。
+    const isRail = () => getComputedStyle(toc).position === 'sticky';
+
+    let heads: { id: string; top: number }[] = [];
+    const measure = () => {
+      heads = Array.from(article.querySelectorAll<HTMLElement>('h2[id], h3[id]'))
+        .filter((h) => byId.has(h.id))
+        .map((h) => ({ id: h.id, top: h.getBoundingClientRect().top + window.scrollY }));
+    };
+
+    const moveMarker = (a: HTMLAnchorElement | null) => {
+      if (!a || !isRail()) {
+        marker.style.opacity = '0';
+        return;
+      }
+      const li = a.parentElement as HTMLElement;
+      // 用 rect 之差而不是 offsetTop：offsetTop 依赖 offsetParent 是谁，
+      // 而 .toc 只有在栏形态下才是 positioned，卡片形态下会算到别处去。
+      const top = li.getBoundingClientRect().top - body.getBoundingClientRect().top;
+      marker.style.height = `${li.offsetHeight}px`;
+      marker.style.transform = `translateY(${top}px)`;
+      marker.style.opacity = '1';
+    };
+
+    // 目录自己也会滚（40~60 条装不下一屏），当前条跑出可视范围时把它带回来
+    const revealInRail = (a: HTMLAnchorElement) => {
+      if (!isRail() || toc.scrollHeight <= toc.clientHeight + 1) return;
+      const li = a.parentElement as HTMLElement;
+      const top = li.getBoundingClientRect().top - toc.getBoundingClientRect().top + toc.scrollTop;
+      const pad = 56;
+      let next = toc.scrollTop;
+      if (top < toc.scrollTop + pad) next = top - pad;
+      else if (top + li.offsetHeight > toc.scrollTop + toc.clientHeight - pad)
+        next = top + li.offsetHeight - toc.clientHeight + pad;
+      if (Math.abs(next - toc.scrollTop) < 1) return;
+      toc.scrollTo({ top: next, behavior: reduced.matches ? 'auto' : 'smooth' });
+    };
+
+    let active: string | null = null;
+    const setActive = (id: string | null) => {
+      if (id === active) return;
+      active = id;
+      for (const a of links) a.classList.remove('is-active', 'is-section');
+      const a = id ? byId.get(id) : undefined;
+      if (!a) {
+        moveMarker(null);
+        return;
+      }
+      a.classList.add('is-active');
+      sectionOf.get(a)?.classList.add('is-section');
+      moveMarker(a);
+      revealInRail(a);
+    };
+
+    const updateFade = () => {
+      const up = toc.scrollTop > 4;
+      const down = toc.scrollTop + toc.clientHeight < toc.scrollHeight - 4;
+      toc.style.setProperty('--fade-t', up ? '26px' : '0px');
+      toc.style.setProperty('--fade-b', down ? '26px' : '0px');
+    };
+
+    // 当前滚动位置对应哪个标题
+    const compute = (): string | null => {
+      if (!heads.length) return null;
+      // 已经滚到底时，最后一节未必越过判定线，但读者显然在看它
+      if (window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 2)
+        return heads[heads.length - 1].id;
+      const line = window.scrollY + LINE;
+      let i = 0;
+      while (i < heads.length && heads[i].top <= line + 1) i++;
+      return i === 0 ? null : heads[i - 1].id;
+    };
+
+    // 点了目录里的一条之后，平滑滚动要飞一会儿。这期间必须钉住目标，
+    // 否则一路上会依次划过中间十几节，高亮疯狂跳。
+    //
+    // 钉住的解除条件是「算出来的当前项已经等于目标」——也就是真的到了；
+    // 不能用定时器：滚 4000px 和滚 200px 花的时间差很多，写死多少都是错的
+    // （试过 800ms，长距离跳转到一半就松开了，跳一路）。
+    // scrollend 和兜底定时器只是防止目标永远到不了时卡死。
+    let pending: string | null = null;
+    let pendingTimer = 0;
+    const clearPending = () => {
+      pending = null;
+      clearTimeout(pendingTimer);
+    };
+
+    const update = () => {
+      updateFade();
+      if (!heads.length) return;
+      const now = compute();
+      if (pending) {
+        if (now !== pending) return;
+        clearPending();
+      }
+      setActive(now);
+    };
+
+    let ticking = false;
+    const onScroll = () => {
+      if (ticking) return;
+      ticking = true;
+      requestAnimationFrame(() => {
+        ticking = false;
+        update();
+      });
+    };
+
+    const onClick = (e: Event) => {
+      const a = e.currentTarget as HTMLAnchorElement;
+      pending = decodeURIComponent(a.hash.slice(1));
+      setActive(pending);
+      clearTimeout(pendingTimer);
+      pendingTimer = window.setTimeout(clearPending, 3000);
+    };
+    for (const a of links) a.addEventListener('click', onClick);
+    window.addEventListener('scrollend', clearPending);
+
+    // 图片是 loading="lazy" 的，加载后正文变高，缓存的标题位置全部作废。
+    // 监听正文尺寸变化比监听 load 事件省心，顺便把折叠块展开之类也覆盖了。
+    const ro = new ResizeObserver(() => {
+      measure();
+      update();
+      moveMarker(active ? byId.get(active) ?? null : null);
+    });
+    ro.observe(article);
+
+    const onResize = () => {
+      measure();
+      update();
+      moveMarker(active ? byId.get(active) ?? null : null);
+    };
+
+    window.addEventListener('scroll', onScroll, { passive: true });
+    window.addEventListener('resize', onResize);
+    toc.addEventListener('scroll', updateFade, { passive: true });
+
+    measure();
+    update();
+
+    return () => {
+      ro.disconnect();
+      clearPending();
+      window.removeEventListener('scroll', onScroll);
+      window.removeEventListener('resize', onResize);
+      window.removeEventListener('scrollend', clearPending);
+      toc.removeEventListener('scroll', updateFade);
+      for (const a of links) a.removeEventListener('click', onClick);
+    };
+  }
+
+  // ClientRouter 换页时 DOM 整个被替换，挂在 window 上的监听会指着已经死掉的
+  // 节点继续跑 —— 必须先拆再装。
+  let teardown: (() => void) | null = null;
+  const boot = () => {
+    teardown?.();
+    teardown = initToc();
+  };
+  document.addEventListener('astro:page-load', boot);
+  document.addEventListener('astro:before-swap', () => {
+    teardown?.();
+    teardown = null;
+  });
+</script>
