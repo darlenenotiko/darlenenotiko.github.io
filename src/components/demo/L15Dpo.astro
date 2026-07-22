@@ -1,0 +1,278 @@
+---
+// DPO 的损失和梯度：隐含奖励差 = β × (胜者的对数比 − 败者的对数比)，
+// 损失 = −log σ(奖励差)，而梯度前面的权重恰好是 σ(−奖励差) ——
+// 「隐含奖励模型判断得越离谱，这一步迈得越大」。
+---
+
+<div class="demo" data-demo="l15-dpo">
+  <div class="ctrl">
+    <label
+      >β <input type="range" data-beta min="2" max="100" step="1" value="30" />
+      <span data-beta-v class="num"></span></label
+    >
+  </div>
+  <div class="ctrl">
+    <label
+      >胜者 y<sub>w</sub> 的对数比 <input type="range" data-dw min="-100" max="100" step="2" value="20" />
+      <span data-dw-v class="num"></span></label
+    >
+    <label
+      >败者 y<sub>l</sub> 的对数比 <input type="range" data-dl min="-100" max="100" step="2" value="-10" />
+      <span data-dl-v class="num"></span></label
+    >
+  </div>
+
+  <div class="plot" data-plot></div>
+
+  <table class="out" data-out><tbody></tbody></table>
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1.4rem;
+    margin-bottom: 0.55rem;
+  }
+  .ctrl label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+  }
+  .ctrl input[type='range'] {
+    width: 150px;
+    accent-color: var(--indigo);
+  }
+  .num {
+    display: inline-block;
+    min-width: 3.6em;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 0.78rem;
+    color: var(--ink);
+  }
+
+  .plot {
+    overflow-x: auto;
+  }
+  .plot :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 440px;
+    height: auto;
+  }
+  .plot :global(.curve) {
+    fill: none;
+    stroke: var(--indigo);
+    stroke-width: 1.8;
+  }
+  .plot :global(.curve.w) {
+    stroke: var(--madder);
+  }
+  .plot :global(.axis) {
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .plot :global(.mark) {
+    stroke: var(--madder);
+    stroke-width: 1;
+    stroke-dasharray: 3 3;
+  }
+  .plot :global(.dot) {
+    fill: var(--madder);
+  }
+  .plot :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 9px;
+  }
+  .plot :global(text.title) {
+    fill: var(--indigo);
+    font-size: 10px;
+    font-weight: 700;
+  }
+
+  .out {
+    width: 100%;
+    margin-top: 0.9rem;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+  }
+  .out :global(td) {
+    padding: 0.28rem 0.35rem;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-muted);
+  }
+  .out :global(td.v) {
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    white-space: nowrap;
+  }
+  .out :global(tr.hi td) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL15Dpo() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l15-dpo"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+      const sig = (z: number) => 1 / (1 + Math.exp(-z));
+
+      function draw() {
+        const beta = +$<HTMLInputElement>('[data-beta]').value / 100; // 0.01 ~ 1.00
+        const dw = +$<HTMLInputElement>('[data-dw]').value / 10; // -4.0 ~ 4.0
+        const dl = +$<HTMLInputElement>('[data-dl]').value / 10;
+
+        $('[data-beta-v]').textContent = beta.toFixed(2);
+        $('[data-dw-v]').textContent = dw.toFixed(1);
+        $('[data-dl-v]').textContent = dl.toFixed(1);
+
+        const rw = beta * dw;
+        const rl = beta * dl;
+        const m = rw - rl; // 隐含奖励差
+        const p = sig(m); // 隐含奖励模型给「y_w 获胜」的概率
+        const loss = -Math.log(Math.max(p, 1e-12));
+        const wgt = sig(-m); // 梯度前面的权重
+
+        // ── 两块小图：左 = 损失 vs 奖励差，右 = 梯度权重 vs 奖励差 ──
+        const W = 640,
+          H = 190,
+          PW = 292,
+          MT = 24,
+          MB = 30,
+          ML = 34;
+        const XMIN = -4,
+          XMAX = 4;
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+
+        const panel = (
+          x0: number,
+          title: string,
+          f: (x: number) => number,
+          ymax: number,
+          cls: string,
+          cur: number,
+        ) => {
+          const gw = PW - ML - 8,
+            gh = H - MT - MB;
+          const X = (v: number) => x0 + ML + ((v - XMIN) / (XMAX - XMIN)) * gw;
+          const Y = (v: number) => MT + gh - (v / ymax) * gh;
+          svg.append(svgEl('text', { class: 'title', x: x0 + 4, y: 12 }, title));
+          svg.append(svgEl('line', { class: 'axis', x1: x0 + ML, y1: MT, x2: x0 + ML, y2: MT + gh }));
+          svg.append(svgEl('line', { class: 'axis', x1: x0 + ML, y1: MT + gh, x2: x0 + ML + gw, y2: MT + gh }));
+          const pts: string[] = [];
+          for (let i = 0; i <= 200; i++) {
+            const v = XMIN + ((XMAX - XMIN) * i) / 200;
+            pts.push(`${X(v).toFixed(2)},${Y(Math.min(f(v), ymax)).toFixed(2)}`);
+          }
+          svg.append(svgEl('polyline', { class: 'curve ' + cls, points: pts.join(' ') }));
+          // 当前点
+          const cx = X(Math.max(XMIN, Math.min(XMAX, cur)));
+          const cy = Y(Math.min(f(cur), ymax));
+          svg.append(svgEl('line', { class: 'mark', x1: cx, y1: MT, x2: cx, y2: MT + gh }));
+          svg.append(svgEl('circle', { class: 'dot', cx, cy, r: 3.4 }));
+          // 刻度
+          svg.append(svgEl('text', { x: x0 + ML - 4, y: MT + 4, 'text-anchor': 'end' }, ymax.toFixed(1)));
+          svg.append(svgEl('text', { x: x0 + ML - 4, y: MT + gh + 3, 'text-anchor': 'end' }, '0'));
+          svg.append(svgEl('text', { x: x0 + ML, y: MT + gh + 14, 'text-anchor': 'middle' }, String(XMIN)));
+          svg.append(svgEl('text', { x: x0 + ML + gw / 2, y: MT + gh + 14, 'text-anchor': 'middle' }, '0'));
+          svg.append(svgEl('text', { x: x0 + ML + gw, y: MT + gh + 14, 'text-anchor': 'middle' }, String(XMAX)));
+          svg.append(
+            svgEl('text', { x: x0 + ML + gw / 2, y: MT + gh + 26, 'text-anchor': 'middle' }, '隐含奖励差 β(Δw − Δl)'),
+          );
+        };
+
+        panel(0, '损失 −log σ(奖励差)', (z) => -Math.log(sig(z)), 4, '', m);
+        panel(PW + 40, '梯度权重 σ(−奖励差)', (z) => sig(-z), 1, 'w', m);
+        $('[data-plot]').replaceChildren(svg);
+
+        // ── 读数 ──
+        const tb = $('[data-out] tbody');
+        tb.replaceChildren();
+        const row = (k: string, v: string, cls = '') => {
+          const tr = document.createElement('tr');
+          if (cls) tr.className = cls;
+          const a = document.createElement('td');
+          a.textContent = k;
+          const b = document.createElement('td');
+          b.className = 'v';
+          b.textContent = v;
+          tr.append(a, b);
+          tb.append(tr);
+        };
+        row('胜者的隐含奖励 r̂(x, y_w) = β·Δw', rw.toFixed(3));
+        row('败者的隐含奖励 r̂(x, y_l) = β·Δl', rl.toFixed(3));
+        row('隐含奖励差', m.toFixed(3), 'hi');
+        row('隐含奖励模型认为「y_w 应该赢」的概率 σ(差)', (p * 100).toFixed(1) + '%');
+        row('这一对贡献的 DPO 损失', loss.toFixed(4));
+        row('梯度前面的权重 σ(−差)', wgt.toFixed(4), 'hi');
+
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        const s = document.createElement('strong');
+        s.textContent = wgt.toFixed(3);
+        const tail =
+          m > 1.0
+            ? '模型已经把胜者排在前面不少了，隐含奖励模型「判断得挺对」，于是这一步迈得很小 —— 权重朝 0 掉。'
+            : m < -1.0
+              ? '模型现在把败者排在了前面，隐含奖励模型判断得完全反了，于是这一步迈得几乎是满格 —— 权重趋近 1。'
+              : '两个回答在模型眼里还没拉开多少差距，隐含奖励模型给出的判断相当不确定，于是这一步迈得相当大。';
+        v.append(
+          document.createTextNode('当前梯度权重是 '),
+          s,
+          document.createTextNode(
+            '。' +
+              tail +
+              ' 这正是课上说的那句「按隐含奖励模型的预测误差来缩放步长」：DPO 的更新永远是「抬高 y_w 的对数概率、压低 y_l 的对数概率」这一个方向，' +
+              '唯一在变的是这一步迈多大。所以调 β 时要小心：β 越大，同样的对数比差会被放大成更大的奖励差，权重更快掉到 0，' +
+              '模型就更贴着参考策略不动；β 越小，模型越敢跑远，但也越容易跑坏。',
+          ),
+        );
+      }
+
+      root.querySelectorAll<HTMLInputElement>('input[type="range"]').forEach((r) => {
+        r.addEventListener('input', draw);
+        r.addEventListener('change', draw);
+      });
+
+      draw();
+    });
+  }
+
+  setupL15Dpo();
+  document.addEventListener('astro:page-load', setupL15Dpo);
+</script>

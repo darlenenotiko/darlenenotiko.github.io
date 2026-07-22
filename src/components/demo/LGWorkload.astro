@@ -1,0 +1,372 @@
+---
+// CS336 客座讲座（Dan Fu）演示 1：工作负载的形状怎么决定机器配比。
+//
+// 讲者的论点：prefill 比单步 decode 久得多，但 decode 的步数多得多；
+// 两者的瓶颈完全不同（算力 vs 显存带宽），所以要分开部署。
+// 这个演示把一次请求拆成 prefill 段和 decode 段，按第 10 讲的成本模型算：
+//
+//   prefill 时间 = 2·P·S_eff / (峰值算力 × MFU)          ← 算力受限
+//   S_eff = S · (1 − 缓存命中率)                          ← 命中的前缀不用重算
+//   单步 decode = (2·P + KV 字节) / 显存带宽              ← 显存带宽受限
+//   KV 字节 = 平均上下文 × 每 token 的 KV 大小
+//   decode 总时间 = N × 单步 decode
+//   机器配比 ≈ prefill 时间 : decode 总时间
+//
+// 数值全部是自洽的量级估算，不是任何厂商的实测数字。
+---
+
+<div class="demo" data-demo="lg-workload">
+  <div class="row">
+    <span class="plabel">负载预设：</span>
+    <button data-preset="code" class="on">编程 agent（32k 进 / 256 出）</button>
+    <button data-preset="book">长文档摘要（128k 进 / 1k 出）</button>
+    <button data-preset="chat">标准聊天（256 进 / 512 出）</button>
+  </div>
+
+  <div class="row">
+    <span class="plabel">模型 / 硬件：</span>
+    <button data-model="m8" class="on">8B，单卡 H100</button>
+    <button data-model="m70">70B，8 卡 H100</button>
+  </div>
+
+  <div class="row">
+    <label class="sld">
+      输入 token = <span data-s-val>32768</span>
+      <input type="range" data-s min="7" max="17" step="1" value="15" />
+    </label>
+    <label class="sld">
+      输出 token = <span data-n-val>256</span>
+      <input type="range" data-n min="4" max="13" step="1" value="8" />
+    </label>
+    <label class="sld">
+      缓存命中率 = <span data-h-val>0%</span>
+      <input type="range" data-h min="0" max="95" step="5" value="0" />
+    </label>
+  </div>
+
+  <div class="two">
+    <div>
+      <canvas data-canvas width="720" height="270"></canvas>
+      <p class="axis">
+        上面一条是<strong>一次请求的时间构成</strong>：靛蓝 = prefill，茜红 = decode（横轴按比例）。
+        下面一条是由此推出的<strong>机器配比</strong> —— 稳态下每 100 台机器里，多少台该做
+        prefill、多少台该做 decode。
+      </p>
+    </div>
+    <div>
+      <table><tbody data-stats></tbody></table>
+      <p class="hint" data-hint></p>
+    </div>
+  </div>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1.1rem;
+    margin-bottom: 0.7rem;
+  }
+  .plabel {
+    font-size: 0.8rem;
+    color: var(--ink-faint);
+  }
+  button {
+    font: inherit;
+    font-size: 0.79rem;
+    padding: 0.22rem 0.6rem;
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    background: var(--bg-raised);
+    color: var(--ink-muted);
+    cursor: pointer;
+    transition: all 0.15s var(--ease);
+  }
+  button.on {
+    border-color: var(--indigo);
+    color: var(--indigo);
+    font-weight: 600;
+  }
+  .sld {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.83rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .sld input[type='range'] {
+    width: 132px;
+    accent-color: var(--indigo);
+  }
+  .two {
+    display: grid;
+    gap: 1.2rem;
+    align-items: start;
+  }
+  @media (min-width: 860px) {
+    .two {
+      grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+    }
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .axis {
+    margin: 0.45rem 0 0;
+    font-size: 0.76rem;
+    color: var(--ink-faint);
+    line-height: 1.7;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.81rem;
+    font-variant-numeric: tabular-nums;
+  }
+  table :global(td) {
+    padding: 0.26rem 0.4rem;
+    color: var(--ink-muted);
+    border-bottom: 1px solid var(--rule);
+  }
+  table :global(td.k) {
+    color: var(--ink-faint);
+  }
+  table :global(td.v) {
+    text-align: right;
+    font-family: var(--font-mono);
+    color: var(--ink);
+  }
+  table :global(tr.hi td.v) {
+    color: var(--indigo);
+    font-weight: 700;
+  }
+  table :global(tr.hi2 td.v) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+  .hint {
+    margin: 0.9rem 0 0;
+    font-size: 0.83rem;
+    line-height: 1.8;
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupLGWorkload() {
+    document.querySelectorAll<HTMLElement>('[data-demo="lg-workload"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const cv = $<HTMLCanvasElement>('[data-canvas]');
+      const ctx = cv.getContext('2d')!;
+      const css = (n: string) =>
+        getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+      // 两种模型 / 硬件组合。KV 每 token 字节 = 2(K+V) × Kkv × Hd × 2(bf16) × L
+      const MODELS: Record<
+        string,
+        { name: string; P: number; kvPerTok: number; peak: number; bw: number; gpus: number }
+      > = {
+        m8: { name: '8B / 1×H100', P: 8.03e9, kvPerTok: 2 * 8 * 128 * 2 * 32, peak: 989e12, bw: 3.35e12, gpus: 1 },
+        m70: { name: '70B / 8×H100', P: 70.6e9, kvPerTok: 2 * 8 * 128 * 2 * 80, peak: 8 * 989e12, bw: 8 * 3.35e12, gpus: 8 },
+      };
+      const MFU = 0.4; // prefill 阶段假设 40% 的峰值算力利用率
+
+      let model = 'm8';
+
+      const sIn = $<HTMLInputElement>('[data-s]');
+      const nIn = $<HTMLInputElement>('[data-n]');
+      const hIn = $<HTMLInputElement>('[data-h]');
+
+      const fmtT = (t: number) =>
+        t >= 1 ? t.toFixed(2) + ' s' : t >= 1e-3 ? (t * 1e3).toFixed(1) + ' ms' : (t * 1e6).toFixed(0) + ' µs';
+
+      function draw() {
+        const Sr = Math.pow(2, parseInt(sIn.value, 10));
+        const N = Math.pow(2, parseInt(nIn.value, 10));
+        const h = parseInt(hIn.value, 10) / 100;
+        $('[data-s-val]').textContent = String(Sr);
+        $('[data-n-val]').textContent = String(N);
+        $('[data-h-val]').textContent = (h * 100).toFixed(0) + '%';
+
+        const M = MODELS[model];
+        const sEff = Sr * (1 - h);
+        const tPrefill = (2 * M.P * sEff) / (M.peak * MFU);
+        const avgCtx = Sr + N / 2;
+        const kvBytes = avgCtx * M.kvPerTok;
+        const wBytes = 2 * M.P;
+        const tStep = (wBytes + kvBytes) / M.bw;
+        const tDecode = N * tStep;
+        const total = tPrefill + tDecode;
+        const fracP = total > 0 ? tPrefill / total : 0;
+
+        const indigo = css('--indigo');
+        const madder = css('--madder');
+        const rule = css('--rule');
+        const faint = css('--ink-faint');
+
+        ctx.clearRect(0, 0, cv.width, cv.height);
+        ctx.font = '12px ui-monospace, monospace';
+        ctx.textBaseline = 'middle';
+
+        const padL = 16,
+          padR = 16;
+        const W = cv.width - padL - padR;
+
+        // ── 第一条：一次请求的时间构成 ──
+        const y1 = 56,
+          bh = 40;
+        ctx.fillStyle = faint;
+        ctx.textAlign = 'left';
+        ctx.fillText('一次请求的时间构成（总 ' + fmtT(total) + '）', padL, 24);
+
+        const wP = Math.max(fracP > 0 ? 1 : 0, W * fracP);
+        ctx.fillStyle = indigo;
+        ctx.fillRect(padL, y1, wP, bh);
+        ctx.fillStyle = madder;
+        ctx.fillRect(padL + wP, y1, W - wP, bh);
+
+        ctx.fillStyle = css('--bg-raised');
+        ctx.textAlign = 'left';
+        if (wP > 130) ctx.fillText('prefill ' + fmtT(tPrefill), padL + 8, y1 + bh / 2);
+        if (W - wP > 130) ctx.fillText('decode ' + fmtT(tDecode), padL + wP + 8, y1 + bh / 2);
+
+        ctx.fillStyle = faint;
+        ctx.textAlign = 'left';
+        ctx.fillText(
+          'prefill ' + (fracP * 100).toFixed(1) + '%   decode ' + ((1 - fracP) * 100).toFixed(1) + '%',
+          padL,
+          y1 + bh + 16,
+        );
+
+        // ── 第二条：机器配比 ──
+        const y2 = 168;
+        const nP = Math.max(1, Math.round(fracP * 100));
+        const nD = 100 - nP;
+        ctx.fillStyle = faint;
+        ctx.textAlign = 'left';
+        ctx.fillText('稳态下 100 台机器该怎么分', padL, y2 - 22);
+
+        const cell = W / 100;
+        for (let i = 0; i < 100; i++) {
+          ctx.fillStyle = i < nP ? indigo : madder;
+          ctx.fillRect(padL + i * cell + 0.6, y2, cell - 1.2, 30);
+        }
+        ctx.fillStyle = faint;
+        ctx.textAlign = 'left';
+        ctx.fillText(nP + ' 台跑 prefill', padL, y2 + 46);
+        ctx.textAlign = 'right';
+        ctx.fillText(nD + ' 台跑 decode', padL + W, y2 + 46);
+
+        ctx.strokeStyle = rule;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(padL + 0.5, y2 + 0.5, W - 1, 29);
+
+        // ── 表格 ──
+        const rows: [string, string, string][] = [
+          ['模型 / 硬件', M.name, ''],
+          ['权重（bf16）', (wBytes / 1e9).toFixed(1) + ' GB', ''],
+          ['需要真算的输入 token', Math.round(sEff).toLocaleString('en-US'), ''],
+          ['prefill 浮点运算', ((2 * M.P * sEff) / 1e12).toFixed(1) + ' TFLOP', ''],
+          ['prefill 时间 ≈ TTFT', fmtT(tPrefill), 'hi'],
+          ['平均上下文长度', Math.round(avgCtx).toLocaleString('en-US'), ''],
+          ['每步要读的 KV', (kvBytes / 1e9).toFixed(2) + ' GB', ''],
+          ['单步 decode', fmtT(tStep), ''],
+          ['decode 总时间（' + N + ' 步）', fmtT(tDecode), 'hi2'],
+          ['单步 decode 是 prefill 的', tPrefill > 0 ? (tStep / tPrefill).toFixed(4) + ' 倍' : '—', ''],
+          ['假设：prefill MFU', (MFU * 100).toFixed(0) + '%', ''],
+        ];
+        const tb = $('[data-stats]');
+        tb.replaceChildren();
+        for (const [k, v, cls] of rows) {
+          const tr = document.createElement('tr');
+          if (cls) tr.className = cls;
+          const a = document.createElement('td');
+          a.className = 'k';
+          a.textContent = k;
+          const b = document.createElement('td');
+          b.className = 'v';
+          b.textContent = v;
+          tr.append(a, b);
+          tb.append(tr);
+        }
+
+        let hint: string;
+        if (fracP > 0.6) {
+          hint =
+            `这是一个 prefill 主导的负载：一次 prefill ${fmtT(tPrefill)}，` +
+            `而单步 decode 只要 ${fmtT(tStep)} —— 但因为只跑 ${N} 步，decode 总共也才 ${fmtT(tDecode)}。` +
+            `把缓存命中率往右拖，看 prefill 那一段怎么塌下去：这就是第六节 CPD 的全部动机。`;
+        } else if (fracP < 0.05) {
+          hint =
+            `这是一个 decode 主导的负载：prefill 只有 ${fmtT(tPrefill)}，几乎看不见，` +
+            `剩下全是 ${N} 步 decode。这种负载你要的是显存带宽，不是浮点算力 —— ` +
+            `也正是讲者说的「decode 可以用完全不同的芯片（LPU）」的适用场景。`;
+        } else {
+          hint =
+            `prefill 和 decode 现在旗鼓相当（${(fracP * 100).toFixed(0)}% / ${((1 - fracP) * 100).toFixed(0)}%）。` +
+            `注意两段的瓶颈完全不同：prefill 吃的是 ${((2 * M.P * sEff) / 1e12).toFixed(1)} TFLOP 的算力，` +
+            `decode 吃的是每步 ${((wBytes + kvBytes) / 1e9).toFixed(1)} GB 的显存带宽。` +
+            `同一台机器不可能在两件事上都最优 —— 所以要分家。`;
+        }
+        $('[data-hint]').textContent = hint;
+      }
+
+      const PRESETS: Record<string, [number, number, number]> = {
+        code: [15, 8, 0], // 32768 进 / 256 出
+        book: [17, 10, 0], // 131072 进 / 1024 出
+        chat: [8, 9, 0], // 256 进 / 512 出
+      };
+      root.querySelectorAll<HTMLButtonElement>('[data-preset]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const [s, n, h] = PRESETS[btn.dataset.preset!];
+          sIn.value = String(s);
+          nIn.value = String(n);
+          hIn.value = String(h);
+          root.querySelectorAll('[data-preset]').forEach((b) => b.classList.toggle('on', b === btn));
+          draw();
+        });
+      });
+      root.querySelectorAll<HTMLButtonElement>('[data-model]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          model = btn.dataset.model!;
+          root.querySelectorAll('[data-model]').forEach((b) => {
+            b.classList.toggle('on', b === btn);
+            b.classList.remove('on70');
+          });
+          draw();
+        });
+      });
+      root.querySelectorAll('input').forEach((el) => {
+        el.addEventListener('input', () => {
+          root.querySelectorAll('[data-preset]').forEach((b) => b.classList.remove('on'));
+          draw();
+        });
+      });
+      new MutationObserver(draw).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-theme'],
+      });
+      draw();
+    });
+  }
+
+  setupLGWorkload();
+  document.addEventListener('astro:page-load', setupLGWorkload);
+</script>

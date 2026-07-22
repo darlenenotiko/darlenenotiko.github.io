@@ -1,0 +1,277 @@
+---
+// 中期训练（两阶段训练）的 token 预算：
+// 把指令数据混进预训练末尾的衰减阶段，到底能让模型多看几遍指令数据？
+// 对照组是「训练完之后单独跑一轮 SFT」。
+---
+
+<div class="demo" data-demo="l15-midtrain-mix">
+  <div class="ctrl">
+    <label
+      >总预训练预算 <input type="range" data-total min="200" max="5000" step="100" value="1000" />
+      <span data-total-v class="num"></span></label
+    >
+    <label
+      >衰减阶段占比 <input type="range" data-decay min="1" max="30" step="1" value="10" />
+      <span data-decay-v class="num"></span></label
+    >
+  </div>
+  <div class="ctrl">
+    <label
+      >衰减阶段里指令/高质量数据的比例 <input type="range" data-instr min="0" max="60" step="1" value="25" />
+      <span data-instr-v class="num"></span></label
+    >
+    <label
+      >对照：单独 SFT 阶段的样本数 <input type="range" data-sft min="1" max="200" step="1" value="20" />
+      <span data-sft-v class="num"></span></label
+    >
+  </div>
+
+  <div class="plot" data-plot></div>
+
+  <table class="out" data-out><tbody></tbody></table>
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1.4rem;
+    margin-bottom: 0.55rem;
+  }
+  .ctrl label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+  }
+  .ctrl input[type='range'] {
+    width: 130px;
+    accent-color: var(--indigo);
+  }
+  .num {
+    display: inline-block;
+    min-width: 5.5em;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 0.78rem;
+    color: var(--ink);
+  }
+
+  .plot {
+    overflow-x: auto;
+  }
+  .plot :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 430px;
+    height: auto;
+  }
+  .plot :global(.stable) {
+    fill: var(--indigo);
+    opacity: 0.55;
+  }
+  .plot :global(.decay) {
+    fill: var(--indigo);
+  }
+  .plot :global(.instr) {
+    fill: var(--madder);
+  }
+  .plot :global(.sftbar) {
+    fill: var(--weld);
+  }
+  .plot :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 9px;
+  }
+  .plot :global(text.title) {
+    fill: var(--indigo);
+    font-size: 10.5px;
+    font-weight: 700;
+  }
+  .plot :global(text.hot) {
+    fill: var(--madder);
+    font-weight: 700;
+  }
+
+  .out {
+    width: 100%;
+    margin-top: 0.9rem;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+  }
+  .out :global(td) {
+    padding: 0.28rem 0.35rem;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-muted);
+  }
+  .out :global(td.v) {
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    white-space: nowrap;
+  }
+  .out :global(tr.hi td) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL15MidtrainMix() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l15-midtrain-mix"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+
+      const AVG_LEN = 500; // 一条 SFT 样本平均多少 token（prompt + 回答）
+      const POOL = 2e9; // 手上的指令数据池：假设 20 亿 token（约 400 万条对话）
+
+      const fmt = (t: number) =>
+        t >= 1e12 ? (t / 1e12).toFixed(2) + 'T' : t >= 1e9 ? (t / 1e9).toFixed(1) + 'B' : (t / 1e6).toFixed(0) + 'M';
+
+      function draw() {
+        const totalB = +$<HTMLInputElement>('[data-total]').value; // 单位：B token
+        const decayPct = +$<HTMLInputElement>('[data-decay]').value;
+        const instrPct = +$<HTMLInputElement>('[data-instr]').value;
+        const sftK = +$<HTMLInputElement>('[data-sft]').value; // 单位：万条
+
+        $('[data-total-v]').textContent = totalB >= 1000 ? (totalB / 1000).toFixed(1) + 'T token' : totalB + 'B token';
+        $('[data-decay-v]').textContent = decayPct + '%';
+        $('[data-instr-v]').textContent = instrPct + '%';
+        $('[data-sft-v]').textContent = sftK + ' 万条';
+
+        const total = totalB * 1e9;
+        const decay = total * (decayPct / 100);
+        const stable = total - decay;
+        const instr = decay * (instrPct / 100);
+        const sftTok = sftK * 1e4 * AVG_LEN;
+        const ratio = sftTok > 0 ? instr / sftTok : 0;
+        const epochs = instr / POOL;
+
+        // ── 条形图：上面一条是整个训练预算（稳定 / 衰减 / 衰减里的指令），下面一条是单独 SFT ──
+        const W = 640,
+          H = 168,
+          ML = 8,
+          MR = 8,
+          MT = 26;
+        const bw = W - ML - MR;
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+        svg.append(svgEl('text', { class: 'title', x: 4, y: 12 }, '条长按 token 数等比例（同一把尺子）'));
+
+        const sc = bw / total;
+        // 第一条：预训练
+        svg.append(svgEl('rect', { class: 'stable', x: ML, y: MT, width: Math.max(stable * sc, 0.5), height: 26, rx: 2 }));
+        svg.append(
+          svgEl('rect', { class: 'decay', x: ML + stable * sc, y: MT, width: Math.max(decay * sc, 0.5), height: 26, rx: 2 }),
+        );
+        svg.append(
+          svgEl('rect', {
+            class: 'instr',
+            x: ML + (total - instr) * sc,
+            y: MT,
+            width: Math.max(instr * sc, 0.5),
+            height: 26,
+            rx: 2,
+          }),
+        );
+        svg.append(svgEl('text', { x: ML + 4, y: MT + 17, fill: 'var(--bg)' }, '稳定阶段 ' + fmt(stable)));
+        svg.append(svgEl('text', { x: ML, y: MT + 40 }, '衰减阶段 ' + fmt(decay) + '，其中指令数据 ' + fmt(instr)));
+
+        // 第二条：单独 SFT
+        const y2 = MT + 66;
+        svg.append(svgEl('rect', { class: 'sftbar', x: ML, y: y2, width: Math.max(sftTok * sc, 1.2), height: 26, rx: 2 }));
+        svg.append(
+          svgEl('text', { x: ML, y: y2 + 40 }, '单独 SFT 阶段 ' + fmt(sftTok) + `（${sftK} 万条 × ${AVG_LEN} token）`),
+        );
+        svg.append(
+          svgEl(
+            'text',
+            { class: 'hot', x: ML, y: y2 + 54 },
+            '中期训练里的指令 token 是它的 ' + (ratio >= 1 ? ratio.toFixed(1) : ratio.toFixed(2)) + ' 倍',
+          ),
+        );
+        $('[data-plot]').replaceChildren(svg);
+
+        // ── 读数 ──
+        const tb = $('[data-out] tbody');
+        tb.replaceChildren();
+        const row = (k: string, v: string, cls = '') => {
+          const tr = document.createElement('tr');
+          if (cls) tr.className = cls;
+          const a = document.createElement('td');
+          a.textContent = k;
+          const b = document.createElement('td');
+          b.className = 'v';
+          b.textContent = v;
+          tr.append(a, b);
+          tb.append(tr);
+        };
+        row('稳定阶段（普通网页数据）', fmt(stable) + ' token');
+        row('衰减阶段总量', fmt(decay) + ' token');
+        row('衰减阶段里的指令 / 高质量数据', fmt(instr) + ' token', 'hi');
+        row('对照：单独 SFT 阶段', fmt(sftTok) + ' token');
+        row('前者是后者的多少倍', (ratio >= 1 ? ratio.toFixed(1) : ratio.toFixed(2)) + '×', 'hi');
+        row('手上只有 2B token 的指令数据池，要过几遍', epochs.toFixed(1) + ' 遍');
+
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        const s1 = document.createElement('strong');
+        s1.textContent = fmt(instr) + ' token';
+        const s2 = document.createElement('strong');
+        s2.textContent = epochs.toFixed(1) + ' 遍';
+        v.append(
+          document.createTextNode('把指令数据混进衰减阶段，模型在指令数据上一共走了 '),
+          s1,
+          document.createTextNode(
+            '。这就是「中期训练让你把指令微调放大」的字面含义 —— 单独一轮 SFT 的规模被单条样本数卡死，而衰减阶段的规模是按预训练预算的百分比算的，量级完全不同。' +
+              '同时注意最后一行：指令数据池只有那么大，放大之后它会被反复过 ',
+          ),
+          s2,
+          document.createTextNode(
+            '。所以放大指令数据并不是无限免费的 —— 重复太多遍，第 9 讲讲过的重复数据的边际递减就会找上门，这也是为什么衰减阶段仍然要留大部分份额给普通网页数据。' +
+              '另外，做完中期训练之后还是要跑一小轮真正的指令微调：混进去的那部分负责「量」，最后那一小轮负责把格式和语气钉死。',
+          ),
+        );
+      }
+
+      root.querySelectorAll<HTMLInputElement>('input[type="range"]').forEach((r) => {
+        r.addEventListener('input', draw);
+        r.addEventListener('change', draw);
+      });
+
+      draw();
+    });
+  }
+
+  setupL15MidtrainMix();
+  document.addEventListener('astro:page-load', setupL15MidtrainMix);
+</script>

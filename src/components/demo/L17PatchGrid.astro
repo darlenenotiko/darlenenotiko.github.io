@@ -1,0 +1,399 @@
+---
+// 第 17 讲演示 1：一张图被切成多少个 token。
+// ViT 把 W×H 的图切成 P×P 的 patch，每个 patch 过一次线性投影就是一个 token。
+// 可选的 2×2 合并（Qwen2-VL 的做法）把相邻四个 patch 压成一个 token。
+// 预设值取自课件里 Qwen2-VL 那张架构图上标出的真实数字。
+---
+
+<div class="demo" data-demo="l17-patch-grid">
+  <div class="knobs">
+    <label>
+      <span>图像宽 <code data-out="w"></code> 像素</span>
+      <input type="range" data-k="w" min="28" max="1680" step="28" value="336" />
+    </label>
+    <label>
+      <span>图像高 <code data-out="h"></code> 像素</span>
+      <input type="range" data-k="h" min="28" max="1680" step="28" value="336" />
+    </label>
+  </div>
+
+  <div class="row">
+    <div class="seg">
+      <span class="lab">patch 边长 P</span>
+      <button data-p="14" class="on">14</button>
+      <button data-p="16">16</button>
+      <button data-p="32">32</button>
+    </div>
+    <label class="chk">
+      <input type="checkbox" data-merge />
+      <span>把相邻 2×2 个 patch 合成一个 token（Qwen2-VL）</span>
+    </label>
+  </div>
+
+  <div class="row presets">
+    <span class="lab">课上出现过的尺寸</span>
+    <button data-preset="336,336,14,0">CLIP ViT-L/14@336px</button>
+    <button data-preset="224,28,14,1">Qwen2-VL 图 2（公式条）</button>
+    <button data-preset="1260,700,14,1">Qwen2-VL 图 3（风景照）</button>
+    <button data-preset="644,336,14,1">Qwen2-VL 视频的一帧</button>
+  </div>
+
+  <canvas data-canvas height="300"></canvas>
+
+  <div class="cards">
+    <div class="card">
+      <h4>切出多少个 patch</h4>
+      <div class="big" data-npatch></div>
+      <p class="sub" data-npatch-sub></p>
+    </div>
+    <div class="card hot">
+      <h4>送进语言模型的 token 数</h4>
+      <div class="big" data-ntok></div>
+      <p class="sub" data-ntok-sub></p>
+    </div>
+    <div class="card">
+      <h4>每个 patch 原本是多少个数</h4>
+      <div class="big" data-nnum></div>
+      <p class="sub" data-nnum-sub></p>
+    </div>
+  </div>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+
+  .knobs {
+    display: grid;
+    gap: 0.7rem;
+  }
+  @media (min-width: 640px) {
+    .knobs {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  .knobs label {
+    display: block;
+    font-size: 0.78rem;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+  }
+  .knobs label span {
+    display: block;
+    margin-bottom: 0.25rem;
+  }
+  .knobs code {
+    font-family: var(--font-mono);
+    color: var(--indigo);
+    font-size: 0.85rem;
+  }
+  .knobs input[type='range'] {
+    width: 100%;
+    accent-color: var(--indigo);
+  }
+
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.45rem;
+    margin-top: 0.8rem;
+  }
+  .lab {
+    font-size: 0.75rem;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+  .seg {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+  .row button {
+    padding: 0.24rem 0.6rem;
+    font: inherit;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .row button:hover {
+    color: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .row button.on {
+    color: var(--bg-raised);
+    background: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .chk {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+  }
+  .chk input {
+    accent-color: var(--madder);
+  }
+  .presets button {
+    font-size: 0.74rem;
+  }
+
+  canvas {
+    display: block;
+    width: 100%;
+    margin: 0.9rem 0 0.2rem;
+  }
+
+  .cards {
+    display: grid;
+    gap: 0.6rem;
+    margin-top: 0.7rem;
+  }
+  @media (min-width: 640px) {
+    .cards {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  }
+  .card {
+    padding: 0.6rem 0.75rem 0.7rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 7px;
+  }
+  .card h4 {
+    margin: 0 0 0.3rem;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+  .card .big {
+    font-family: var(--font-mono);
+    font-size: 1.35rem;
+    color: var(--indigo);
+    line-height: 1.15;
+  }
+  .card.hot .big {
+    color: var(--madder);
+  }
+  .card .sub {
+    margin: 0.25rem 0 0;
+    font-size: 0.74rem;
+    color: var(--ink-muted);
+    line-height: 1.5;
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.82rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict b {
+    color: var(--ink);
+  }
+</style>
+
+<script>
+  function setupL17PatchGrid() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l17-patch-grid"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const canvas = $<HTMLCanvasElement>('[data-canvas]');
+      const ctx = canvas.getContext('2d');
+
+      const css = (n: string) => getComputedStyle(root).getPropertyValue(n).trim() || '#888';
+      const cn = (x: number) => Math.round(x).toLocaleString('en-US');
+
+      let patch = 14;
+
+      const slider = (k: string) => $<HTMLInputElement>(`[data-k="${k}"]`);
+      const merged = () => $<HTMLInputElement>('[data-merge]').checked;
+
+      // 一个 token 覆盖多少像素：不合并就是 P，合并 2×2 就是 2P
+      const tokenPx = () => (merged() ? patch * 2 : patch);
+
+      function stats() {
+        const w = Number(slider('w').value);
+        const h = Number(slider('h').value);
+        const cols = Math.floor(w / patch);
+        const rows = Math.floor(h / patch);
+        const nPatch = cols * rows;
+        const tp = tokenPx();
+        const tCols = Math.floor(w / tp);
+        const tRows = Math.floor(h / tp);
+        return { w, h, cols, rows, nPatch, tp, tCols, tRows, nTok: tCols * tRows };
+      }
+
+      function draw() {
+        if (!ctx) return;
+        const s = stats();
+        const dpr = window.devicePixelRatio || 1;
+        const cw = canvas.clientWidth || 640;
+        const ch = 300;
+        canvas.width = cw * dpr;
+        canvas.height = ch * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, cw, ch);
+
+        // 把图像按原始长宽比缩进画布
+        const pad = 16;
+        const scale = Math.min((cw - 2 * pad) / s.w, (ch - 2 * pad) / s.h);
+        const bw = s.w * scale;
+        const bh = s.h * scale;
+        const x0 = (cw - bw) / 2;
+        const y0 = (ch - bh) / 2;
+
+        ctx.fillStyle = css('--bg-raised');
+        ctx.fillRect(x0, y0, bw, bh);
+
+        const cellW = bw / s.cols;
+        const cellH = bh / s.rows;
+
+        // patch 网格（细线）。太密就不画，否则整块糊成一片
+        if (cellW >= 3 && cellH >= 3) {
+          ctx.strokeStyle = css('--thread');
+          ctx.lineWidth = 0.5;
+          ctx.beginPath();
+          for (let i = 1; i < s.cols; i++) {
+            ctx.moveTo(x0 + i * cellW, y0);
+            ctx.lineTo(x0 + i * cellW, y0 + bh);
+          }
+          for (let j = 1; j < s.rows; j++) {
+            ctx.moveTo(x0, y0 + j * cellH);
+            ctx.lineTo(x0 + bw, y0 + j * cellH);
+          }
+          ctx.stroke();
+        } else {
+          ctx.fillStyle = css('--thread');
+          ctx.globalAlpha = 0.35;
+          ctx.fillRect(x0, y0, bw, bh);
+          ctx.globalAlpha = 1;
+        }
+
+        // token 网格（粗线）：合并之后一个 token 覆盖 2×2 个 patch
+        const tCellW = bw / s.tCols;
+        const tCellH = bh / s.tRows;
+        if (merged() && tCellW >= 5 && tCellH >= 5) {
+          ctx.strokeStyle = css('--indigo');
+          ctx.lineWidth = 1;
+          ctx.globalAlpha = 0.55;
+          ctx.beginPath();
+          for (let i = 1; i < s.tCols; i++) {
+            ctx.moveTo(x0 + i * tCellW, y0);
+            ctx.lineTo(x0 + i * tCellW, y0 + bh);
+          }
+          for (let j = 1; j < s.tRows; j++) {
+            ctx.moveTo(x0, y0 + j * tCellH);
+            ctx.lineTo(x0 + bw, y0 + j * tCellH);
+          }
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+        }
+
+        // 左上角第一个 token 高亮，说明「一个 token 就是这么大一块」
+        ctx.fillStyle = css('--madder');
+        ctx.globalAlpha = 0.35;
+        ctx.fillRect(x0, y0, Math.max(2, tCellW), Math.max(2, tCellH));
+        ctx.globalAlpha = 1;
+
+        ctx.strokeStyle = css('--ink-faint');
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x0 + 0.5, y0 + 0.5, bw - 1, bh - 1);
+
+        // 标注
+        ctx.fillStyle = css('--ink-faint');
+        ctx.font = '11px ui-monospace, monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText(`${s.w} px`, x0 + bw / 2, Math.max(11, y0 - 5));
+        ctx.textAlign = 'left';
+        ctx.fillText(`${s.h} px`, Math.min(cw - 40, x0 + bw + 5), y0 + bh / 2);
+        ctx.textAlign = 'left';
+        ctx.fillStyle = css('--madder');
+        ctx.fillText(`1 个 token = ${s.tp}×${s.tp} 像素`, x0, Math.min(ch - 4, y0 + bh + 13));
+      }
+
+      function render() {
+        const s = stats();
+        $('[data-out="w"]').textContent = String(s.w);
+        $('[data-out="h"]').textContent = String(s.h);
+
+        $('[data-npatch]').textContent = cn(s.nPatch);
+        $('[data-npatch-sub]').textContent =
+          `⌊${s.w}/${patch}⌋ × ⌊${s.h}/${patch}⌋ = ${s.cols} × ${s.rows}`;
+
+        $('[data-ntok]').textContent = cn(s.nTok);
+        $('[data-ntok-sub]').textContent = merged()
+          ? `2×2 合并后 ${s.tCols} × ${s.tRows}，是 patch 数的四分之一`
+          : `不合并，一个 patch 就是一个 token`;
+
+        const nums = patch * patch * 3;
+        $('[data-nnum]').textContent = cn(nums);
+        $('[data-nnum-sub]').textContent = `${patch}×${patch} 像素 × 3 个颜色通道（RGB）`;
+
+        // 和文本比：第 1 讲量过 GPT-5 分词器大致 4 字节/token，
+        // 中文一个汉字 3 字节，粗算约 1.5 个汉字/token。
+        const zh = Math.round(s.nTok * 1.5);
+        const cost = s.nTok * s.nTok;
+        $('[data-verdict]').innerHTML =
+          `这张图占掉 <b>${cn(s.nTok)} 个 token</b> 的上下文 —— 按中文大约 1.5 字/token 折算，` +
+          `相当于 <b>${cn(zh)} 个汉字</b>塞进 prompt。注意力是平方复杂度，光这张图内部就要算 ` +
+          `<b>${cn(s.nTok)}² ≈ ${cost.toExponential(1)}</b> 对注意力分数。` +
+          (merged()
+            ? ` 打开 2×2 合并之后 token 数掉到四分之一，这正是 Qwen2-VL 压缩上下文的手段。`
+            : ` 勾上 2×2 合并看看这个数会掉到多少。`);
+
+        draw();
+      }
+
+      // 控件本身只绑一次，之后只重画 canvas 和文本，绝不重建控件所在的 DOM
+      root.querySelectorAll<HTMLInputElement>('input[type="range"]').forEach((el) => {
+        el.addEventListener('input', render);
+      });
+      $('[data-merge]').addEventListener('change', render);
+
+      root.querySelectorAll<HTMLButtonElement>('[data-p]').forEach((b) => {
+        b.addEventListener('click', () => {
+          patch = Number(b.dataset.p);
+          root.querySelectorAll('[data-p]').forEach((o) => o.classList.remove('on'));
+          b.classList.add('on');
+          render();
+        });
+      });
+
+      root.querySelectorAll<HTMLButtonElement>('[data-preset]').forEach((b) => {
+        b.addEventListener('click', () => {
+          const [w, h, p, m] = b.dataset.preset!.split(',').map(Number);
+          slider('w').value = String(w);
+          slider('h').value = String(h);
+          patch = p;
+          root.querySelectorAll('[data-p]').forEach((o) => {
+            o.classList.toggle('on', Number((o as HTMLElement).dataset.p) === p);
+          });
+          $<HTMLInputElement>('[data-merge]').checked = m === 1;
+          render();
+        });
+      });
+
+      window.addEventListener('resize', draw);
+      render();
+    });
+  }
+
+  setupL17PatchGrid();
+  document.addEventListener('astro:page-load', setupL17PatchGrid);
+</script>

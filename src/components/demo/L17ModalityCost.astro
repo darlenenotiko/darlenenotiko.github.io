@@ -1,0 +1,197 @@
+---
+// 第 17 讲演示 4：三种模态各值多少 token。
+// 数字全部来自 LLaVA-OneVision 论文里那张「token 策略」表（课件截图）：
+// 单图 (1+N)×729、多图 N×729、视频 N×196，上限分别是 7290 / 8748 / 6272。
+// 拖动三个滑块，看它们怎么被有意凑到同一个量级。
+---
+
+<div class="demo" data-demo="l17-modality-cost">
+  <div class="knobs">
+    <label>
+      <span>单图：切成 <code data-out="c"></code> 块高清 crop（外加 1 张缩略全图）</span>
+      <input type="range" data-k="c" min="0" max="9" step="1" value="9" />
+    </label>
+    <label>
+      <span>多图：一次给 <code data-out="i"></code> 张图</span>
+      <input type="range" data-k="i" min="1" max="12" step="1" value="12" />
+    </label>
+    <label>
+      <span>视频：抽 <code data-out="f"></code> 帧</span>
+      <input type="range" data-k="f" min="1" max="32" step="1" value="32" />
+    </label>
+  </div>
+
+  <div class="bars" data-bars></div>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .knobs {
+    display: grid;
+    gap: 0.7rem;
+  }
+  @media (min-width: 700px) {
+    .knobs {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  }
+  .knobs label {
+    display: block;
+    font-size: 0.76rem;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+  }
+  .knobs label span {
+    display: block;
+    margin-bottom: 0.25rem;
+  }
+  .knobs code {
+    font-family: var(--font-mono);
+    color: var(--indigo);
+    font-size: 0.85rem;
+  }
+  .knobs input[type='range'] {
+    width: 100%;
+    accent-color: var(--indigo);
+  }
+
+  .bars {
+    margin-top: 1rem;
+    display: grid;
+    gap: 0.55rem;
+  }
+  .bar {
+    display: grid;
+    grid-template-columns: 5.5rem 1fr;
+    align-items: center;
+    gap: 0.6rem;
+  }
+  .bar .name {
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+  }
+  .bar .track {
+    position: relative;
+    height: 26px;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    overflow: hidden;
+  }
+  .bar .fill {
+    position: absolute;
+    inset: 0 auto 0 0;
+    background: var(--indigo);
+    opacity: 0.7;
+    transition: width 0.18s var(--ease);
+  }
+  .bar.text .fill {
+    background: var(--weld);
+  }
+  .bar .txt {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    padding-left: 0.5rem;
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    color: var(--ink);
+  }
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.82rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict b {
+    color: var(--ink);
+  }
+</style>
+
+<script>
+  function setupL17ModalityCost() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l17-modality-cost"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const v = (k: string) => Number($<HTMLInputElement>(`[data-k="${k}"]`).value);
+      const cn = (x: number) => Math.round(x).toLocaleString('en-US');
+
+      // 每张 384×384 的图经 SigLIP 编码是 27×27 = 729 个 token；
+      // 视频每帧被降到 14×14 = 196 个 token。
+      const PER_IMG = 729;
+      const PER_FRAME = 196;
+
+      function render() {
+        const c = v('c');
+        const i = v('i');
+        const f = v('f');
+        $('[data-out="c"]').textContent = String(c);
+        $('[data-out="i"]').textContent = String(i);
+        $('[data-out="f"]').textContent = String(f);
+
+        const single = (1 + c) * PER_IMG;
+        const multi = i * PER_IMG;
+        const video = f * PER_FRAME;
+        // 对照：一段纯文本。按第 1 讲量到的约 4 字节/token 折算成英文字符数。
+        const textTok = 1000;
+
+        const rows = [
+          { name: '单张图', val: single, exp: `(1 + ${c}) × ${PER_IMG}`, cls: '' },
+          { name: '多张图', val: multi, exp: `${i} × ${PER_IMG}`, cls: '' },
+          { name: '视频', val: video, exp: `${f} 帧 × ${PER_FRAME}`, cls: '' },
+          { name: '一段文字', val: textTok, exp: '约 4000 字节的英文', cls: 'text' },
+        ];
+        const max = Math.max(...rows.map((r) => r.val), 1);
+
+        const box = $('[data-bars]');
+        box.replaceChildren();
+        for (const r of rows) {
+          const wrap = document.createElement('div');
+          wrap.className = 'bar ' + r.cls;
+          const name = document.createElement('div');
+          name.className = 'name';
+          name.textContent = r.name;
+          const track = document.createElement('div');
+          track.className = 'track';
+          const fill = document.createElement('div');
+          fill.className = 'fill';
+          fill.style.width = (r.val / max) * 100 + '%';
+          const txt = document.createElement('div');
+          txt.className = 'txt';
+          txt.textContent = `${cn(r.val)} token　${r.exp}`;
+          track.append(fill, txt);
+          wrap.append(name, track);
+          box.append(wrap);
+        }
+
+        const ratio = video / textTok;
+        $('[data-verdict]').innerHTML =
+          `三条视觉的柱子被<b>有意</b>调到了同一个量级（满档分别是 7,290 / 8,748 / 6,272）：` +
+          `单图能切多块所以看得细，多图每张只给基础分辨率，视频每帧再降一档。` +
+          `目的是别让某一种模态在训练里压过另外两种。` +
+          `再看最后那根黄色的柱子 —— <b>1,000 个 token 的纯文本</b>大约是 4000 字节的英文，` +
+          `而现在这段视频要花 <b>${cn(video)}</b> 个 token，是它的 <b>${ratio.toFixed(1)} 倍</b>。` +
+          `视频的信息密度远低于文本，却吃掉多得多的上下文 —— 这就是 Qwen3-VL 要按序列长度开平方来重新加权损失的原因。`;
+      }
+
+      root.querySelectorAll<HTMLInputElement>('input[type="range"]').forEach((el) => {
+        el.addEventListener('input', render);
+      });
+      render();
+    });
+  }
+
+  setupL17ModalityCost();
+  document.addEventListener('astro:page-load', setupL17ModalityCost);
+</script>

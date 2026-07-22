@@ -1,0 +1,395 @@
+---
+// GRPO 的长度归一化偏置。
+//
+// 一组 4 条 rollout（2 对 2 错）。GRPO 的目标里每条回答带一个 1/|o_i| 因子，
+// 所以作用在整条回答上的梯度系数是 A_i / |o_i|；Dr. GRPO 去掉这一项，系数就是 A_i。
+// 拖动错误回答的长度，看 GRPO 那一列按 1/L 衰减 —— 长度翻倍，惩罚减半。
+// 优势用 GRPO 的定义（组内 z-score，总体标准差 + 1e-4），2 对 2 错时正好是 ±1。
+---
+
+<div class="demo" data-demo="l16-length-bias">
+  <div class="ctrl">
+    <label>错误回答 #3 的长度 <input type="range" data-l3 min="200" max="6000" step="50" value="800" /></label>
+    <span class="val" data-l3-v></span>
+  </div>
+  <div class="ctrl">
+    <label>错误回答 #4 的长度 <input type="range" data-l4 min="200" max="6000" step="50" value="1600" /></label>
+    <span class="val" data-l4-v></span>
+  </div>
+  <div class="ctrl">
+    <label>正确回答 #1 的长度 <input type="range" data-l1 min="100" max="2000" step="25" value="300" /></label>
+    <span class="val" data-l1-v></span>
+  </div>
+
+  <p class="derived" data-derived></p>
+
+  <div class="two">
+    <div class="plot" data-plot-bar></div>
+    <div class="plot" data-plot-curve></div>
+  </div>
+
+  <table class="out" data-out>
+    <thead>
+      <tr>
+        <th>rollout</th><th>结果</th><th>长度 |o|</th><th>优势 A</th>
+        <th>GRPO 系数 A/|o|</th><th>Dr. GRPO 系数 A</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.45rem;
+  }
+  .ctrl label {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+  }
+  .ctrl input[type='range'] {
+    width: 190px;
+    accent-color: var(--indigo);
+  }
+  .val {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--madder);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .derived {
+    margin: 0.8rem 0 0.2rem;
+    padding: 0.5rem 0.7rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.85;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+  }
+
+  .two {
+    display: grid;
+    gap: 0.8rem;
+    margin-top: 0.9rem;
+  }
+  @media (min-width: 700px) {
+    .two {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  .plot {
+    overflow-x: auto;
+  }
+  .plot :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 300px;
+    height: auto;
+  }
+  .plot :global(.axis) {
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .plot :global(.zero) {
+    stroke: var(--selvage);
+    stroke-width: 1.1;
+  }
+  .plot :global(.grid) {
+    stroke: var(--rule);
+    stroke-width: 0.6;
+    stroke-dasharray: 2 3;
+  }
+  .plot :global(.up) {
+    fill: var(--indigo);
+  }
+  .plot :global(.down) {
+    fill: var(--madder);
+  }
+  .plot :global(.curve) {
+    fill: none;
+    stroke: var(--madder);
+    stroke-width: 2;
+  }
+  .plot :global(.flat) {
+    fill: none;
+    stroke: var(--indigo);
+    stroke-width: 1.6;
+    stroke-dasharray: 4 3;
+  }
+  .plot :global(.mark) {
+    stroke: var(--weld);
+    stroke-width: 1.4;
+  }
+  .plot :global(.dot) {
+    fill: var(--madder);
+  }
+  .plot :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 9px;
+  }
+  .plot :global(text.title) {
+    fill: var(--indigo);
+    font-size: 10.5px;
+    font-weight: 700;
+  }
+  .plot :global(text.lab) {
+    fill: var(--ink-muted);
+    font-size: 8.5px;
+  }
+
+  .out {
+    width: 100%;
+    margin-top: 0.9rem;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+  }
+  .out :global(th) {
+    padding: 0.25rem 0.35rem;
+    text-align: right;
+    font-weight: 400;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(th:first-child),
+  .out :global(th:nth-child(2)) {
+    text-align: left;
+  }
+  .out :global(td) {
+    padding: 0.25rem 0.35rem;
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(td:first-child),
+  .out :global(td:nth-child(2)) {
+    text-align: left;
+  }
+  .out :global(td.up) {
+    color: var(--indigo);
+  }
+  .out :global(td.down) {
+    color: var(--madder);
+  }
+  .out :global(td.dim) {
+    color: var(--ink-faint);
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL16LengthBias() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l16-length-bias"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+
+      const EPS = 1e-4;
+      const REWARDS = [1, 1, 0, 0]; // 2 对 2 错
+      const LABEL = ['#1 正确', '#2 正确', '#3 错误', '#4 错误'];
+      const L2 = 400; // 第 2 条正确回答的长度，固定
+
+      const W = 340,
+        H = 180,
+        ML = 46,
+        MR = 12,
+        MT = 26,
+        MB = 26;
+
+      function drawBars(host: HTMLElement, lens: number[], adv: number[]) {
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+        svg.append(svgEl('text', { class: 'title', x: 4, y: 13 }, 'GRPO 的梯度系数 A/|o|（×1000）'));
+        const coef = adv.map((a, i) => (a / lens[i]) * 1000);
+        const amax = Math.max(1e-6, ...coef.map(Math.abs)) * 1.2;
+        const y0 = MT + (H - MT - MB) / 2;
+        const y = (v: number) => y0 - (v / amax) * ((H - MT - MB) / 2);
+        for (const v of [amax, 0, -amax]) {
+          svg.append(
+            svgEl('line', { class: v === 0 ? 'zero' : 'grid', x1: ML, y1: y(v), x2: W - MR, y2: y(v) }),
+          );
+          svg.append(svgEl('text', { x: ML - 4, y: y(v) + 3, 'text-anchor': 'end' }, v.toFixed(2)));
+        }
+        const bw = (W - ML - MR) / 4;
+        coef.forEach((c, i) => {
+          const x0 = ML + i * bw + bw * 0.2;
+          const w = bw * 0.6;
+          const h = Math.max(1, Math.abs(y(c) - y(0)));
+          svg.append(
+            svgEl('rect', { class: c >= 0 ? 'up' : 'down', x: x0, y: Math.min(y(c), y(0)), width: w, height: h }),
+          );
+          svg.append(
+            svgEl(
+              'text',
+              { class: 'lab', x: x0 + w / 2, y: H - MB + 11, 'text-anchor': 'middle' },
+              LABEL[i].slice(0, 2),
+            ),
+          );
+        });
+        host.replaceChildren(svg);
+      }
+
+      function drawCurve(host: HTMLElement, l3: number, a3: number) {
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+        svg.append(svgEl('text', { class: 'title', x: 4, y: 13 }, '错误回答 #3：惩罚 vs 长度'));
+        const lo = 200,
+          hi = 6000;
+        const mag = (L: number) => (Math.abs(a3) / L) * 1000;
+        const vmax = mag(lo) * 1.1;
+        const px = (L: number) => ML + ((L - lo) / (hi - lo)) * (W - ML - MR);
+        const py = (v: number) => H - MB - (v / vmax) * (H - MT - MB);
+
+        for (let k = 0; k <= 3; k++) {
+          const v = (vmax * k) / 3;
+          svg.append(svgEl('line', { class: 'grid', x1: ML, y1: py(v), x2: W - MR, y2: py(v) }));
+          svg.append(svgEl('text', { x: ML - 4, y: py(v) + 3, 'text-anchor': 'end' }, v.toFixed(2)));
+        }
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: H - MB, x2: W - MR, y2: H - MB }));
+        for (const L of [200, 2000, 4000, 6000]) {
+          svg.append(svgEl('text', { x: px(L), y: H - MB + 11, 'text-anchor': 'middle' }, String(L)));
+        }
+
+        const pts: string[] = [];
+        for (let i = 0; i <= 160; i++) {
+          const L = lo + ((hi - lo) * i) / 160;
+          pts.push(`${i ? 'L' : 'M'}${px(L).toFixed(2)},${py(mag(L)).toFixed(2)}`);
+        }
+        svg.append(svgEl('path', { class: 'curve', d: pts.join(' ') }));
+
+        // Dr. GRPO：不随长度变化
+        const drv = Math.abs(a3) * 1000;
+        if (drv <= vmax) {
+          svg.append(svgEl('line', { class: 'flat', x1: ML, y1: py(drv), x2: W - MR, y2: py(drv) }));
+        } else {
+          svg.append(
+            svgEl('text', { class: 'lab', x: W - MR, y: MT + 8, 'text-anchor': 'end' }, 'Dr. GRPO 在图外（恒定）'),
+          );
+        }
+
+        svg.append(svgEl('line', { class: 'mark', x1: px(l3), y1: MT, x2: px(l3), y2: H - MB }));
+        svg.append(svgEl('circle', { class: 'dot', cx: px(l3), cy: py(mag(l3)), r: 3.2 }));
+        svg.append(
+          svgEl('text', { class: 'lab', x: W - MR, y: MT + 20, 'text-anchor': 'end' }, '实线 = GRPO　虚线 = Dr. GRPO'),
+        );
+        host.replaceChildren(svg);
+      }
+
+      function draw() {
+        const l1 = parseInt($<HTMLInputElement>('[data-l1]').value, 10);
+        const l3 = parseInt($<HTMLInputElement>('[data-l3]').value, 10);
+        const l4 = parseInt($<HTMLInputElement>('[data-l4]').value, 10);
+        $('[data-l1-v]').textContent = `${l1} token`;
+        $('[data-l3-v]').textContent = `${l3} token`;
+        $('[data-l4-v]').textContent = `${l4} token`;
+
+        const lens = [l1, L2, l3, l4];
+        const mean = REWARDS.reduce((a, b) => a + b, 0) / REWARDS.length;
+        const varp = REWARDS.reduce((a, r) => a + (r - mean) * (r - mean), 0) / REWARDS.length;
+        const std = Math.sqrt(varp);
+        const adv = REWARDS.map((r) => (r - mean) / (std + EPS));
+
+        const grpo = adv.map((a, i) => a / lens[i]);
+        const half = Math.abs(adv[2]) / (l3 * 2);
+
+        $('[data-derived]').textContent =
+          `一组 4 条 rollout，2 对 2 错　→　mean = ${mean.toFixed(2)}，std = ${std.toFixed(3)}，` +
+          `优势 A = [${adv.map((a) => a.toFixed(3)).join(', ')}]\n` +
+          `GRPO 的目标里每条回答带一个 1/|o_i| 因子，所以作用在整条回答上的系数是 A_i/|o_i|；` +
+          `Dr. GRPO 去掉这一项，系数就是 A_i\n` +
+          `错误回答 #3：现在长 ${l3} token，惩罚系数 ${Math.abs(grpo[2]).toExponential(3)}；` +
+          `如果它再写长一倍（${l3 * 2} token），惩罚变成 ${half.toExponential(3)} —— 正好减半`;
+
+        const tb = $('[data-out] tbody');
+        tb.replaceChildren();
+        LABEL.forEach((nm, i) => {
+          const tr = document.createElement('tr');
+          const cells: [string, string][] = [
+            [nm.slice(0, 2), ''],
+            [REWARDS[i] === 1 ? '答案正确' : '答案错误', ''],
+            [String(lens[i]), 'dim'],
+            [adv[i].toFixed(3), adv[i] >= 0 ? 'up' : 'down'],
+            [grpo[i].toExponential(3), grpo[i] >= 0 ? 'up' : 'down'],
+            [adv[i].toFixed(3), adv[i] >= 0 ? 'up' : 'down'],
+          ];
+          cells.forEach(([t, cls]) => {
+            const td = document.createElement('td');
+            td.textContent = t;
+            if (cls) td.className = cls;
+            tr.append(td);
+          });
+          tb.append(tr);
+        });
+
+        drawBars($('[data-plot-bar]'), lens, adv);
+        drawCurve($('[data-plot-curve]'), l3, adv[2]);
+
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        const strong = (t: string) => {
+          const s = document.createElement('strong');
+          s.textContent = t;
+          return s;
+        };
+        const ratio = Math.abs(grpo[2]) / Math.abs(grpo[3]);
+        v.append(
+          document.createTextNode('最后两列是全部要点：Dr. GRPO 那一列'),
+          strong('完全不看长度'),
+          document.createTextNode(
+            '，四条回答的系数就是 ±1。GRPO 那一列却被长度稀释了 —— 现在 #3（' +
+              `${l3} token）受到的惩罚是 #4（${l4} token）的 ${ratio.toFixed(2)} 倍。` +
+              '把错误回答的长度往右拖，惩罚沿着 1/L 一路塌向 0：',
+          ),
+          strong('模型一旦发现自己解不出来，把话拉长就能把惩罚除没'),
+          document.createTextNode(
+            '。同时看正确的那一侧：#1 越短，它拿到的正系数越大 —— 所以 GRPO 在正确答案上偏好简洁、' +
+              '在错误答案上偏好啰嗦，这正是 Dr. GRPO 论文里那段「回答级别的长度偏置」说的事。',
+          ),
+        );
+      }
+
+      root.querySelectorAll('input').forEach((el) => el.addEventListener('input', draw));
+      draw();
+    });
+  }
+
+  setupL16LengthBias();
+  document.addEventListener('astro:page-load', setupL16LengthBias);
+</script>

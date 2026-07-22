@@ -1,0 +1,569 @@
+---
+// MinHash 的逐步演示：两段文本 → 切 n-gram（shingle）→ 若干哈希函数各取最小值
+// → 比较签名 → 用「相等的比例」估计 Jaccard 相似度，和真实 Jaccard 对照。
+//
+// 哈希用的是 MurmurHash3 x86 32-bit，和课件里 Python 的 mmh3.hash 逐位一致
+// （已核对：mmh3("hello") = 613153351）。所以页面上显示的每一个哈希值
+// 都可以在 Python 里用 mmh3 复现。
+---
+
+<div class="demo" data-demo="l14-minhash">
+  <div class="ctrl">
+    <label class="wide">文档 A <input type="text" data-a value="the cat sat on the mat" /></label>
+  </div>
+  <div class="ctrl">
+    <label class="wide">文档 B <input type="text" data-b value="the cat sat on a mat" /></label>
+  </div>
+  <div class="ctrl">
+    <label>n-gram 长度 <input type="range" data-n min="1" max="5" step="1" value="3" /></label>
+    <span class="val" data-n-v></span>
+    <label class="seg">切分单位
+      <button data-unit="word" class="on">按词</button><button data-unit="char">按字</button>
+    </label>
+  </div>
+  <div class="ctrl">
+    <label>哈希函数个数 k <input type="range" data-k min="1" max="400" step="1" value="100" /></label>
+    <span class="val" data-k-v></span>
+  </div>
+  <div class="ctrl">
+    <span class="tag">预设</span>
+    <button data-preset="cat">近重复（改一个词）</button>
+    <button data-preset="tmpl">模板文案（换国名）</button>
+    <button data-preset="same">完全相同</button>
+    <button data-preset="diff">毫无关系</button>
+  </div>
+
+  <div class="step" data-step1></div>
+  <div class="step" data-step2></div>
+  <div class="step" data-step3></div>
+
+  <div class="plot" data-plot></div>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.55rem;
+    margin-bottom: 0.5rem;
+  }
+  .ctrl label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+  }
+  .ctrl label.wide {
+    flex: 1 1 22rem;
+  }
+  .ctrl input[type='text'] {
+    flex: 1;
+    min-width: 10rem;
+    padding: 0.24rem 0.45rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--ink);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+  }
+  .ctrl input[type='range'] {
+    width: 11rem;
+    accent-color: var(--indigo);
+  }
+  .val {
+    min-width: 3.4rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--madder);
+  }
+  .tag {
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .seg {
+    gap: 0.3rem;
+  }
+  .ctrl button {
+    padding: 0.24rem 0.6rem;
+    font: inherit;
+    font-size: 0.76rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .ctrl button:hover {
+    color: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .ctrl button.on {
+    color: var(--bg);
+    background: var(--indigo);
+    border-color: var(--indigo);
+  }
+
+  .step {
+    margin-top: 0.9rem;
+  }
+  .step :global(h4) {
+    margin: 0 0 0.4rem;
+    font-size: 0.8rem;
+    font-weight: 700;
+    color: var(--indigo);
+  }
+  .step :global(table) {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+  }
+  .step :global(th) {
+    padding: 0.24rem 0.35rem;
+    text-align: left;
+    font-weight: 600;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+  }
+  .step :global(td) {
+    padding: 0.24rem 0.35rem;
+    color: var(--ink-muted);
+    border-bottom: 1px solid var(--rule);
+  }
+  .step :global(td.m),
+  .step :global(th.m) {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    white-space: nowrap;
+  }
+  .step :global(td.sh) {
+    font-family: var(--font-mono);
+    color: var(--ink);
+  }
+  .step :global(tr.both td) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+  .step :global(tr.min td.m) {
+    color: var(--indigo);
+    font-weight: 700;
+  }
+  .step :global(.scroll) {
+    overflow-x: auto;
+  }
+  .step :global(.eq) {
+    margin: 0.35rem 0 0;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--madder);
+  }
+  .step :global(.hint) {
+    margin: 0.3rem 0 0;
+    font-size: 0.76rem;
+    color: var(--ink-faint);
+  }
+  .step :global(.yes) {
+    color: var(--indigo);
+    font-weight: 700;
+  }
+  .step :global(.no) {
+    color: var(--ink-faint);
+  }
+
+  .plot {
+    margin-top: 0.9rem;
+    overflow-x: auto;
+  }
+  .plot :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 420px;
+    height: auto;
+  }
+  .plot :global(.curve) {
+    fill: none;
+    stroke: var(--indigo);
+    stroke-width: 1.6;
+  }
+  .plot :global(.truth) {
+    fill: none;
+    stroke: var(--madder);
+    stroke-width: 1.2;
+    stroke-dasharray: 4 3;
+  }
+  .plot :global(.band) {
+    fill: var(--weld);
+    opacity: 0.18;
+  }
+  .plot :global(.axis) {
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .plot :global(.mark) {
+    fill: none;
+    stroke: var(--madder);
+    stroke-width: 1.2;
+  }
+  .plot :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 8.5px;
+  }
+  .plot :global(text.title) {
+    fill: var(--indigo);
+    font-size: 10px;
+    font-weight: 700;
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL14MinHash() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l14-minhash"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+
+      // ── MurmurHash3 x86 32-bit（和 Python mmh3.hash 完全一致，返回有符号 32 位整数）──
+      const enc = new TextEncoder();
+      function mmh3(key: string, seed = 0): number {
+        const data = enc.encode(key);
+        const len = data.length;
+        const nblocks = len >> 2;
+        let h1 = seed | 0;
+        const c1 = 0xcc9e2d51,
+          c2 = 0x1b873593;
+        const rotl = (x: number, r: number) => (x << r) | (x >>> (32 - r));
+        for (let i = 0; i < nblocks; i++) {
+          const j = i * 4;
+          let k1 = data[j] | (data[j + 1] << 8) | (data[j + 2] << 16) | (data[j + 3] << 24);
+          k1 = Math.imul(k1, c1);
+          k1 = rotl(k1, 15);
+          k1 = Math.imul(k1, c2);
+          h1 ^= k1;
+          h1 = rotl(h1, 13);
+          h1 = (Math.imul(h1, 5) + 0xe6546b64) | 0;
+        }
+        let k1 = 0;
+        const tail = nblocks * 4;
+        const rem = len & 3;
+        if (rem === 3) k1 ^= data[tail + 2] << 16;
+        if (rem >= 2) k1 ^= data[tail + 1] << 8;
+        if (rem >= 1) {
+          k1 ^= data[tail];
+          k1 = Math.imul(k1, c1);
+          k1 = rotl(k1, 15);
+          k1 = Math.imul(k1, c2);
+          h1 ^= k1;
+        }
+        h1 ^= len;
+        h1 ^= h1 >>> 16;
+        h1 = Math.imul(h1, 0x85ebca6b);
+        h1 ^= h1 >>> 13;
+        h1 = Math.imul(h1, 0xc2b2ae35);
+        h1 ^= h1 >>> 16;
+        return h1 | 0;
+      }
+
+      const PRESETS: Record<string, [string, string]> = {
+        cat: ['the cat sat on the mat', 'the cat sat on a mat'],
+        tmpl: [
+          'holiday flights take off from your departure country Canada',
+          'holiday flights take off from your departure country USA',
+        ],
+        same: ['permission is hereby granted free of charge', 'permission is hereby granted free of charge'],
+        diff: ['the cat sat on the mat', 'quantum error correction needs many qubits'],
+      };
+
+      let unit: 'word' | 'char' = 'word';
+
+      const KMAX = 400;
+
+      function shingles(s: string, n: number): string[] {
+        const units = unit === 'word' ? s.trim().split(/\s+/).filter(Boolean) : Array.from(s.replace(/\s+/g, ''));
+        const out: string[] = [];
+        const seen = new Set<string>();
+        for (let i = 0; i + n <= units.length; i++) {
+          const g = units.slice(i, i + n).join(unit === 'word' ? ' ' : '');
+          if (!seen.has(g)) {
+            seen.add(g);
+            out.push(g);
+          }
+        }
+        return out;
+      }
+
+      function minhash(S: string[], seed: number): number {
+        let m = Infinity;
+        for (const x of S) {
+          const h = mmh3(x, seed);
+          if (h < m) m = h;
+        }
+        return m;
+      }
+
+      function draw() {
+        const n = +$<HTMLInputElement>('[data-n]').value;
+        const k = +$<HTMLInputElement>('[data-k]').value;
+        $('[data-n-v]').textContent = n + (unit === 'word' ? ' 词' : ' 字');
+        $('[data-k-v]').textContent = 'k = ' + k;
+
+        const A = shingles($<HTMLInputElement>('[data-a]').value, n);
+        const B = shingles($<HTMLInputElement>('[data-b]').value, n);
+        const setA = new Set(A),
+          setB = new Set(B);
+        const union = [...new Set([...A, ...B])];
+        const inter = union.filter((x) => setA.has(x) && setB.has(x));
+        const trueJ = union.length ? inter.length / union.length : 0;
+
+        // ── 第一步：切 n-gram，看清交集和并集 ──
+        const s1 = $('[data-step1]');
+        s1.replaceChildren();
+        const h1 = document.createElement('h4');
+        h1.textContent = `第一步：切成 ${n}-gram，每个文档变成一个集合`;
+        s1.append(h1);
+        if (!union.length) {
+          const p = document.createElement('p');
+          p.className = 'hint';
+          p.textContent = '文本太短，切不出这么长的 n-gram。把 n 调小一点。';
+          s1.append(p);
+          $('[data-step2]').replaceChildren();
+          $('[data-step3]').replaceChildren();
+          $('[data-plot]').replaceChildren();
+          $('[data-verdict]').textContent = '';
+          return;
+        }
+        const wrap1 = document.createElement('div');
+        wrap1.className = 'scroll';
+        const t1 = document.createElement('table');
+        t1.innerHTML =
+          '<thead><tr><th>n-gram</th><th>在 A</th><th>在 B</th><th class="m">MurmurHash（seed=0）</th></tr></thead>';
+        const tb1 = document.createElement('tbody');
+        for (const g of union) {
+          const tr = document.createElement('tr');
+          const inA = setA.has(g),
+            inB = setB.has(g);
+          if (inA && inB) tr.className = 'both';
+          const c0 = document.createElement('td');
+          c0.className = 'sh';
+          c0.textContent = g;
+          const c1 = document.createElement('td');
+          c1.innerHTML = inA ? '<span class="yes">✓</span>' : '<span class="no">·</span>';
+          const c2 = document.createElement('td');
+          c2.innerHTML = inB ? '<span class="yes">✓</span>' : '<span class="no">·</span>';
+          const c3 = document.createElement('td');
+          c3.className = 'm';
+          c3.textContent = String(mmh3(g, 0));
+          tr.append(c0, c1, c2, c3);
+          tb1.append(tr);
+        }
+        t1.append(tb1);
+        wrap1.append(t1);
+        s1.append(wrap1);
+        const eq = document.createElement('p');
+        eq.className = 'eq';
+        eq.textContent = `Jaccard(A, B) = |A ∩ B| / |A ∪ B| = ${inter.length} / ${union.length} = ${trueJ.toFixed(4)}`;
+        s1.append(eq);
+        const hint1 = document.createElement('p');
+        hint1.className = 'hint';
+        hint1.textContent = '红色的行是两边都有的 n-gram。这一列哈希值是 seed=0 那个哈希函数算出来的，下一步就是在每一列里取最小值。';
+        s1.append(hint1);
+
+        // ── 第二步：每个哈希函数取最小值，比签名 ──
+        const s2 = $('[data-step2]');
+        s2.replaceChildren();
+        const h2 = document.createElement('h4');
+        h2.textContent = `第二步：${k} 个哈希函数各取最小值，得到两个签名（表里只列前 8 个）`;
+        s2.append(h2);
+        const wrap2 = document.createElement('div');
+        wrap2.className = 'scroll';
+        const t2 = document.createElement('table');
+        t2.innerHTML =
+          '<thead><tr><th class="m">seed</th><th class="m">min h(A)</th><th>取到的 n-gram</th><th class="m">min h(B)</th><th>取到的 n-gram</th><th>相等？</th></tr></thead>';
+        const tb2 = document.createElement('tbody');
+        const argmin = (S: string[], seed: number) => {
+          let best = S[0],
+            bv = Infinity;
+          for (const x of S) {
+            const h = mmh3(x, seed);
+            if (h < bv) {
+              bv = h;
+              best = x;
+            }
+          }
+          return best;
+        };
+        for (let seed = 0; seed < Math.min(k, 8); seed++) {
+          const ma = minhash(A, seed),
+            mb = minhash(B, seed);
+          const tr = document.createElement('tr');
+          if (ma === mb) tr.className = 'min';
+          const cells = [
+            [String(seed), 'm'],
+            [String(ma), 'm'],
+            [A.length ? argmin(A, seed) : '—', 'sh'],
+            [String(mb), 'm'],
+            [B.length ? argmin(B, seed) : '—', 'sh'],
+          ];
+          for (const [txt, cls] of cells) {
+            const td = document.createElement('td');
+            td.className = cls;
+            td.textContent = txt;
+            tr.append(td);
+          }
+          const tdm = document.createElement('td');
+          tdm.innerHTML = ma === mb ? '<span class="yes">相等 ✓</span>' : '<span class="no">不等 ✗</span>';
+          tr.append(tdm);
+          tb2.append(tr);
+        }
+        t2.append(tb2);
+        wrap2.append(t2);
+        s2.append(wrap2);
+        const hint2 = document.createElement('p');
+        hint2.className = 'hint';
+        hint2.textContent =
+          '注意「取到的 n-gram」这两列：只要两边取到的是同一个 n-gram，最小值自然就相等 —— 而那只可能是交集里的 n-gram。这就是 Pr[相等] = Jaccard 的全部内容。';
+        s2.append(hint2);
+
+        // ── 第三步：数相等的比例 ──
+        const matches: boolean[] = [];
+        for (let seed = 0; seed < KMAX; seed++) matches.push(minhash(A, seed) === minhash(B, seed));
+        const cntK = matches.slice(0, k).filter(Boolean).length;
+        const est = cntK / k;
+
+        const s3 = $('[data-step3]');
+        s3.replaceChildren();
+        const h3 = document.createElement('h4');
+        h3.textContent = '第三步：用「相等的比例」当作 Jaccard 的估计';
+        s3.append(h3);
+        const eq3 = document.createElement('p');
+        eq3.className = 'eq';
+        eq3.textContent = `估计值 = ${cntK} / ${k} = ${est.toFixed(4)}　　真实值 = ${trueJ.toFixed(4)}　　误差 = ${Math.abs(est - trueJ).toFixed(4)}`;
+        s3.append(eq3);
+        const se = Math.sqrt((trueJ * (1 - trueJ)) / k);
+        const hint3 = document.createElement('p');
+        hint3.className = 'hint';
+        hint3.textContent = `理论标准误 = √(J(1−J)/k) = √(${trueJ.toFixed(3)}×${(1 - trueJ).toFixed(3)}/${k}) = ${se.toFixed(4)}。这就是为什么 k 要成百上千 —— 误差只按 1/√k 缩小。`;
+        s3.append(hint3);
+
+        // ── 估计值随 k 的走势 ──
+        const W = 620,
+          H = 200,
+          ML = 40,
+          MR = 12,
+          MT = 22,
+          MB = 30;
+        const iw = W - ML - MR,
+          ih = H - MT - MB;
+        const xOf = (i: number) => ML + (i / KMAX) * iw;
+        const yOf = (v: number) => MT + (1 - v) * ih;
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+        svg.append(svgEl('text', { class: 'title', x: 4, y: 12 }, '估计值随哈希函数个数 k 的走势（虚线 = 真实 Jaccard，色带 = ±1 个理论标准误）'));
+
+        // ±1 标准误的色带
+        const bandTop: string[] = [],
+          bandBot: string[] = [];
+        for (let i = 1; i <= KMAX; i++) {
+          const s = Math.sqrt((trueJ * (1 - trueJ)) / i);
+          bandTop.push(`${xOf(i).toFixed(2)},${yOf(Math.min(1, trueJ + s)).toFixed(2)}`);
+          bandBot.push(`${xOf(i).toFixed(2)},${yOf(Math.max(0, trueJ - s)).toFixed(2)}`);
+        }
+        svg.append(svgEl('polygon', { class: 'band', points: bandTop.concat(bandBot.reverse()).join(' ') }));
+
+        // 坐标轴
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: MT, x2: ML, y2: MT + ih }));
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: MT + ih, x2: ML + iw, y2: MT + ih }));
+        for (const v of [0, 0.25, 0.5, 0.75, 1]) {
+          svg.append(svgEl('text', { x: ML - 5, y: yOf(v) + 3, 'text-anchor': 'end' }, v.toFixed(2)));
+        }
+        for (const t of [1, 100, 200, 300, 400]) {
+          svg.append(svgEl('text', { x: xOf(t), y: MT + ih + 12, 'text-anchor': 'middle' }, String(t)));
+        }
+        svg.append(svgEl('text', { x: ML + iw / 2, y: H - 4, 'text-anchor': 'middle' }, 'k（哈希函数个数）'));
+
+        // 真实值
+        svg.append(svgEl('line', { class: 'truth', x1: ML, y1: yOf(trueJ), x2: ML + iw, y2: yOf(trueJ) }));
+
+        // 累计估计曲线
+        let acc = 0;
+        const pts: string[] = [];
+        for (let i = 1; i <= KMAX; i++) {
+          if (matches[i - 1]) acc++;
+          pts.push(`${xOf(i).toFixed(2)},${yOf(acc / i).toFixed(2)}`);
+        }
+        svg.append(svgEl('polyline', { class: 'curve', points: pts.join(' ') }));
+        svg.append(svgEl('circle', { class: 'mark', cx: xOf(k), cy: yOf(est), r: 3.5 }));
+        $('[data-plot]').replaceChildren(svg);
+
+        // ── 结论 ──
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        const strong = document.createElement('strong');
+        strong.textContent = `${est.toFixed(3)}（真实 ${trueJ.toFixed(3)}）`;
+        v.append(
+          document.createTextNode(`两个文档切出 ${union.length} 个不同的 ${n}-gram，其中 ${inter.length} 个是共有的。k = ${k} 时的估计是 `),
+          strong,
+          document.createTextNode(
+            '。把 k 从 1 拖到 400，看曲线怎么慢慢贴到虚线上 —— 而且贴的速度很慢：k 翻四倍，误差才减半。这正是真实系统里 k 取到几千的原因（课上举的那篇去重论文用了 n = 9000 个哈希函数）。另外注意 MinHash 只压缩了「比较两个集合」这一步，还没解决「怎么只跟可能相似的文档比」—— 那是下面 LSH 要做的事。',
+          ),
+        );
+      }
+
+      // 控件只绑定一次，draw() 里绝不重建它们
+      root.querySelectorAll<HTMLInputElement>('input').forEach((el) => {
+        el.addEventListener('input', draw);
+      });
+      root.querySelectorAll<HTMLButtonElement>('[data-unit]').forEach((b) => {
+        b.addEventListener('click', () => {
+          unit = b.dataset.unit as 'word' | 'char';
+          root.querySelectorAll<HTMLButtonElement>('[data-unit]').forEach((x) => x.classList.toggle('on', x === b));
+          draw();
+        });
+      });
+      root.querySelectorAll<HTMLButtonElement>('[data-preset]').forEach((b) => {
+        b.addEventListener('click', () => {
+          const p = PRESETS[b.dataset.preset!];
+          $<HTMLInputElement>('[data-a]').value = p[0];
+          $<HTMLInputElement>('[data-b]').value = p[1];
+          draw();
+        });
+      });
+
+      draw();
+    });
+  }
+
+  setupL14MinHash();
+  document.addEventListener('astro:page-load', setupL14MinHash);
+</script>

@@ -1,0 +1,2104 @@
+---
+course: cs336
+courseTitle: 'Stanford CS336：从零构建语言模型'
+lecture: 16
+title: 后训练之二：可验证奖励的强化学习
+date: 2026-07-21
+description: 从 RLHF 的过优化讲到 RLVR。策略梯度与 REINFORCE 技巧从零讲起，PPO 的理论与实现之痛，GRPO 的组内 z-score 优势、它的两个偏置，以及 DeepSeek R1 / Kimi K1.5 / Qwen3 三份技术报告的完整拆解。
+speaker: Tatsu Hashimoto
+slides: lecture_16.pdf
+tags: [CS336, 语言模型, 强化学习, RLVR, GRPO, PPO, 策略梯度, DeepSeek R1]
+---
+
+import L16PolicyGradient from '../../../components/demo/L16PolicyGradient.astro';
+import L16GrpoAdvantage from '../../../components/demo/L16GrpoAdvantage.astro';
+import L16LengthBias from '../../../components/demo/L16LengthBias.astro';
+import L16KimiLength from '../../../components/demo/L16KimiLength.astro';
+
+这是 CS336 的第十六讲，主讲人是 Tatsu Hashimoto，也是**后训练两讲里的第二讲**。
+上一讲讲的是中期训练 / 后训练的总体图景 —— 指令微调、RLHF，走到这里大概就是 ChatGPT 那个水平。
+这一讲专攻其中一条线：**可验证奖励的强化学习（reinforcement learning from verifiable rewards, RLVR）**，
+也就是让模型学会写很长的思维链、去解数学题和编程题的那套东西。
+
+Tatsu 开场说这个话题很应景：他没来得及更新幻灯片，但就在讲课前，OpenAI 那边宣布
+他们用一个**思考模型（thinking model）**解掉了一个**未解决的数学问题**。
+那个东西是怎么工作的？**就是这一讲要讲的思考模型 / RLVR 那套东西。**
+
+<Collapsible title="本讲课务">
+
+课务信息很少，只有两条与作业相关：
+
+- 这一讲的**第一部分（核心算法）是基础知识，作业里会直接用到**。Tatsu 说
+  「你们会在作业里写出 GRPO」，而且会把 **RFT（拒绝采样微调）**作为基线一并实现。
+- 作业里你会亲手撞上这一讲提到的几个坑：**答案等价性检查有多难**（数学答案可以有无数种等价写法），
+  以及**在线（on-policy）GRPO 训练动态有多干净、一旦想复用 rollout 提高利用率就有多难受**。
+
+讲座结构是课程里反复出现的那种两段式：先讲核心算法（PPO → GRPO），
+再拿一批开源模型的技术报告来对照，看第一部分讲的东西在真实的模型发布里长什么样。
+
+</Collapsible>
+
+<Figure src="/courses/cs336/l16-pipeline-overview.png" wide caption="课程走到哪了：预训练 + RLHF 大致到 GPT-3.5 / ChatGPT；今天要走到 o1 / R1 —— 右边那张图是 o1 的测试时算力与 AIME 准确率的关系。来源：CS336 第 16 讲课件" />
+
+## 一、为什么还要一种新的 RL
+
+### 1.1 上一讲结束在一个泄气的地方
+
+Tatsu 说上一讲他是用一个**有点丧的结论**收的尾：**RLHF 没法把我们带到想去的地方**，
+原因是一个叫**过优化（overoptimization）**的问题。
+
+RLHF 的流程是这样的：
+
+1. 收一大批**偏好数据**（人类标注者在两个回答里选一个更好的）。偏好数据非常有用。
+2. 用这批数据训一个**奖励模型（reward model）**。
+3. 拿这个奖励模型当目标，对语言模型做 RL。
+
+问题出在第 3 步。这条流水线**从根本上是被标注量卡住的（annotation bottlenecked）**：
+你只有一个奖励模型，而**你没法一直往同一个奖励模型里灌算力**。
+灌到一定程度，你就会把奖励模型**过拟合**掉 —— 模型学会的不是「怎么给出好回答」，
+而是「怎么让这个特定的奖励模型给高分」。
+
+Tatsu 强调：**不管你在正则化上做得多好，最终都会撞上这个过拟合问题。**
+
+<Callout type="note" title="补充：过优化到底是什么形状">
+奖励模型只是真实人类偏好的一个**近似**，而且是在有限数据上训出来的近似。
+在偏好数据覆盖到的区域里它挺准，在没覆盖到的区域里它可能给出离谱的高分。
+
+RL 的本事恰恰是**找出让奖励最大的那些输出**。所以只要你优化得够狠，
+策略一定会漂到奖励模型没见过的、被高估的那片区域去 ——
+奖励模型报出来的分数一路上涨，而真实的人类评价在某个点之后开始下降。
+
+这就是为什么 RLHF 里必须有一个 KL 惩罚项把策略拴在参考模型附近，
+也是为什么「往 RLHF 里加算力」这条路走不远。
+</Callout>
+
+### 1.2 对照：AlphaGo 那种 RL 为什么能一直加算力
+
+如果你是一个坚定的强化学习信徒，你会去看 AlphaGo 之类的东西然后说：
+在那些领域里，**RL 干得非常漂亮**。那 RLHF 和这些「RL 原生」的领域，差别到底在哪？
+
+Tatsu 给的答案是：
+
+<Theorem type="proposition" name="关键区别">
+在 AlphaGo 里，**我们优化的正是我们真正想要的东西**。
+
+围棋的胜负条件是明确的，这个定义里**没有任何含糊之处**。
+所以你想投入多少算力都可以 —— 只要目标函数在改善，你就是在变好。
+</Theorem>
+
+他补了一个不太精确但有用的说法：**这类问题更像搜索问题，而 RLHF 更像学习问题。**
+RLHF 里你得先「学」出一个奖励函数，然后在这个学出来的、有误差的函数上做优化；
+围棋里你不需要学奖励，规则直接给你。
+
+那么，**有没有别的领域也具备这种可验证的性质？** 有：
+
+- **形式化数学**（比如 Lean，编译器能检查证明对不对）；
+- 甚至**自然语言表述的数学** —— 最终答案对不对，是可以判定的；
+- 某些情况下的**代码**（跑测试用例）。
+
+这些领域「更可验证，因此更适合强化学习」。这就是研究 RLVR 的动机。
+Tatsu 说：**算法本身跟 RLHF 不会有本质区别，但最后能到达的地方会惊人地不同。**
+
+### 1.3 这一讲的两部分
+
+- **第一部分：核心算法。** PPO → GRPO。这是基础知识，作业会用到。
+- **第二部分：案例研究。** 翻一批开源模型的技术报告（DeepSeek R1、Kimi K1.5、Qwen3），
+  看第一部分讲的东西在真实发布里怎么体现。
+
+---
+
+## 二、先补课：强化学习在语言模型里到底是什么
+
+<Callout type="note" title="补充：这一整节是补的">
+Tatsu 在课上说「如果你上过 RL 课，PPO 你当然懂」，但他也说「我不假设你们都上过 RL 课」。
+即便如此，他讲策略梯度只用了一页幻灯片、一条公式。
+
+这一节是**讲义补的**，把 RL 的基本词汇在**语言模型的具体语境**下从零建立起来。
+如果你已经学过 RL，可以直接跳到第三节。后面所有公式的记号都以这一节为准。
+</Callout>
+
+### 2.1 把「训练语言模型」翻译成 RL 的语言
+
+强化学习的标准词汇是**策略、状态、动作、轨迹、奖励**。这些词在 grid-world 里是一回事，
+在语言模型里是另一回事。先把对应关系钉死：
+
+<Theorem type="definition" name="语言模型里的 RL 五件套">
+
+- **策略（policy）$\pi_\theta$**：**就是语言模型本身**。给定当前已有的文本，它输出下一个 token 的概率分布。
+  参数 $\theta$ 就是模型权重。
+- **状态（state）$s_t$**：**prompt 加上到目前为止已经生成的 token**。
+  比如 prompt 是「求 $x^2 - 5x + 6 = 0$ 的所有实根之和」，模型已经写了
+  「我们先因式分解：」，那这一整串就是当前状态。
+- **动作（action）$a_t$**：**下一个 token**。动作空间就是词表，大小十万量级。
+- **轨迹（trajectory）$z$**：**一整条采样出来的回答**（这一讲也常写成 $o$ 或 $y$）——
+  从 prompt 开始一路生成到 EOS 的那一整串 token。在 RL 里这叫一次 **rollout（推演）**。
+- **奖励（reward）$R(z)$**：**这条回答的得分**。在 RLVR 里它通常来自一个**验证器**：
+  把模型写在最后的答案抽出来，跟标准答案比对，对了给 1，错了给 0。
+
+</Theorem>
+
+有两个语言模型特有的性质，后面会反复用到：
+
+<Callout type="insight" title="语言模型的 RL 是一个 bandit 问题">
+标准 RL 里，每走一步都有一个即时奖励，所以你要考虑「现在这一步的收益」和「未来的收益」怎么折现。
+
+但在 RLVR 里，**奖励只在最后一步给一次** —— 整条思维链写完、给出答案，验证器才打一个分。
+中间每个 token 都没有单独的奖励。
+
+这种「一次决策、一次奖励」的结构在 RL 里叫**bandit（老虎机）问题**。
+Tatsu 在讲 PPO 的 GAE 时会专门提到这一点：因为它本质上是 bandit，
+所以 PPO 里那些为多步 RL 设计的折现机制在这里基本退化成平凡的形式。
+</Callout>
+
+<Callout type="insight" title="「一条轨迹」既可以看成一步也可以看成很多步">
+同一条回答，你可以有两种看法：
+
+- **序列级（sequence-level）**：整条回答 $z$ 是一个动作，奖励 $R(z)$ 是这个动作的回报。这是 bandit 视角。
+- **token 级（token-level）**：每个 token 是一个动作，一条回答是 $|z|$ 步。
+
+两种视角的联系是 $\log p_\theta(z) = \sum_t \log \pi_\theta(a_t \mid s_t)$ ——
+一条回答的对数概率等于每个 token 对数概率之和。
+所以序列级的一次梯度，摊开就是 token 级的一串梯度。**后面的公式会在两种写法之间来回切换**，
+看到求和号 $\sum_t$ 就是切到了 token 级。
+</Callout>
+
+### 2.2 目标函数：我们到底在最大化什么
+
+目标非常直白：**让模型采样出来的回答，期望奖励最大**。
+
+$$
+\max_\theta \; J(\theta), \qquad J(\theta) \;=\; \mathbb{E}_{z \sim p_\theta}\bigl[R(z)\bigr]
+$$
+
+$z \sim p_\theta$ 的意思是：**回答是用当前这个模型采样出来的**。
+这一点非常重要 —— 它是后面 on-policy / off-policy 一切纠结的源头。
+
+问题来了：**这个期望没法直接求导。** 因为 $\theta$ 不在被求期望的那个函数 $R(z)$ 里，
+而是在**采样分布**里。你改一点 $\theta$，改变的是「哪些回答容易被抽到」，
+而不是「某条回答值多少分」。$R$ 本身可能根本不可导（它是一个验证器，可能就是一段字符串比对代码）。
+
+### 2.3 REINFORCE：对数导数技巧
+
+解决办法是一个很漂亮的恒等式，叫**对数导数技巧（log-derivative trick）**，
+也叫 **REINFORCE 技巧**。这是幻灯片上「Attempt 1」那一行：
+
+<Theorem type="theorem" name="策略梯度定理（REINFORCE 形式）">
+
+$$
+\nabla_\theta \, \mathbb{E}_{p_\theta}\bigl[R(z)\bigr] \;=\; \mathbb{E}_{p_\theta}\bigl[R(z)\, \nabla_\theta \log p_\theta(z)\bigr]
+$$
+
+</Theorem>
+
+Tatsu 说这条式子是**整个这一讲的核心，后面所有东西都是从它派生出来的**，一定要记住。
+它的推导只有三行，值得自己走一遍：
+
+$$
+\nabla_\theta \sum_z p_\theta(z) R(z)
+\;=\; \sum_z R(z)\, \nabla_\theta p_\theta(z)
+$$
+
+然后用一个恒等式 $\nabla_\theta p_\theta(z) = p_\theta(z)\, \nabla_\theta \log p_\theta(z)$
+（这就是 $\nabla \log f = \nabla f / f$ 反过来写），代进去：
+
+$$
+\;=\; \sum_z p_\theta(z)\, R(z)\, \nabla_\theta \log p_\theta(z)
+\;=\; \mathbb{E}_{p_\theta}\bigl[R(z)\, \nabla_\theta \log p_\theta(z)\bigr]
+$$
+
+右边这个期望**是可以用采样估计的**：采 $G$ 条回答，算平均。
+
+<Callout type="insight" title="Tatsu 强调的读法：带权重的 SFT 更新">
+他说，在语言模型的 RL 里最该记住的一件事是：
+
+**我们做的永远是「加权的 SFT 更新」，只不过权重可以是正的，也可以是负的。**
+
+为什么？因为 $\nabla_\theta \log p_\theta(z)$ **就是**监督微调（SFT）在样本 $z$ 上的梯度 ——
+SFT 就是最大化训练样本的对数似然。所以策略梯度做的事情是：
+
+1. 用当前模型**自己**采样出一批回答；
+2. 给每条回答打一个分 $R(z)$；
+3. 拿这个分**当作这条回答的 SFT 权重**做一次更新。
+
+**分高的回答被推高（正权重，像 SFT 一样学它），分低的回答被压低（负权重，反着学）。**
+
+这个读法非常实用：它解释了为什么 RL 训练在实现上跟 SFT 训练那么像
+（都是算 log-prob、都是反向传播），也解释了为什么 RL 需要模型**自己生成数据** ——
+SFT 的数据是别人给的，RL 的数据是自己采的。
+</Callout>
+
+### 2.4 麻烦一：方差太高
+
+幻灯片上「Attempt 1」那行后面跟着一句括号：**variances are too high（方差太高）**。
+
+具体是什么意思？假设一道数学题，模型采 8 条回答，7 条错（$R = 0$）、1 条对（$R = 1$）。
+按上面的公式，梯度估计是
+
+$$
+\hat g \;=\; \frac{1}{8}\Bigl[1 \cdot \nabla_\theta \log p_\theta(z_{\text{对}}) + 0 \cdot (\cdots) + \cdots\Bigr]
+$$
+
+7 条回答对梯度**完全没有贡献**（乘了 0）。而如果你换一道简单的题，8 条全对，
+那 8 条**全都被推高** —— 包括那些其实写得很啰嗦、很绕的。这个估计的**噪声极大**：
+同样的模型、同样的 batch 大小，两次跑出来的梯度可能差很远。
+
+再看一个更极端的例子：如果你把所有奖励都**加上 100**（$R' = R + 100$），
+真实的最优策略完全没变（加常数不改变哪个回答最好），
+但梯度估计变成了「**把每一条回答都用一个 100 上下的大权重推高**」——
+方向几乎全被这个常数偏置主导了。这显然荒唐。
+
+### 2.5 解法：基线与优势
+
+修正办法是**减去一个基线（baseline）**。
+
+<Theorem type="theorem" name="基线定理">
+对任意**只依赖状态、不依赖动作**的函数 $b(s)$，都有
+
+$$
+\mathbb{E}_{p_\theta}\bigl[b(s)\, \nabla_\theta \log p_\theta(z)\bigr] \;=\; 0
+$$
+
+因此
+
+$$
+\nabla_\theta J(\theta) \;=\; \mathbb{E}_{p_\theta}\bigl[(R(z) - b(s))\, \nabla_\theta \log p_\theta(z)\bigr]
+$$
+
+**减去基线不改变梯度的期望，但会改变它的方差。**
+</Theorem>
+
+为什么减去它期望不变？因为
+
+$$
+\mathbb{E}_{p_\theta}\bigl[\nabla_\theta \log p_\theta(z)\bigr] \;=\; \sum_z p_\theta(z) \frac{\nabla_\theta p_\theta(z)}{p_\theta(z)} \;=\; \nabla_\theta \sum_z p_\theta(z) \;=\; \nabla_\theta 1 \;=\; 0
+$$
+
+概率必须加起来等于 1，所以它对 $\theta$ 的导数是 0。这就是幻灯片上引 Sutton & Barto 那一页里
+「$\sum_a b(s) \nabla \pi(a\mid s,\theta) = b(s) \nabla \sum_a \pi(a \mid s,\theta) = b(s)\nabla 1 = 0$」
+那一行的内容。
+
+<Theorem type="definition" name="优势（advantage）">
+减掉基线之后的那个量就叫**优势**：
+
+$$
+A(z) \;=\; R(z) - b(s)
+$$
+
+读法非常直观：**这条回答比「在这个 prompt 上通常能拿到的分数」好多少。**
+
+- $A > 0$：这条回答比平均水平好 → 推高它的概率。
+- $A < 0$：比平均水平差 → 压低它的概率。
+- $A = 0$：不好不坏 → 不动。
+
+回到刚才那个「所有奖励加 100」的例子：如果基线也跟着变成 $b + 100$，优势完全不变。
+**优势把那个无意义的常数偏置消掉了。**
+</Theorem>
+
+在语言模型里，**状态就是 prompt**（bandit 视角下一条轨迹只有一个状态），
+所以「依赖状态的基线」意思就是「**依赖于这道题的基线**」——
+比如「这道题上模型平均能得多少分」。这个观察是后面 GRPO 的全部要害。
+
+那 $b$ 怎么来？两条路，正好对应 PPO 和 GRPO：
+
+- **PPO 的路**：训一个**价值网络（value model）$V_\phi(s)$** 去预测「在这个状态下期望能拿多少分」，
+  拿它当基线。Tatsu 的描述是：「我的神经网络说我应该拿 5 分，我拿了 6 分，所以这是一次好的 rollout。」
+- **GRPO 的路**：**同一道题多采几条回答，拿这一组的均值当基线**。
+  「我拿了 5 分，我再采 10 条，看看我比这 10 条好还是差。」
+
+<Callout type="tip" title="动手：一步策略梯度更新长什么样">
+下面这个演示把上面所有东西压到最小的可视规模：**一个 prompt、四个候选回答**。
+模型对四个候选有一个概率分布（softmax），每个候选有一个奖励。
+
+- 左边看**一步策略梯度更新**：拿到奖励之后，四个候选的概率各自往哪个方向、移动多少。
+  这里用的是精确梯度 $\partial J / \partial z_j = p_j (r_j - \bar r)$，
+  也就是「概率 × 优势」—— 优势为正的被推高，为负的被压低，**推的力度还正比于它当前的概率**。
+- 右边看**基线为什么重要**：横轴是基线 $b$ 的取值，纵轴是单样本梯度估计的方差
+  （对四个候选精确求和算出来的，不是蒙特卡洛）。把 $b$ 从 0 拖到组内均值，看方差怎么掉下去。
+
+几件值得试的事：
+
+- 把基线拖到 0（相当于不减基线），记下方差；再拖到 0.5（组内均值），看它掉了多少倍。
+- 把所有奖励整体抬高（「奖励 +5」那个预设），看**更新方向完全不变**，
+  但**不减基线时的方差爆炸式增长** —— 这就是 2.4 节说的那个荒唐现象。
+- 把步长拉大，注意一个细节：**概率是此消彼长的**。步长很大时，
+  某个奖励为正、但涨得慢的候选，可能因为另一个候选涨得太快而被挤下去。
+
+</Callout>
+
+<L16PolicyGradient />
+
+### 2.6 麻烦二：每走一步都要重新采样
+
+还有一个纯粹是效率的问题，Tatsu 说这是上一讲留下的直觉：
+
+**策略梯度要求：每次你想走一个梯度步，都必须从当前策略采样。**
+
+因为公式里那个期望是 $\mathbb{E}_{z \sim p_\theta}$，下标是**当前的** $\theta$。
+你一旦更新了参数，之前采的那批回答就「过期」了 —— 它们是旧策略的样本，
+不再是新策略的无偏样本。
+
+这在语言模型上极其昂贵：**采样意味着推理**，而生成一条几千 token 的思维链要花很久。
+花那么大代价采一批 rollout，只走一个梯度步就扔掉，太浪费了。
+
+于是问题变成：**能不能复用 rollout？** 这就引出了 TRPO 和 PPO。
+
+<Theorem type="definition" name="on-policy 与 off-policy">
+
+- **on-policy（同策略）**：用来更新模型的那批回答，**正是模型当前的样子**生成出来的。
+  数学上干净，训练动态也好。
+- **off-policy（异策略）**：那批回答是**模型早几步之前的样子**生成的，模型已经变了。
+
+Tatsu 说：**GRPO 在它最简单的 on-policy 形式下表现非常好，你在作业里会体验到。
+然后你会变贪心** —— 你会说「我的系统利用率太低了，如果能复用 rollout，
+我就能把推理和训练重叠起来，做各种聪明的事」。于是你去复用 rollout，
+**于是你就掉进了 off-policy 的坑，训练开始不稳定**。
+
+这个拉扯贯穿整个 RL 工程，第 7.5 节还会回来。
+</Theorem>
+
+### 2.7 重要性采样比：复用旧 rollout 的正确姿势
+
+如果我手上只有旧策略 $\pi_{\theta_{\text{old}}}$ 采的样本，怎么估计新策略 $\pi_\theta$ 下的期望？
+
+标准做法是**重要性采样（importance sampling）**：
+
+$$
+\mathbb{E}_{z \sim \pi_\theta}\bigl[f(z)\bigr] \;=\; \mathbb{E}_{z \sim \pi_{\theta_{\text{old}}}}\Bigl[\frac{\pi_\theta(z)}{\pi_{\theta_{\text{old}}}(z)} f(z)\Bigr]
+$$
+
+那个比值
+
+$$
+\rho(z) \;=\; \frac{\pi_\theta(z)}{\pi_{\theta_{\text{old}}}(z)}
+$$
+
+就叫**重要性采样比（importance sampling ratio）**，在 PPO 和 GRPO 的公式里到处都是。
+
+它的读法很简单：**这条旧样本，在新策略下比在旧策略下更可能出现，还是更不可能。**
+
+- $\rho = 1$：新旧策略对这条回答的看法一样。
+- $\rho = 3$：新策略觉得它出现的可能性是旧策略的 3 倍 → 这条样本被「高估」了，要放大权重。
+- $\rho = 0.1$：新策略几乎不会生成它了。
+
+在 token 级上，它写成 $\pi_\theta(a_t \mid s_t) / \pi_{\theta_{\text{old}}}(a_t \mid s_t)$。
+
+<Callout type="warning" title="重要性采样比为什么危险">
+重要性采样在数学上是无偏的，但**方差可以爆炸**。
+
+如果新旧策略差得远，某些样本的 $\rho$ 会变得极大（比如 1000），
+这一条样本就会**统治整个梯度估计** —— 你的更新方向完全被一条运气好的旧样本决定。
+训练随即发散。
+
+所以才需要限制新旧策略之间的距离。**TRPO 用一个硬性的 KL 约束，PPO 用裁剪。**
+这就是幻灯片上那三次「Attempt」的逻辑主线。
+</Callout>
+
+---
+
+## 三、PPO：先把它讲清楚，再讲它为什么让人受不了
+
+Tatsu 说：**讨论语言模型的 RL 不可能绕过 PPO。**
+虽然上一讲已经讲过一次，但「PPO 足够让人困惑，讲两遍你是有收获的」。
+
+### 3.1 三次尝试
+
+幻灯片用三行把 PPO 的来历讲完了。
+
+<Theorem type="proposition" name="从策略梯度到 PPO 的三步">
+
+**Attempt 1：策略梯度**（方差太高）
+
+$$
+\nabla_\theta \, E_{p_\theta}\bigl[R(z)\bigr] \;=\; E_{p_\theta}\bigl[R(z)\, \nabla_\theta \log p_\theta(z)\bigr]
+$$
+
+**Attempt 2：TRPO**（在当前策略附近把问题线性化）
+
+$$
+\begin{aligned}
+\underset{\theta}{\text{maximize}} \quad & \hat{\mathbb{E}}_t\Bigl[\frac{\pi_\theta(a_t \mid s_t)}{\pi_{\theta_{\text{old}}}(a_t \mid s_t)} \hat A_t\Bigr] \\[4pt]
+\text{subject to} \quad & \hat{\mathbb{E}}_t\bigl[\mathrm{KL}[\pi_{\theta_{\text{old}}}(\cdot \mid s_t),\, \pi_\theta(\cdot \mid s_t)]\bigr] \;\le\; \delta
+\end{aligned}
+$$
+
+**Attempt 3：PPO**（把比值裁剪在某个 $\epsilon$ 内）
+
+$$
+L(s, a, \theta_k, \theta) \;=\; \min\Bigl(\frac{\pi_\theta(a \mid s)}{\pi_{\theta_k}(a \mid s)} A^{\pi_{\theta_k}}(s, a), \;\; \mathrm{clip}\Bigl(\frac{\pi_\theta(a \mid s)}{\pi_{\theta_k}(a \mid s)},\, 1 - \epsilon,\, 1 + \epsilon\Bigr) A^{\pi_{\theta_k}}(s, a)\Bigr)
+$$
+
+</Theorem>
+
+逐条解释这三行在干什么：
+
+- **Attempt 1** 就是第二节推的那条。它对，但方差高，而且每步都得重新采样。
+- **Attempt 2（TRPO，trust region policy optimization，信赖域策略优化）**：
+  既然新旧策略差太远会让重要性采样比爆炸，那就**明确禁止它们差太远** ——
+  在「新旧策略的 KL 散度不超过 $\delta$」这个约束下，最大化重要性加权的优势。
+  这样在这个「信赖域」里，用旧样本估新目标是可靠的，于是**可以多走几步**。
+  代价是：带约束的优化很难解，实现复杂（要算共轭梯度、Fisher 矩阵向量积之类）。
+- **Attempt 3（PPO，proximal policy optimization，近端策略优化）**：
+  用一个**便宜得多的近似**替掉那个硬约束 —— 直接**把比值裁剪（clip）到 $[1-\epsilon, 1+\epsilon]$**，
+  然后取「原始项」和「裁剪项」的**较小者**。
+
+<Callout type="note" title="补充：那个 min 和 clip 到底在干什么">
+这是 PPO 里最容易看晕的一处。逐情况拆开看（记 $\rho = \pi_\theta / \pi_{\theta_k}$）：
+
+**情况一：优势为正（$A > 0$，这条回答比平均好，我们想推高它）。**
+- 如果 $\rho \le 1 + \epsilon$：两项相等或者原始项更小，取原始项，正常更新。
+- 如果 $\rho > 1 + \epsilon$：说明新策略已经把这条回答的概率推得比旧策略高出 $\epsilon$ 以上了。
+  这时裁剪项 $= (1+\epsilon) A$ 是常数，**对 $\theta$ 求导等于 0**。
+  取 min 之后目标函数变成常数，**梯度直接归零** —— 不许再往上推了。
+
+**情况二：优势为负（$A < 0$，我们想压低它）。**
+- 因为 $A < 0$，乘上去之后大小关系反过来：$\min$ 会在 $\rho < 1 - \epsilon$ 时选中裁剪项，
+  同样让梯度归零 —— **不许再往下压了**。
+
+一句话：**PPO 允许你在信赖域内自由更新，一旦越出边界，那个样本的梯度就被掐断。**
+这就是「用裁剪代替 KL 约束」的全部内容。$\epsilon$ 在实践中常取 **0.2**
+（AlpacaFarm 的实现里 `cliprange=0.2`）。
+</Callout>
+
+### 3.2 PPO 在真实 RL 任务里确实很强
+
+Tatsu 说 PPO 是 RL 领域**真正的主力（workhorse）**，在一堆非常困难的 RL 场景里都被用过。
+OpenAI 在他们「非常信 RL」的早期做了不少这类工作：
+
+- **PPO 发布博客（2017）**：里面演示的是让仿真里的两足角色**学会走路**（OpenAI Gym 那批环境）。
+  Tatsu 现场提了一句「那个 OpenAI 小人在到处跑」。
+- **OpenAI Five（2019）**：他们用 PPO 训出来的 Dota 2 机器人。这是一个戏剧性得多的演示。
+
+所以 PPO **能在深度 RL、高维动作空间和状态空间**这种通常很难做 RL 的地方胜任。
+
+### 3.3 概念层面：PPO 真的很简单
+
+幻灯片直接贴了 OpenAI Spinning Up 文档里的伪代码。Tatsu 的评价是：
+「你看这个会说，这没那么糟啊，其实挺简单的，我一口气就能实现出来。」
+
+<Theorem type="proposition" name="PPO-Clip 算法（Spinning Up 版）">
+
+1. **输入**：初始策略参数 $\theta_0$，初始价值函数参数 $\phi_0$。
+2. **for** $k = 0, 1, 2, \ldots$ **do**
+3. &nbsp;&nbsp;&nbsp;&nbsp;在环境里跑策略 $\pi_k = \pi(\theta_k)$，收集一批轨迹 $\mathcal{D}_k = \{\tau_i\}$。
+4. &nbsp;&nbsp;&nbsp;&nbsp;计算 **rewards-to-go**（从 $t$ 时刻起的累计奖励）$\hat R_t$。
+5. &nbsp;&nbsp;&nbsp;&nbsp;基于当前价值函数 $V_{\phi_k}$，用**任意一种优势估计方法**算出优势估计 $\hat A_t$。
+6. &nbsp;&nbsp;&nbsp;&nbsp;最大化 PPO-Clip 目标来更新策略：
+
+$$
+\theta_{k+1} \;=\; \arg\max_\theta \; \frac{1}{|\mathcal{D}_k| T} \sum_{\tau \in \mathcal{D}_k} \sum_{t=0}^{T} \min\Bigl(\frac{\pi_\theta(a_t \mid s_t)}{\pi_{\theta_k}(a_t \mid s_t)} A^{\pi_{\theta_k}}(s_t, a_t), \;\; g\bigl(\epsilon,\, A^{\pi_{\theta_k}}(s_t, a_t)\bigr)\Bigr)
+$$
+
+&nbsp;&nbsp;&nbsp;&nbsp;通常用 Adam 做随机梯度上升。
+
+7. &nbsp;&nbsp;&nbsp;&nbsp;用**均方误差回归**拟合价值函数：
+
+$$
+\phi_{k+1} \;=\; \arg\min_\phi \; \frac{1}{|\mathcal{D}_k| T} \sum_{\tau \in \mathcal{D}_k} \sum_{t=0}^{T} \bigl(V_\phi(s_t) - \hat R_t\bigr)^2
+$$
+
+8. **end for**
+
+</Theorem>
+
+采一批轨迹、算优势、用裁剪过的目标更新策略、再拟合一下价值函数 —— 就这些。看着确实不难。
+
+### 3.4 然后你看到这种博客标题
+
+Tatsu 说，正因为伪代码看着简单，大家会觉得「PPO 挺好的啊」。
+**然后你看到一篇标题叫《PPO 的 37 个实现细节》的博客，这应该让你心里一凉。**
+
+<Callout type="warning" title="为什么「37 个实现细节」是个坏信号">
+如果一个算法需要一篇博客来列 37 条实现细节，
+说明**它对实现决策极度敏感**。事实也是如此：
+
+- 各种不同的库、不同的实现，**给出的数字完全不一样**，取决于你用哪个。
+- **很多人把它实现错了。** 有论文专门指出：某些人在 PPO 里用的所谓「基线」
+  **根本不是基线** —— 它们从根本上改变了被优化的那个问题。
+
+（这一点在第五节讲 GRPO 的标准差归一化时会以另一种形式重演。）
+</Callout>
+
+于是 Tatsu 说，他没法不带你看几段真实的 PPO 实现 ——
+而**语言模型上的 PPO 实现，坦白说，并不令人愉快**。
+
+### 3.5 语言模型版 PPO 的全景图
+
+<Figure src="/courses/cs336/l16-ppo-lm-diagram.png" wide caption="语言模型上的 PPO 全景。注意绿色的价值模型出现了两次，中间那个大方块是 GAE 优势估计。来源：Zheng et al. 2023，转引自 CS336 第 16 讲课件" />
+
+Tatsu 说这张图「是对 PPO 长什么样非常好的描述」。指着图逐块看：
+
+- **策略 LM $\pi_\theta^{\text{RL}}$**（粉色）：正在被训练的模型，也是产生 rollout 的那个。
+  图里出现了两次：一个是 $\pi_{\theta_{\text{old}}}^{\text{RL}}$（采样用的旧策略），一个是 $\pi_\theta^{\text{RL}}$（正在更新的）。
+- **SFT 模型 $\pi^{\text{SFT}}$**（蓝色）：**参考模型**，用来算 KL 散度，把策略拴住。
+- **奖励模型 $r(x,y)$**（黄色）：给整条回答打分。
+- **价值模型 $V_\phi(s_t)$**（绿色）：**出现了两次** —— 一次喂进 GAE 优势估计，
+  一次自己被 MSE 损失训练。这是 PPO 里最麻烦的部件。
+- **GAE 方块**：里面写着优势函数、TD 误差、回报三条公式。
+- **经验缓冲区（experience buffer）**：因为要**保留一些旧的 rollout**，所以需要一个缓冲区。
+- 最后是三个损失圈：**PPO-clip 损失、LM 损失、MSE 损失**。
+
+课件上那句总结是：「跟 RL 的一般表述很像。动作作用在 token 上，
+一个又大又密的奖励在最末端作用于整条序列。」
+
+Tatsu 还特意点出一件事：**有些部分（比如 KL 项）是逐 token 计算的。**
+所以它**并不真的只是一个 bandit 问题，而是一个完整的多步 RL 问题** ——
+这也是它为什么这么难。
+
+### 3.6 一份真实实现：AlpacaFarm 的 PPO
+
+Tatsu 拿他自己实验室的 [AlpacaFarm](https://github.com/tatsu-lab/alpaca_farm) 做例子 ——
+他的一个学生为了做 RLHF 项目实现了 PPO，「花了很长时间才让它跑起来」，
+后来被好几个人拿去用，效果不错。他去翻了细节：**到底做了什么才让这东西真的能跑？**
+
+**外层循环**是完全正常的：遍历 rollout，走若干个 PPO 步，算损失、裁剪梯度、更新参数。
+「完全合理的外层循环。」
+
+**内层的 `compute_loss`** 也几乎就是照抄 PPO 更新：算优势、算裁剪比值、按此更新模型。
+关键几行长这样（`cliprange = 0.2`）：
+
+```python
+# AlpacaFarm 的 compute_loss，去掉了周边代码
+logprob = outputs["logprobs"]
+ratio = torch.exp(logprob - old_logprob)            # 重要性采样比 ρ = π_θ / π_θ_old
+
+pg_losses = -advantages * ratio                     # 未裁剪的那一项（取负号是因为要最小化）
+pg_losses2 = -advantages * torch.clamp(             # 裁剪过的那一项
+    ratio, min=1.0 - self.args.cliprange, max=1.0 + self.args.cliprange
+)
+pg_loss = torch.maximum(pg_losses, pg_losses2).mean()  # 对损失取 max = 对目标取 min
+```
+
+（价值函数那边同样有一套 `vpredclipped` 的裁剪，然后取
+`vf_loss = 0.5 * max(vf_losses1, vf_losses2)`。）
+
+「这些都还好。**然后你走到比较脏的部分。**」
+（幻灯片里还有一页专门讲 rollout 的代码，Tatsu 现场跳过了：「rollout 那部分我先略过。」）
+
+#### 奖励整形（reward shaping）
+
+<Figure src="/courses/cs336/l16-ppo-curves.png" wide caption="PPO 训练起来该长什么样：整体奖励上升、奖励模型分数上升、KL 惩罚（负的那项）往下走。来源：CS336 第 16 讲课件" />
+
+**高层的说法**是：加一个**逐 token 的 KL 惩罚**，再在**最后一个 token 上加满额奖励**。
+
+**实践中呢？** 幻灯片上的代码是这样的：
+
+```python
+def _shape_reward(self, rewards, responses, logprobs, ref_logprobs):
+    # 注意这一行：KL 被 clamp 在 0 以下截断了
+    kl = torch.clamp(logprobs - ref_logprobs, min=0.0)
+    non_score_rewards = -self.kl_ctl.value * kl
+    shaped_rewards = non_score_rewards.clone()
+    # 把整条回答的奖励只加在最后一个非 padding 的位置上
+    terminal_positions = (responses != self.tokenizer.pad_token_id).sum(dim=1) - 1
+    shaped_rewards[list(range(rewards.size(0))), terminal_positions] += rewards
+    return dict(shaped_rewards=shaped_rewards, non_score_rewards=non_score_rewards, kl=kl)
+```
+
+Tatsu 特意停在这里：**只有当新策略的 logp 低于参考模型 logp 的那些序列上，把 KL 截掉，
+这东西才 work。** 而如果你了解 KL 散度，**这完全毁掉了 KL 散度的意义** ——
+KL 的求和项本来是**有正有负**的，你把负的部分删掉，它就不再是 KL 了。
+
+**但如果不这么做，它立刻炸掉。** 课件上的辩护是：
+「有助于稳定性？如果我们把模型搞炸了，这能防止 KL 发散。」
+
+他强调这不是在教你「PPO 就该这么实现」，而是要说明：
+**RL 算法的实现可能相当微妙、相当敏感**，因为 PPO 里活动件太多，而且梯度估计方差太高。
+
+#### 广义优势估计（GAE）
+
+另一个常见的东西 —— **这一条不是 AlpacaFarm 特有的，原始 PPO 论文里就有** ——
+叫**广义优势估计（generalized advantage estimation, GAE）**：
+
+$$
+\hat A_t^{\mathrm{GAE}(\gamma, \lambda)} \;:=\; \sum_{l=0}^{\infty} (\gamma\lambda)^l\, \delta^V_{t+l},
+\qquad \text{其中} \quad
+\delta^V_t \;=\; r_t + \gamma V(s_{t+1}) - V(s_t)
+$$
+
+<Callout type="note" title="补充：GAE 在算什么">
+$\delta^V_t$ 叫 **TD 误差（时序差分误差）**：「实际拿到的即时奖励 $r_t$ 加上对下一状态的估值，
+比对当前状态的估值高出多少」。它是优势的一个单步估计。
+
+GAE 把这些 TD 误差按 $(\gamma\lambda)^l$ 加权求和：
+$\lambda$ 靠近 0 时只信单步估计（偏差大、方差小），
+$\lambda$ 靠近 1 时把整条轨迹的实际奖励都用上（偏差小、方差大）。
+$\gamma$ 是标准的折现因子。
+
+所以 GAE 是一个**在偏差和方差之间连续调节的旋钮**。
+</Callout>
+
+课件下面那句注解是这一节的笑点，Tatsu 称之为「有趣的细节」：
+
+<Callout type="insight" title="γ = λ = 1：一个退化设定">
+**这是一个 bandit 问题，而且 $\gamma = \lambda = 1$ 就能 work** ——
+这时候 GAE 退化成「**reward-to-go 减去价值函数**」。
+
+Tatsu 的评价是：人们经常就直接用 $\gamma = \lambda = 1$，
+这是一个**退化的设定，把问题重新变回了 bandit 问题**。
+换句话说，**你把 PPO 提供的那些多步结构基本上全扔掉了**，
+但价值网络和那一堆复杂度还留在那儿。
+</Callout>
+
+#### 跑起来该看到什么
+
+Tatsu 说，做完一堆工程之后，跑这个算法**你会看到你预期的东西**。
+你在作业里跑自己的 RL 算法时也该看到类似的曲线：
+
+- **整体奖励上升**；
+- 如果在做 RLHF，**奖励模型给的分数上升**；
+- **负的 KL 正则项往下走**（策略在逐渐偏离参考模型，这是预期内的）。
+
+课件的注解是：「这是一个 bandit 设定，你应该期待看到合理的训练曲线。」
+
+### 3.7 为什么大家不想用 PPO
+
+**为什么不用 PPO？**
+
+1. **实践中实现复杂。** Tatsu 的总结：PPO 的实现相当痛苦，取决于环境；
+   **可能需要 hack 才能稳定**。这不是说做不到 —— 很多人用 PPO 训出了非常好的模型，
+   很多大实验室有相当成熟、开箱即用的方案能把 PPO 跑到大规模。
+   但**对于从零实现的研究者来说，PPO 就是很麻烦、很挑剔**。
+2. **价值模型很吃内存，而且要额外调参。** 价值模型**跟原模型一样大** ——
+   它是一整个神经网络，要占一份显存，而这份显存你本来想拿去放模型或者推理服务器。
+   而且它自己也会**破坏训练稳定性**。
+
+**那为什么不用 DPO？** 上一讲讲过 DPO（直接偏好优化），看起来挺好用，为什么不全用它？
+
+1. **DPO 是针对一个非常具体的问题的非常具体的解法。**
+   DPO 擅长的是 **Bradley-Terry 形式的成对反馈**。
+   但**数学问题本质上不是成对比较的形式** —— 你手上是「这道题答对了没有」，不是「A 比 B 好」。
+   确实有一些 DPO 变体试图打破这个成对结构，但那**基本上是拿错了锤子**。
+   **PPO 是那把更通用的锤子，什么都能砸。**
+2. **DPO 一般是离线的**（不过 Tatsu 说这个区分被严重夸大了 ——
+   反复迭代 DPO 就能把它变成在线的，所以他不认为这是个大差别）。
+
+结论：研究社区**极其强烈地想摆脱 PPO**。
+Tatsu 说，DPO 和 GRPO 能获得这么广泛的采用，本身就说明了**把 PPO 调通有多痛苦**。
+
+---
+
+## 四、GRPO：把价值函数扔掉
+
+跟 DPO 一样，**GRPO 是那个替代品** —— 做可验证任务的 RL 的更简单方式。
+它在开源 / 开放知识社区里**基本上已经全面接管了 RLVR**。
+
+GRPO 出自 DeepSeek 的一篇论文（**DeepSeekMath**）。
+它的精神跟 PPO 非常像，只是**把最复杂的那几个部分剥掉了**。
+
+### 4.1 一句话的想法
+
+<Theorem type="definition" name="GRPO（group relative policy optimization，组相对策略优化）">
+
+- **从 PPO 出发**（很多部分是一样的）；
+- **去掉价值函数 / 优势计算**；
+- **把优势算成「组内的 z-score」**。
+
+</Theorem>
+
+为什么要去掉价值函数？Tatsu 说这是 **PPO 里最复杂、最烦人的部分**：
+价值函数是你为了降低梯度更新的方差而减掉的那个基线，
+但**它本身是一整个神经网络**，吃显存，还会破坏训练稳定性。我们不想要它。
+
+但**优势还是要有的** —— 不能退回到 vanilla REINFORCE，那样方差会高得离谱。
+那怎么办？
+
+<Callout type="insight" title="PPO 和 GRPO 的基线，用同一道题对比">
+假设 prompt 是一道数学题，模型采样出的这条回答拿了 5 分。
+
+- **PPO 的做法**：拿价值函数预测一下。
+  「我的神经网络说我在这个状态下应该拿 5 分。我拿了 6 分。所以这是一次好的 rollout。」
+- **GRPO 的做法**：**对同一个 prompt 再采 10 条回答**，然后问：
+  「我跟另外那 10 条比，好还是不好？如果我比均值好，那我的优势就是正的。」
+
+Tatsu 说，在「能对同一个 prompt 多次采样」的场景下，
+**这是一个非常自然的计算优势的方式**。而语言模型恰好完全满足这个条件 ——
+你想采多少条就采多少条。
+</Callout>
+
+### 4.2 完整的 GRPO 目标函数
+
+这是 DeepSeekMath 论文里最初的定义，也是幻灯片上原封不动贴的那一段：
+
+<Theorem type="definition" name="GRPO 目标函数">
+
+对每个问题 $q$，从旧策略 $\pi_{\theta_{\text{old}}}$ 采样一组输出 $\{o_1, o_2, \ldots, o_G\}$，
+然后最大化
+
+$$
+\mathcal{J}_{\text{GRPO}}(\theta) \;=\; \mathbb{E}\bigl[q \sim P(Q),\; \{o_i\}_{i=1}^{G} \sim \pi_{\theta_{\text{old}}}(O \mid q)\bigr]
+$$
+
+$$
+\frac{1}{G} \sum_{i=1}^{G} \Biggl( \min\Bigl(\frac{\pi_\theta(o_i \mid q)}{\pi_{\theta_{\text{old}}}(o_i \mid q)} A_i, \;\; \mathrm{clip}\Bigl(\frac{\pi_\theta(o_i \mid q)}{\pi_{\theta_{\text{old}}}(o_i \mid q)},\, 1 - \epsilon,\, 1 + \epsilon\Bigr) A_i \Bigr) \;-\; \beta\, \mathbb{D}_{\mathrm{KL}}\bigl(\pi_\theta \,\|\, \pi_{\text{ref}}\bigr) \Biggr)
+\tag{1}
+$$
+
+其中 KL 项按下式计算：
+
+$$
+\mathbb{D}_{\mathrm{KL}}\bigl(\pi_\theta \,\|\, \pi_{\text{ref}}\bigr) \;=\; \frac{\pi_{\text{ref}}(o_i \mid q)}{\pi_\theta(o_i \mid q)} \;-\; \log \frac{\pi_{\text{ref}}(o_i \mid q)}{\pi_\theta(o_i \mid q)} \;-\; 1
+\tag{2}
+$$
+
+$\epsilon$ 和 $\beta$ 是超参数，优势 $A_i$ 用组内的奖励 $\{r_1, r_2, \ldots, r_G\}$ 算：
+
+$$
+A_i \;=\; \frac{r_i - \mathrm{mean}(\{r_1, r_2, \cdots, r_G\})}{\mathrm{std}(\{r_1, r_2, \cdots, r_G\})}
+\tag{3}
+$$
+
+</Theorem>
+
+逐块对照 PPO：
+
+- **min / clip 那一块跟 PPO 一模一样** —— 重要性采样比乘优势，再裁剪。
+- **多了一个 KL 项** $-\beta \mathbb{D}_{\mathrm{KL}}(\pi_\theta \| \pi_{\text{ref}})$，
+  把自己拴在参考模型附近。Tatsu 说 KL 用的这个特定形式「细节不特别重要」。
+- **优势换成了式 (3)**：**对一组 rollout 的奖励，减均值、除标准差**，得到每条 rollout 的 z-score。
+
+<Callout type="note" title="补充：式 (2) 那个奇怪的 KL 是什么">
+$\frac{\pi_{\text{ref}}}{\pi_\theta} - \log \frac{\pi_{\text{ref}}}{\pi_\theta} - 1$
+看起来不像教科书里的 KL 散度，其实它是 KL 散度的一个**无偏、且恒非负的单样本估计**
+（在 RL 圈里常被叫做 Schulman 的 **k3 估计器**）。
+
+道理是这样的：记 $u = \pi_{\text{ref}}(o) / \pi_\theta(o)$，其中 $o$ 是从 $\pi_\theta$ 采的。两个事实：
+
+- $\mathbb{E}_{o \sim \pi_\theta}[u] = \sum_o \pi_\theta(o) \frac{\pi_{\text{ref}}(o)}{\pi_\theta(o)} = \sum_o \pi_{\text{ref}}(o) = 1$；
+- $\mathbb{E}_{o \sim \pi_\theta}[\log u] = \mathbb{E}_{o \sim \pi_\theta}\bigl[\log \frac{\pi_{\text{ref}}(o)}{\pi_\theta(o)}\bigr] = -\mathrm{KL}(\pi_\theta \,\|\, \pi_{\text{ref}})$。
+
+逐项取期望：
+
+$$
+\mathbb{E}\bigl[u - \log u - 1\bigr] \;=\; 1 \;-\; \bigl(-\mathrm{KL}(\pi_\theta \,\|\, \pi_{\text{ref}})\bigr) \;-\; 1 \;=\; \mathrm{KL}(\pi_\theta \,\|\, \pi_{\text{ref}})
+$$
+
+好处是：$u - \log u - 1 \ge 0$ 对任意 $u > 0$ 都成立（在 $u = 1$ 处取到 0），
+所以这个估计量**逐样本非负**，方差也比朴素的 $-\log u$ 小。
+朴素估计量会有正有负、抖得厉害 —— 正是 3.6 节里 AlpacaFarm 不得不把 KL 截在 0 以下的那个毛病。
+</Callout>
+
+### 4.3 在线情形下，裁剪其实什么也没做
+
+幻灯片底下有一句加粗的话，Tatsu 强调这是一个重要的区分：
+
+> **在在线（online）情形下（采样完立刻更新），这就只是「带组归一化奖励的策略梯度」。**
+
+为什么？因为如果你**采完 rollout 立刻就用它更新一次**，那么在这一次更新时
+$\pi_\theta = \pi_{\theta_{\text{old}}}$，重要性采样比
+
+$$
+\frac{\pi_\theta(o_i \mid q)}{\pi_{\theta_{\text{old}}}(o_i \mid q)} \;=\; 1
+$$
+
+**裁剪算子永远不会被触发**（1 稳稳地落在 $[1-\epsilon, 1+\epsilon]$ 里）。
+于是 $\min(A_i, A_i) = A_i$，整个目标退化成
+
+$$
+\frac{1}{G}\sum_{i=1}^{G} \Bigl( A_i \;-\; \beta\, \mathbb{D}_{\mathrm{KL}}(\pi_\theta \,\|\, \pi_{\text{ref}}) \Bigr)
+$$
+
+也就是**优势减去一个 KL 惩罚**，对它做策略梯度上升。
+Tatsu 说，在在线 rollout 的情形下，这是一个**非常非常简单、而且作为 RL 目标很讲得通**的对象。
+
+<Callout type="warning" title="别被 min(A, A) = A 误导">
+写成 $\min(A_i, A_i)$ 之后目标函数看起来不含 $\theta$ 了 —— 那怎么求梯度？
+
+关键在于：$\pi_{\theta_{\text{old}}}$ 是**冻结的常数**（做了 stop-gradient），
+而分子上的 $\pi_\theta$ 是**要求导的**。
+所以
+
+$$
+\nabla_\theta \Bigl[\frac{\pi_\theta(o_i)}{\pi_{\theta_{\text{old}}}(o_i)} A_i\Bigr] \;=\; A_i\, \frac{\nabla_\theta \pi_\theta(o_i)}{\pi_{\theta_{\text{old}}}(o_i)}
+$$
+
+在 $\theta = \theta_{\text{old}}$ 处正好等于 $A_i \nabla_\theta \log \pi_\theta(o_i)$ ——
+**就是标准的带优势权重的策略梯度**。
+
+这也是 Tatsu 提到的「你得在某个地方做一次 stop-grad」的原因：
+用自动微分实现时，必须显式地把 $\pi_{\theta_{\text{old}}}$（或 $A_i$）从计算图里摘出去，
+否则梯度会流到不该流的地方。
+</Callout>
+
+<Callout type="tip" title="动手：组内优势是怎么算出来的">
+下面这个演示就是式 (3)。一个 prompt，采 $G$ 条回答，验证器给每条打 0 或 1，
+然后减均值、除标准差。
+
+- 拖「组大小 $G$」和「本组答对的条数 $k$」，看每条 rollout 的优势 $A_i$ 怎么变，
+  哪些被推高（正的、靛蓝）、哪些被压低（负的、茜红）。
+- 把「除以标准差」这个勾去掉，就变成了 **Dr. GRPO** 的做法（第五节会讲），
+  对比一下两列数字。
+- 把 $k$ 拖到 $0$ 或者 $G$（全错 / 全对）：所有优势**同时变成 0** ——
+  **这道题这一轮完全没有学习信号**。这就是第七节里「难度过滤」为什么那么重要。
+- 注意右边那个「相对放大倍数 $1/\sigma$」：当 $k$ 接近 0 或 $G$ 时它会飙上去。
+  这就是 Tatsu 说的「**除以标准差，等于在上调那些太简单或太难的题的权重**」。
+
+</Callout>
+
+<L16GrpoAdvantage />
+
+### 4.4 GRPO 简单到能写在半页幻灯片里
+
+因为没有价值函数，**你可以（而且人们真的会）写出极小的 GRPO 实现**。
+Tatsu 用的参考实现来自 McGill-NLP 的 [nano-aha-moment](https://github.com/McGill-NLP/nano-aha-moment)，
+「组下标的计算、标准差的计算，这一整套就占了半页幻灯片」。
+
+整个流程只有四步：
+
+1. **为每条 rollout 算奖励**；
+2. **按组做均值 / 方差归一化**；
+3. **算 KL 项**；
+4. **在这个损失上做梯度更新**。
+
+优势那部分的代码是这样的（幻灯片原文）：
+
+```python
+rewards = np.array(rewards)                                    # [group_size]
+response_advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-4)
+```
+
+<Callout type="note" title="补充：那个 1e-4 是干什么的">
+Tatsu 说这份实现**跟论文里字面写的 GRPO 唯一的区别，就是标准差里加了一个很小的 1e-4**，
+防止它在下面两种情况下炸掉：
+
+1. **只有一个样本**（$G = 1$，标准差没定义）；
+2. **一组样本的奖励恰好完全相同** —— 这在可验证奖励的场景里**经常发生**，
+   因为你会拿到**数值上精确为 0** 的奖励（比如整组都没解出那道数学题）。
+
+没有这个 1e-4 就是 0 除以 0。
+</Callout>
+
+损失那部分（同样是幻灯片上的 `compute_pg_loss`）：
+
+```python
+with torch.no_grad():
+    ref_logps = compute_token_log_probs(reference_model, model_inputs, TEMPERATURE)
+logps = compute_token_log_probs(policy_model, model_inputs, TEMPERATURE)
+
+# 式 (2) 那个 k3 形式的 KL 估计器
+kl_penalty = torch.exp(ref_logps - logps) - (ref_logps - logps) - 1
+kl_penalty = kl_penalty * labels_mask                     # 只在回答的 token 上算
+
+entropy = -logps.sum() / labels_mask.sum()                # 只是记录用的指标
+
+policy_loss = -logps * advantages[..., 1:]                # 加权的 SFT 梯度，权重 = 优势
+policy_loss = policy_loss * labels_mask
+
+loss = (policy_loss + KL_COEFFICIENT * kl_penalty).sum() / total_response_len
+```
+
+Tatsu 说：「希望这让你体会到 GRPO 有多直接，以及为什么几乎所有开源工作都建在这个算法上。
+**它容易实现、容易理解**，而且效果相当有说服力 ——
+它让开源社区复现出了闭源实验室大概是用 PPO 做出来的那些东西。」
+
+### 4.5 一个最小可跑的 GRPO 实现
+
+<Callout type="note" title="补充：这份代码是讲义补的">
+下面这段是**讲义写的**最小可跑实现，不是幻灯片上的代码。
+它把上面四步串成一个能真的跑起来的训练循环，逐行中文注释。
+为了不依赖 GPU 和真实模型，「语言模型」被换成了一个**很小的分类分布**，
+但**梯度的形状和 GRPO 完全一致**。
+</Callout>
+
+```python
+"""最小 GRPO：一个 prompt、若干候选回答，验证器给 0/1 奖励。
+   跑法：python grpo_min.py   （只需要 PyTorch）"""
+import torch
+
+torch.manual_seed(0)
+
+# ── 环境设定 ────────────────────────────────────────────────
+# 5 个候选「回答」。把它们想成 5 条不同的思维链；只有 0 号和 2 号解对了。
+N_ACTIONS = 5
+REWARD = torch.tensor([1.0, 0.0, 1.0, 0.0, 0.0])   # 验证器给的奖励：对 = 1，错 = 0
+
+# ── 策略 ────────────────────────────────────────────────────
+# 真实的策略是语言模型；这里用一组 logit 代替，softmax 之后就是「生成每条回答的概率」。
+logits = torch.zeros(N_ACTIONS, requires_grad=True)   # 初始时五条等概率
+opt = torch.optim.SGD([logits], lr=0.5)
+
+G = 8            # 组大小：同一个 prompt 采多少条 rollout
+BETA = 0.02      # KL 惩罚系数 β
+EPS = 1e-4       # 标准差里的稳定项，和 nano-aha-moment 一致
+
+# 参考模型 π_ref：训练开始时的策略快照，冻住不动
+with torch.no_grad():
+    ref_logp = torch.log_softmax(logits.detach().clone(), dim=-1)
+
+for step in range(200):
+    # ── 第 1 步：rollout。用「当前」策略采 G 条回答（这是 on-policy 的含义） ──
+    with torch.no_grad():
+        probs = torch.softmax(logits, dim=-1)
+        idx = torch.multinomial(probs, G, replacement=True)   # [G]，采到的是哪条回答
+        rewards = REWARD[idx]                                 # [G]，验证器打分
+
+    # ── 第 2 步：组内 z-score，就是式 (3) ──
+    # 注意用总体标准差（分母是 G，不是 G-1），和幻灯片上 numpy 的 .std() 一致
+    mean = rewards.mean()
+    std = rewards.std(unbiased=False)
+    adv = (rewards - mean) / (std + EPS)                       # [G]，优势 A_i
+    adv = adv.detach()                                         # ← 关键的 stop-grad
+
+    # ── 第 3 步：算这一步的对数概率和 KL 惩罚 ──
+    logp_all = torch.log_softmax(logits, dim=-1)               # 当前策略的 log π_θ
+    logp = logp_all[idx]                                       # [G]，采到的那些回答的 log-prob
+
+    # 式 (2) 的 k3 估计器：u - log u - 1，其中 u = π_ref / π_θ
+    log_u = ref_logp[idx] - logp                               # log u
+    kl = torch.exp(log_u) - log_u - 1                          # [G]，逐样本非负
+
+    # ── 第 4 步：损失 = 负的（优势加权 log-prob）+ β · KL ──
+    # -adv * logp 就是「带权重的 SFT 更新」：adv > 0 的回答被推高，adv < 0 的被压低
+    loss = (-adv * logp + BETA * kl).mean()
+
+    opt.zero_grad()
+    loss.backward()
+    opt.step()
+
+    if step % 40 == 0:
+        p = torch.softmax(logits, dim=-1).detach()
+        print(f"step {step:3d}  正确回答的总概率 = {p[0] + p[2]:.4f}  p = {p.numpy().round(3)}")
+
+print("最终：", torch.softmax(logits, dim=-1).detach().numpy().round(3))
+```
+
+跑出来会看到「正确回答的总概率」从 0.4（五条等概率里有两条对）一路涨到接近 1，
+而 KL 惩罚会阻止它完全塌到某一条上。把 `BETA` 调大，你会看到最终分布**更接近初始的均匀分布**；
+调成 0，模型会毫不犹豫地把概率全部堆到某一条正确回答上。
+
+<Callout type="insight" title="这段代码里最容易写错的一行">
+`adv = adv.detach()`。
+
+优势是**用奖励和其他 rollout 算出来的一个标量**，它**不该有梯度**。
+如果忘了 detach，`std` 和 `mean` 会把梯度传回 `logits`，
+你优化的就不再是「期望奖励」，而是某个乱七八糟的东西。
+
+Tatsu 在课上专门提了这件事：「你得动一点脑筋，因为要用自动微分做这个，
+**你必须在某个地方放一个 stop-grad**，不过其实没那么复杂。」
+</Callout>
+
+### 4.6 它管用吗
+
+<Figure src="/courses/cs336/l16-grpo-vs-rft.png" wide caption="DeepSeekMath 论文里的结果：GRPO（黄线 GRPO+OS 和蓝线 GRPO+PS）明显好过 RFT 和 Online RFT。来源：DeepSeekMath 论文图 5，转引自 CS336 第 16 讲课件" />
+
+Tatsu 推荐读 DeepSeekMath 那篇论文（「如果你对数学 AI 感兴趣的话」）。结果是：
+
+- **GRPO（黄线和蓝线）比 RFT 好很多。**
+
+  <Callout type="note" title="补充：RFT 是什么">
+  **RFT = rejection fine-tuning（拒绝采样微调）**，Tatsu 的描述是：
+  **把模型自己生成的正确答案拿出来，在上面做 SFT，其余全部扔掉。**
+
+  你在作业里也会把它实现成一个基线。它和 RL 的关键区别是：
+  **RFT 只有正梯度**（学正确的），**没有负梯度**（不去压低错误的）。
+  第 7.6 节还会回到这个对比。
+  </Callout>
+
+- **过程监督（process supervision, PS）似乎能带来一些额外收益。**
+  Tatsu 说这一点很重要，值得单独讨论，因为它是这类 RL 问题的**重大设计决策之一** ——
+  第 6.7 节会讲 R1 是怎么处理它的。
+
+「不过就现在而言，你可以先内化一个事实：**GRPO 管用。蓝线和黄线在其他线上面。**」
+
+---
+
+## 五、认真想想 GRPO 的目标函数：它其实不干净
+
+Tatsu 说：现在来仔细想想 GRPO 这个目标函数。**我们真的在做策略梯度吗？**
+这是应该认真想清楚的重要概念问题。
+
+### 5.1 什么叫「合法的」基线
+
+回到 PPO 和 GRPO 的差别：PPO 有一个价值函数喂进优势，GRPO 把它剥掉换成了 z-score。
+**那么这是一个好的优势函数吗？**
+
+幻灯片直接贴了 Sutton & Barto 里 13.4 节「带基线的 REINFORCE」那一页：
+
+<Theorem type="proposition" name="Sutton & Barto 13.4：带基线的 REINFORCE">
+
+策略梯度定理可以推广到包含一个任意的**基线 $b(s)$**：
+
+$$
+\nabla J(\boldsymbol\theta) \;\propto\; \sum_s \mu(s) \sum_a \bigl(q_\pi(s,a) - b(s)\bigr) \nabla \pi(a \mid s, \boldsymbol\theta)
+$$
+
+**基线可以是任何函数，甚至可以是随机变量，只要它不随 $a$ 变化。**
+等式仍然成立，因为被减掉的那部分是零：
+
+$$
+\sum_a b(s) \nabla \pi(a \mid s, \boldsymbol\theta) \;=\; b(s) \nabla \sum_a \pi(a \mid s, \boldsymbol\theta) \;=\; b(s) \nabla 1 \;=\; 0
+$$
+
+由此得到带一般基线的 REINFORCE 更新：
+
+$$
+\boldsymbol\theta_{t+1} \;\doteq\; \boldsymbol\theta_t + \alpha \bigl(G_t - b(S_t)\bigr) \frac{\nabla \pi(A_t \mid S_t, \boldsymbol\theta_t)}{\pi(A_t \mid S_t, \boldsymbol\theta_t)}
+$$
+
+</Theorem>
+
+Tatsu 的翻译：**你被允许做的事情是 —— 从奖励里减掉任何一个依赖状态的基线。**
+在 bandit 世界里，**状态就是 prompt**，所以你可以减掉一个**依赖 prompt 的基线**。
+只要你只做这件事，它**仍然是合法的策略梯度**：
+**你还是在朝同一个方向下降**，只不过取决于 $b$ 的选择，方差会更低或更高。
+
+### 5.2 GRPO 用的不是合法基线
+
+「你大概已经注意到了：**我们做的并不是这件事。**」
+
+<Callout type="warning" title="GRPO 破坏了基线契约">
+GRPO 的优势是
+
+$$
+A_i \;=\; \frac{r_i - \mathrm{mean}(\{r_1, \ldots, r_G\})}{\mathrm{std}(\{r_1, \ldots, r_G\})}
+$$
+
+**我们不只是减掉了一个常数，我们还除以了标准差。**
+
+标准差**也是用这一组奖励算出来的**，它是一个随机量，而且**跟这组样本相关**。
+除以它**破坏了 unbiasedness（无偏性）**。
+
+Tatsu 的说法：「如果你真的想要一个概念上清楚、名副其实、真的在下降奖励的算法，
+**GRPO 并不做这件事**。」
+</Callout>
+
+而且还有第二处偏离，Tatsu 说这是「一个之前没提、比较微妙的实现细节」：
+
+**GRPO 是几乎逐 token 做的** —— 它会**除以序列的总长度**作为归一化因子。
+但如果你从第一性原理出发、按照策略梯度定理和基线定理去推 GRPO，
+**你推出来的东西不长这样**：**既不会有长度归一化，也不会有标准差归一化。**
+
+论文里完整的 token 级写法长这样。为了看得清，先给重要性采样比起个短名字：
+
+$$
+\rho_{i,t}(\theta) \;=\; \frac{\pi_\theta(o_{i,t} \mid \mathbf{q}, \mathbf{o}_{i,<t})}{\pi_{\theta_{\text{old}}}(o_{i,t} \mid \mathbf{q}, \mathbf{o}_{i,<t})}
+$$
+
+那么 GRPO 的 token 级目标是
+
+$$
+\frac{1}{G}\sum_{i=1}^{G} \; \boxed{\frac{1}{|o_i|}} \; \sum_{t=1}^{|o_i|} \min\Bigl[\rho_{i,t}(\theta)\, \hat A_{i,t}, \;\; \mathrm{clip}\bigl(\rho_{i,t}(\theta),\, 1-\epsilon,\, 1+\epsilon\bigr)\hat A_{i,t}\Bigr]
+$$
+
+$$
+\hat A_{i,t} \;=\; \frac{R(\mathbf{q}, \mathbf{o}_i) - \mathrm{mean}(\{R(\mathbf{q},\mathbf{o}_1), \ldots, R(\mathbf{q},\mathbf{o}_G)\})}{\boxed{\mathrm{std}(\{R(\mathbf{q},\mathbf{o}_1), \ldots, R(\mathbf{q},\mathbf{o}_G)\})}}
+$$
+
+**框起来的那两处，就是从第一性原理推不出来的两项。**
+
+GRPO 刚出来不久，就有人注意到了这两处。他们写了一篇论文（**Liu et al. 2025**，
+方法叫 **Dr. GRPO**，意思是「GRPO Done Right（做对了的 GRPO）」）说：
+**如果你不做这两件不一样的事，你会得到非常不同、而且可能非常正面的行为。**
+
+<Theorem type="definition" name="Dr. GRPO：无偏梯度版本的 GRPO">
+
+$$
+\frac{1}{G}\sum_{i=1}^{G} \sum_{t=1}^{|o_i|} \min\Bigl[\rho_{i,t}(\theta)\, \hat A_{i,t}, \;\; \mathrm{clip}\bigl(\rho_{i,t}(\theta),\, 1-\epsilon,\, 1+\epsilon\bigr)\hat A_{i,t}\Bigr]
+$$
+
+$$
+\hat A_{i,t} \;=\; R(\mathbf{q}, \mathbf{o}_i) - \mathrm{mean}(\{R(\mathbf{q},\mathbf{o}_1), \ldots, R(\mathbf{q},\mathbf{o}_G)\})
+$$
+
+也就是：**去掉 $1/|o_i|$，去掉除以标准差。** 剩下的就是一个干净的、
+「奖励减去组内均值」的合法基线。
+
+课件的注解：**这已经很接近 REINFORCE with leave-one-out（留一法 REINFORCE）了。**
+</Theorem>
+
+<Callout type="note" title="补充：leave-one-out 是什么意思">
+更严格的无偏做法是：算第 $i$ 条的优势时，基线只用**其余 $G-1$ 条**的均值，
+而不是包括自己在内的全部 $G$ 条。
+
+理由很简单：基线必须**与被评价的那个动作独立**才严格无偏。
+把自己也算进均值里，会引入一点点相关性。
+不过当 $G$ 比较大时，两者的差别是 $O(1/G)$ 级别的，实践中影响很小。
+</Callout>
+
+Tatsu 的总结：**GRPO 不是从第一性原理推出来的算法。它实际在做的事情稍有不同，有利有弊。**
+
+### 5.3 这两项各自在干什么
+
+「我们现在知道 GRPO 并不是直接在奖励目标上下降，也知道它有这两个修正因子。**它们各自干什么？**」
+
+#### 长度归一化：鼓励错误答案越写越长
+
+**长度归一化比较容易看出来。** 我们在干什么？**我们把更长的序列除以一个更大的数。**
+
+Tatsu 的推演（这是这一讲最重要的直觉之一）：
+
+> 假设我知道我这个数学证明要写错了。我会拿到 $-1$ 的负奖励。
+> **那我就生成一个无限长的字符串。** 这样我就可以除以无穷大，
+> **我的负惩罚就被完全消掉了。**
+
+这是极端情形，但道理清楚了：**除以输出长度，等于在鼓励模型 —— 一旦发现自己解不出来，
+就开始胡扯下去。**
+
+论文里那段原话说得更完整（幻灯片上贴的 Dr. GRPO 原文）：
+
+> **回答级别的长度偏置**：这来自除以 $|o_i|$。对于**正优势**（$\hat A_{i,t} > 0$，即回答正确），
+> 这个偏置导致**更短的回答得到更大的梯度更新**，使策略在正确答案上偏好简洁。
+> 反过来，对于**负优势**（$\hat A_{i,t} < 0$，即回答错误），**更长的回答因为 $|o_i|$ 更大而受到更少的惩罚**，
+> 使策略在错误答案里偏好更长的回答。
+
+<Callout type="insight" title="课堂提问：正确的那一侧呢">
+有同学问：对正确的情形，长度归一化在干什么？
+
+Tatsu 的回答：**在那些情形下，长度归一化会鼓励你把思维链缩短。**
+
+- 如果你想省推理成本，这是**好事**；
+- 如果这会损害准确率，那就是**坏事**。
+
+但他说**主要问题还是在负例那一侧** —— 你会得到一些**非常非常长**的错误回答。
+在正例那边，它其实压不了多少，因为**要解出一道特定的题，思维链有一个长度下限**，
+不可能无限缩短。
+</Callout>
+
+<Callout type="tip" title="动手：长度归一化的偏置">
+下面这个演示把上面那段论文原文变成数字。一组 4 条 rollout，2 对 2 错。
+表里给出每条回答**作用在整条序列上的梯度系数**：
+
+- **GRPO**：$A_i / |o_i|$
+- **Dr. GRPO**：$A_i$（没有长度项）
+
+拖动那条「错误回答的长度」滑块，看 GRPO 那一列的惩罚怎么按 $1/L$ 衰减 ——
+**长度翻一倍，惩罚正好减半**。旁边会直接报出「再写长一倍能省下多少惩罚」。
+这就是 Tatsu 那个「生成无限长字符串把惩罚除没」的可量化版本。
+
+同时看正确那一侧：短的正确回答拿到更大的正系数，
+所以策略**在正确答案上偏好简洁、在错误答案上偏好啰嗦** —— 一个非常别扭的组合。
+
+</Callout>
+
+<L16LengthBias />
+
+<Figure src="/courses/cs336/l16-length-bias-fix.png" wide caption="修掉之后会怎样：奖励（1）几乎一样，但输出长度（2）不再无限增长；分开看正确（3）和错误（4）的长度，可以看到差距几乎全部来自错误回答那一侧。来源：Dr. GRPO（Liu et al. 2025），转引自 CS336 第 16 讲课件" />
+
+Tatsu 说：**如果你把这一项修掉，人们在 GRPO 里观察到的那种「思维链越来越长、
+一直长下去」的现象，会变成「涨到某个常数就封顶」。** 这看起来是件好事 ——
+尤其在错误的情形下，你真的不希望输出越来越长。
+
+#### 标准差归一化：上调太简单和太难的题
+
+**这一项更微妙一点。** 除以标准差，可以理解为**在强调那些标准差小的问题**。
+
+那么二值奖励下，**什么时候标准差小？** 当**题目太简单或太难**的时候：
+
+- 题目**特别简单**，我 100% 都答对 → 奖励**没有任何变化**，标准差是 0，
+  于是我在**除以一个接近 0 的数**；
+- 题目**特别难**，我 100% 都答错 → 同样，奖励零方差。
+
+**所以标准差这一项把两头（太简单和太难）的题的权重都调高了。**
+Tatsu 的评价：**这显然是我们大概不想要的** ——
+我们希望模型学的是那些**落在它可解范围内**的题。
+
+（第 4.3 节那个演示里的「相对放大倍数 $1/\sigma$」就是这一项的量化形状：
+$k = G/2$ 时它是 $2$，$k = 1$（8 条里只对 1 条）时涨到 $3.02$，
+$G = 16$ 只对 1 条时涨到 $4.13$。）
+
+<Callout type="note" title="补充：完全没有方差时会怎样">
+注意一个容易混淆的地方：如果整组奖励**完全相同**（全对或全错），
+分子 $r_i - \mathrm{mean}$ **恰好是 0**，所以优势是 $0 / (0 + 10^{-4}) = 0$ ——
+**这道题这一轮的学习信号是零**，而不是被无限放大。
+
+「上调权重」说的是**接近**退化的情形（8 条对 1 条、7 条），
+而不是**恰好**退化的情形。恰好退化的情形是纯浪费算力 ——
+这正是第七节那些技术报告都要做**难度过滤**的原因。
+</Callout>
+
+### 5.4 小结，以及接下来看什么
+
+「以上就是 RLVR 的算法部分。」Tatsu 在这里停下来问有没有算法上的问题，然后进入案例研究。
+
+他说接下来会过一遍**几个最近的模型发布**，把他认为重要的算法组件都讲一讲，
+**包括今年新加的内容 —— 也就是智能体（agentic）那部分**，
+他认为这一块正在流行起来，而且**对使用和部署这些模型越来越重要**。
+
+课件上列的三个案例是：
+
+- **DeepSeek R1** —— 近期很多 RLVR 工作的核心，细节非常多；
+- **Kimi K1.5** —— 和 R1 同期，同样是 RLVR，**细节和 R1 互补**；
+- **Qwen 3** —— 最近的开源推理模型尝试，**低数据量的 RLVR**。
+
+---
+
+## 六、案例一：DeepSeek R1
+
+「我们从 DeepSeek R1 开始，因为我觉得这多少是一个社会现象。我认为每个人都该多了解一点 R1。
+我觉得这是一篇可爱的论文。」
+
+它**掀起了开源 RLVR 模型的浪潮**。为什么值得注意：
+
+- **性能超过 OpenAI o1**。Tatsu 说 R1 大概是**第一个真正对上了 o1 那种行为**的东西 ——
+  o1 的关键特征是**很长的思维链**、**明显是 RL 出来的**、**在难数学题上表现非常好**。
+- **开放的 RL 配方，而且相当简单**。从研发的角度看这非常重要：
+  如果他们的方案是「一个只有 DeepSeek 跑得动的可怕 PPO 系统」，
+  那对研究者的影响就小得多；而这个 GRPO 的东西**任何人都能玩，包括你在作业里**。
+- **终结了关于 MCTS / PRM 是否必要的猜测**（第 6.7 节）。
+- **关于 SFT 的洞察**（R1-zero 和 distill-R1 两条线）。
+
+### 6.1 起点：DeepSeekMath
+
+Tatsu 说，你能看出 DeepSeek 的专长是**一层一层叠上去**的：
+他们先有 DeepSeekMath 那篇论文做 GRPO，**已经搞懂了在数学题上做 RL 的很多细节**，
+所以 R1 直接从 DeepSeekMath 的很多部件出发。
+
+但有一处**非常重要的差别**，Tatsu 特意标出来：
+
+<Callout type="warning" title="R1 放弃了过程监督">
+**他们放弃了过程监督（process supervision），只用结果监督（outcome supervision）。**
+而过程监督恰恰是在 DeepSeekMath 里效果很好的东西。
+
+- **结果监督**：只根据**最终答案对不对**给奖励。
+- **过程监督**：有一份评分细则（rubric），去检查**证明中间步骤的有效性**。
+
+很多人当时认为过程监督很重要。**结果证明，对很多事情来说它并不关键。**
+</Callout>
+
+### 6.2 受控设定：R1-zero
+
+R1 有很多部件，但**其中最有意思的一个是 R1-zero** —— 在这里他们**几乎不做后训练**。
+
+**设置：**
+
+- **基础模型**：DeepSeek-V3。（Tatsu 补充：当然，我们现在都知道所谓 base model
+  其实也是经过中期训练的，所以这个模型已经有一定的指令跟随能力了。）
+- **算法**：GRPO。
+- **奖励**：
+  - **准确率奖励（accuracy rewards）** —— 一批数学题解对了没有；
+  - **格式奖励（format rewards）** —— 要求模型正确使用 thinking 标签把思维链包起来。
+    这一条很重要，因为**格式奖励让他们后面能把思维链剥出来**。
+- **数据**：未公开。
+
+<Callout type="insight" title="为什么 R1-zero 这么值得看">
+「这个配方非常简单。GRPO 非常简单。准确率奖励非常简单。**事实上你会在作业里实现并复现
+基本上这一套结果。** 你就做这么简单的配方，最后到哪儿？
+**最后你得到的东西只比 OpenAI o1 差一点点。**」
+
+Tatsu 说他喜欢这个结果，因为**它没有真实生产后训练流水线里的那些混乱**。
+你不会去怀疑「是不是因为 RLHF 帮了忙」或者别的什么。
+**就是一个基础模型加 GRPO，数学能力就相当好了。**
+</Callout>
+
+### 6.3 「有意思的现象」（？）
+
+<Figure src="/courses/cs336/l16-r1zero-phenomena.png" wide caption="R1 论文里被广泛传播的两个现象：训练中平均回答长度持续增长（左），以及模型在思维链里写出「Wait, wait. That's an aha moment I can flag here.」（右）。来源：DeepSeek-R1 论文，转引自 CS336 第 16 讲课件" />
+
+R1 之所以火，一部分是因为论文里声称观察到的两个现象：
+
+1. **训练越久，思维链越长。** 模型能思考得越来越久，CoT 越来越长。
+2. **「aha 时刻」。** 这个在社交媒体上传疯了 —— 训练到一定程度，
+   模型会在思维链里写出「等一下，等一下。这里有一个我可以标记出来的 aha 时刻」这样的话。
+
+**Tatsu 对这两个现象都持保留态度。**
+
+<Figure src="/courses/cs336/l16-drgrpo-analysis.png" wide caption="Dr. GRPO 的后续分析：左上是被指出有偏的 GRPO 目标（红色两项），右上是「token 效率」—— Dr. GRPO 用更短的输出拿到同样的奖励；下面是基础模型自己就会说「Aha! I can use this to get...」。来源：Liu et al. 2025，转引自 CS336 第 16 讲课件" />
+
+- **关于长度**：我们现在知道，**更长的 CoT 大概率只是 GRPO 长度归一化的自然副作用**
+  （第 5.3 节）。
+- **关于 aha 时刻**：**别人已经证明，它在基础模型里就出现了。**
+  所以它显然不可能只是 RL 算法的产物。Tatsu 的解释：很多人在解数学题时会说「啊哈，
+  我可以用这个」，**模型在预训练时就学会了这句话**；RL 过程中它在大量吐数学 token，
+  **这句话被顺带提取出来一点也不奇怪**。
+
+「所以我觉得被高亮出来的这些现象**并不特别突出、也不特别令人兴奋**。
+但我确实认为 **R1 是一个非常重要的里程碑**，因为它凸显了 **RLVR 可以有多简单** ——
+作为一个算法、作为一种解决这类难题的方式，它在某种意义上非常干净。」
+
+<Callout type="insight" title="课堂追问：怎么从图里看出来是错误回答在变长">
+有同学追问那张图该怎么读。Tatsu 说 Dr. GRPO 那篇的图更清楚：
+
+**R1 论文里的那张图是聚合过的** —— 是所有评测上所有回答的平均，不只是正确的那些。
+而 Dr. GRPO 的图把**平均输出长度、错误回答长度、正确回答长度**分开画，
+可以看到**长度增长主要是由错误回答驱动的** —— 正如长度归一化的解释所预测的那样。
+
+「至少在这些受控对比里，故事是相当干净、相当清楚的。」
+</Callout>
+
+### 6.4 R1：把它产品化
+
+R1-zero 是一个很干净的受控设定。**R1 则是他们把这套东西产品化的尝试。**
+
+<Figure src="/courses/cs336/l16-r1-pipeline.png" wide caption="R1 的完整流水线：DeepSeek-V3 → 推理 SFT → RL（GRPO）→ SFT/RLHF。来源：CS336 第 16 讲课件" />
+
+Tatsu 说 R1（以及后面 Qwen 的对应物）好在**你能看清所有零件是怎么摞起来的**：
+「我们分别研究过每个零件 —— 我们知道预训练在哪，知道有 RLHF，知道有 SFT，
+**但怎么把所有零件组合成最终的系统？**」
+
+通常的做法是：**中期训练好的模型 → 一堆推理训练（中间可能还有长上下文扩展）→
+最后做 RLHF**，因为 RLHF 在某种意义上是**最面向用户**的那一环 ——
+你想确保格式之类的东西是好的，RLHF 在这上面很有帮助。
+
+**R1 相对 R1-zero 的三个关键差别：**
+
+1. **SFT 初始化**（冷启动）；
+2. **给思维链加了语言一致性奖励**；
+3. **第二阶段引入了非可验证奖励**。
+
+#### 语言一致性奖励
+
+Tatsu 说这个细节很有意思：**如果按 R1-zero 那样训、不加一致性奖励，
+思维链里会发生语言切换**（中英文混着来）。他们觉得这**非常不可解释、有点让人不安**，
+所以希望模型输出单一、一致的语言。**所以这纯粹是出于可解释性的理由做的。**
+
+课件上留了个问号：「关于语言切换的这条注记很有意思…… RL 会自然地导致混合语言？」
+
+#### SFT 初始化：读技术报告要读字缝
+
+R1-zero 完全不做 SFT，但 **R1 愿意用长思维链数据做 SFT**。
+
+<Callout type="insight" title="Tatsu 教你读开源技术报告">
+「读这些开源技术报告的时候，试着读出字缝里的意思是挺有意思的。
+当他们说『**我们构造并收集了少量长思维链数据**』的时候，
+你可能会想：**这是不是从别的模型蒸馏来的？**」
+
+他补了一句：这**并不是对开源模型的负面评价**，**现在大家都在这么干**。
+他只是觉得这句话**写得非常小心**，很有意思。
+
+课件上的注解是：「先来点朴素的（长）CoT，然后也许再加一点额外的验证（含糊其辞）。
+**声称的好处：可解释性。注意：数据的来源不太清楚。**」
+</Callout>
+
+流程是：用这批长 CoT 数据微调模型，然后**加一些验证来过滤这些 CoT**，再继续往下走。
+
+#### 一点点 SFT 数据就够了
+
+<Figure src="/courses/cs336/l16-s1-sft.png" wide caption="s1：1000 道数学和科学题 + 来自 Gemini / r1 的长思维链，就能把一个 32B 模型推到 MATH-500 上 93.0。来源：s1 论文，转引自 CS336 第 16 讲课件" />
+
+「我们知道，对一个足够好的基础模型来说，**光是在长 CoT 上做 SFT，
+就能解锁很多 o1 式的能力**。这是一个很好的 RL 起点。」
+
+课件上举的例子是 **s1**：**1000 道数学和科学题 + 来自 Gemini / r1 的长思维链**，
+就足以把 Qwen2.5-32B 从 MATH-500 的 84.0 推到 93.0，
+AIME 2024 从 26.7 推到 56.7。图上那条「最省样本」的前沿，s1 就在最左端。
+
+Tatsu 说，**他自己的学生也有工作显示**：只要蒸馏流程对、基础模型对，
+**你基本上可以只靠 SFT 就把长思维链的推理能力榨出来**。
+
+<Callout type="insight" title="那到底还需不需要 RL？Tatsu 的看法">
+「我觉得这也许很有意思，因为**一个仍然开放的问题是：这些东西真的需要 RL 吗？**」
+
+他给的一个思考框架是：
+
+**RL 在语言建模里的角色，是一个极好的监督信号来源。**
+
+如果你在解前沿的数学问题，**你根本没有那种详细长思维链的监督数据** ——
+没人写过。**RL 让你能自己生成这种监督。**
+
+但**一旦有人已经生成了这些长 CoT，你就可以通过模仿来学**。
+这似乎正是那一批蒸馏结果所部分展示的东西。
+</Callout>
+
+#### RL 阶段与最后的 SFT / RLHF
+
+**RL 部分基本上跟 R1-zero 一样**，只是多了那个语言一致性损失。
+
+再往后就是上一讲学过的那些：
+
+- **SFT 阶段，2 个 epoch**：
+  - **推理数据** —— 针对**非可验证任务**（比如「写一个 X 的证明」），
+    用 **DeepSeek-V3 当裁判**，共 **60 万条**；
+  - **非推理数据** —— 直接用 V3 的 SFT 数据集，**20 万条**。
+- **RLHF 阶段**：
+  - 在这里**复用 R1-zero 式的推理 RLHF**；
+  - **非可验证任务**走 V3 的 RLHF 流水线，**仍然用 GRPO**（用来做 RLHF）。
+
+「所以这里**完全没有惊喜**。」
+
+### 6.5 效果与蒸馏
+
+<Figure src="/courses/cs336/l16-r1-results.png" wide caption="R1 的成绩单：在很多类别上打败了 o1-1217，AIME 2024 拿到 79.8，MATH-500 拿到 97.3。来源：DeepSeek-R1 论文，转引自 CS336 第 16 讲课件" />
+
+「它相当相当好。我觉得这就是当时那阵恐慌、或者说巨大关注的原因 ——
+**R1 是一个真正很好的模型**，在很多类别上打败了 o1，
+**匹配了人们期待的很多测试时扩展行为**，而且**来自一个非常简单的配方**，
+所以**很容易搞清楚收益是从哪来的**。」
+
+<Figure src="/courses/cs336/l16-r1-distill.png" wide caption="蒸馏：让 R1 生成 80 万条思维链，教给 Qwen 2.5 和 Llama。DeepSeek-R1-Distill-Qwen-32B 在 AIME 2024 上拿到 72.6，超过 QwQ-32B-Preview 的 50.0。来源：DeepSeek-R1 论文，转引自 CS336 第 16 讲课件" />
+
+**蒸馏 —— 能不能让不会推理的模型学会推理？**
+
+流程只有两步：
+
+1. **让 R1 生成思维链轨迹（80 万条！）**；
+2. **通过蒸馏教给 Qwen 2.5。**
+
+结果是：这些模型的性能被**显著提升**，某些情况下**匹配上了那些专门的思考模型**。
+
+「换句话说，如果你能拿到**对这些模型来说可读（legible）的那种长思维链**，
+往往就有可能让它们长时间地推理下去 —— **基础模型本身已经好得出人意料**。
+而且**这对 Llama 系列也 work**，我觉得这挺让人着迷的。」
+
+### 6.6 失败的尝试：Tatsu 特别欣赏的一节
+
+「我很喜欢 DeepSeek 的很多技术报告，因为**他们经常既做消融，也告诉你哪些事情没成**。」
+
+如果你一路追着看：DeepSeekMath 里有一大堆过程奖励模型（PRM）的内容 ——
+「我们得验证每一步」。**然后你读 R1，你会问：过程奖励模型跑哪去了？**
+
+**他们告诉你跑哪去了：**
+
+- **PRM（过程奖励模型，process reward model）**：他们试过让 PRM 工作，
+  **对他们来说就是没什么用**。事实证明**结果奖励模型就足够好了，而且数据能扩展得好得多**。
+
+  <Callout type="note" title="补充：PRM 难在哪">
+  Tatsu 说 PRM 的一大争议是：**这些一步一步的评分细则你上哪儿去搞？**
+  **这个东西非常难规模化。**
+
+  「我觉得到这个时候已经相当清楚了：**结果奖励模型非常非常好，
+  这也是绝大部分动作发生的地方。**」
+  </Callout>
+
+- **MCTS（蒙特卡洛树搜索）**：如果你经历过 o1 刚发布那阵，
+  很多人猜 OpenAI 内部到底在干什么 —— 「他们在做 PRM 吗？他们在做 AlphaGo 那样的树搜索吗？」
+  **DeepSeek 也试了很多 MCTS，他们描述说没能让它工作得很好。**
+
+「我非常想强调一点：**他们对所有这些探索、以及那些试过但没成的事情非常开放**，
+而不是干脆不提自己试过。」
+
+---
+
+## 七、案例二：Kimi K1.5
+
+「每次我讲 R1，我都觉得有义务讲一下 Kimi K1.5。」
+
+- **和 R1 同时发布**；
+- **同样用 RL 打败了 o1**；
+- 但**所有人谈的都是 DeepSeek**，Kimi 在讨论里被提得少得多，**尽管他们的模型极其好**。
+
+Tatsu 说他讲 Kimi 不是出于同情：**Kimi 有几件事做得跟 DeepSeek 相当不同，
+而「两条路都 work」这个事实本身能教我们很多。**
+
+这也是这门课反复出现的主题：**通过读大量技术报告、看更宽的模式，
+我们能大致理解哪些是让这些算法 work 的有效或者说容易走通的空间。**
+
+Kimi 有两处特别值得看：
+
+- **数据集构造和课程生成**上讲得细得多（很多人说这非常重要）；
+- **他们用的 RL 算法不完全是 GRPO**，虽然直觉上有相似之处 ——
+  这是另一个很好的验证：**技术上你不一定非要 GRPO 才能让这些东西 work。**
+
+它的三个关键步骤是：**数据集构造（难度过滤）→ SFT（针对长 CoT）→ RL（用他们自己的策略梯度损失）**。
+
+### 7.1 数据：RL 特有的难题是「课程」
+
+数据依然非常重要。但**对 RL 来说多了一个褶皱：课程（curriculum）** ——
+**你想往里扔什么难度的题？**
+
+Tatsu 对比了三种训练范式对数据难度的敏感度：
+
+- **预训练**：基本不考虑难度，数据塞进去、算预训练损失，模型被迫从中学习。
+- **SFT**：有一点微妙（上一讲讨论过幻觉问题，有些数据你未必想训）。
+- **RL**：**多了一个致命的褶皱 —— 如果题目太难，你拿不到任何奖励；
+  没有奖励就没有信号；没有信号就学不到东西。**
+
+所以**对正确类型的样本有广泛覆盖非常重要**。
+
+Kimi 的做法：
+
+- **在数学类场景里做标准的数据整理，平衡各个主题**（不意外）；
+- **排除选择题 / 判断题**，因为会有**假阳性**（蒙对了也算对）。
+  他们的论据是：他们想要**需要长时间深度思考**的题，选择题也许不具备这个性质。
+- **只保留 best-of-8 失败的样本** —— Tatsu 说**这最后一条可能是最重要的想法**，
+  它出现在很多不同的 RL 论文里。
+
+<Theorem type="definition" name="best-of-K 难度过滤">
+对每道题，让模型采样 $K$ 次（这里 $K = 8$）。
+
+- 如果模型**至少能做对一次**，说明这道题**已经在模型能力边缘之内**了 ——
+  它**不是一个好的 RL 样本**，因为你教不了它什么特别新的东西。
+- 所以**只保留那些没通过这个测试的题**。
+
+这么做的好处：
+
+1. **省算力** —— 可以整题整题地跳过；
+2. 也可以**两头都过滤**，得到**既不太难也不太容易**的题。
+
+Tatsu 说研究社区的普遍共识是：**如果你真正想要的是让 RL 稳步推进，
+这种中等难度区间的过滤非常有用。**
+</Theorem>
+
+关于 SFT：**和 DeepSeek 一样，没有描述**。课件上写的是「只被描述成『prompt engineering』（蒸馏？）」。
+「我们可以猜，但没有具体信息。」
+
+### 7.2 Kimi 的 RL 算法：从 DPO 式推导走到 GRPO 附近
+
+「Kimi 有意思的地方是：他们有一套 **DPO 风格的论证**，但**最后落到了一个和 GRPO 非常相似的地方**。
+**两条路殊途同归**，这暗示了哪些部件可能是真正有用的 —— 这对你设计新 RL 算法很有参考价值。」
+
+**第一步：完全一样的起点。** Kimi 用的是**基于参考答案的奖励模型**，所以优化问题是
+
+$$
+\max_\theta \; \mathbb{E}_{(x, y^*) \sim \mathcal{D}}\Bigl[\mathbb{E}_{(y,z) \sim \pi_\theta}\bigl[r(x, y, y^*)\bigr] - \tau \mathrm{KL}\bigl(\pi_\theta(x) \,\|\, \pi_{\theta_i}(x)\bigr)\Bigr]
+$$
+
+Tatsu 说这个式子现在对你们应该已经很熟悉了：**最大化我的策略下的期望奖励，
+右边有个 KL 正则把我拴在基础策略（或者根据你怎么做 RL，前一次迭代的策略）附近。**
+
+这里 $x$ 是问题，$y^*$ 是标准答案，$y$ 是模型给的答案，$z$ 是思维链，$\tau$ 是 KL 系数。
+
+**第二步：DPO 式的推导。** 假设我可以**解析地**求出这个最大化问题的解，
+然后**反解出对应的奖励模型**，得到一个策略之比：
+
+$$
+r(x, y, y^*) - \tau \log Z \;=\; \tau \log \frac{\pi^*(y, z \mid x)}{\pi_{\theta_i}(y, z \mid x)}
+$$
+
+（课件注解：**非参数假设 + 反解 $r$**。$Z$ 是配分函数。）
+
+**第三步：一个大胆的启发式。** 他们现在想**匹配这个奖励模型**。
+上面这个等式**在最优解处成立**。于是 ——
+
+<Callout type="insight" title="Tatsu 对这一步的评价">
+「因此，**这是一个很大的启发式**：既然某个东西在最小值处相等，
+**那我们干脆给它套一个平方损失、最小化这个平方损失不就行了？**」
+
+「我觉得做优化的人看到这个会吓坏。**但我认为这在某种意义上是完全合理的直觉** ——
+我们知道模型好的时候这两个东西应该是接近的。
+所以**把这两个量显式地拉近，作为一个替代目标，也许也没问题**。」
+</Callout>
+
+于是损失函数是
+
+$$
+L(\theta) \;=\; \mathbb{E}_{(x,y^*) \sim \mathcal{D}}\Biggl[\mathbb{E}_{(y,z) \sim \pi_{\theta_i}}\Biggl[\biggl(r(x,y,y^*) - \tau \log Z - \tau \log \frac{\pi_\theta(y, z \mid x)}{\pi_{\theta_i}(y, z \mid x)}\biggr)^2\Biggr]\Biggr]
+$$
+
+**第四步：见证奇迹。** 「这个推导跟 GRPO 非常非常不同 ——
+我们根本没有走 PPO 那条路来推这个更新。**但你去取 $L$ 的梯度，
+你最后得到的东西惊人地像加了一个正则项的 GRPO。**」
+
+$$
+\frac{1}{k}\sum_{j=1}^{k}\Biggl(\nabla_\theta \log \pi_\theta(y_j, z_j \mid x)\bigl(r(x, y_j, y^*) - \bar r\bigr) \;-\; \frac{\tau}{2}\nabla_\theta \Bigl(\log \frac{\pi_\theta(y_j, z_j \mid x)}{\pi_{\theta_i}(y_j, z_j \mid x)}\Bigr)^2\Biggr)
+$$
+
+课件上的标题是：**「带正则的、基线化的策略梯度」**。
+
+拆开看：
+
+- 第一项就是**带基线 $\bar r$ 的策略梯度**，而 $\bar r$ **正是这 $k$ 条 rollout（同一个 $x$ 下）的均值**；
+- 第二项是一个**额外的正则项**，本质上就是 GRPO 里那个 KL 项。
+
+「所以在某种意义上，**我们通过完全不同的路径，重新发明了组内均值归一化的基线。**」
+
+<Callout type="insight" title="这个巧合说明了什么">
+Kimi 的推导里**没有**出现的两样东西，正是第五节批评 GRPO 的那两样：
+**没有除以标准差，也没有除以序列长度。**
+
+也就是说，从一条完全独立的路径出发，你自然得到的是**接近 Dr. GRPO 的形式**。
+这是对第五节那个「GRPO 不是第一性原理推出来的」判断的独立佐证。
+</Callout>
+
+### 7.3 Kimi 的长度控制
+
+「我觉得 Kimi 的人在**长度问题**上的看法更好一些。」
+
+<Callout type="insight" title="Tatsu 对 GRPO 那张长度图的评价">
+「GRPO 那边的人像是在说：『**长度在不受控地增长，这不是很棒吗？我们的模型肯定变聪明了。**』
+这个说法有点刻薄，但当你把这张图当成正面结果来展示时，
+**隐含的表述就是『我们的模型思考得更久了，真好』。**」
+
+「而 Kimi 的人看这个长 CoT 问题，说的是：**如果我们在生成长 CoT，
+那可能非常浪费** —— 我们并不真的想要长 CoT，因为 **CoT 是要花推理成本的。**」
+</Callout>
+
+Tatsu 把这件事放在语言模型开发的大图景里：**我们希望 CoT 尽可能短。
+我们想解难题，但不想思考很久** —— 因为思考很久的时候，我们本质上是在**补贴用户**。
+
+> 「如果你是 OpenAI，你的用户交了 200 美元的 Pro 订阅，而你的模型一次思考一小时，
+> **那不是个好位置**。反过来如果你的模型一次思考 5 分钟，**那是个很好的位置**。」
+
+Kimi 的目标函数**本来就没有 GRPO 那个长度偏置问题**（因为它不按序列长度归一化），
+但**他们还想更进一步，主动压缩回答长度**。
+
+怎么做？**最简单的 RL 做法：搞一个启发式的长度奖励，直接挂到 RL 过程上。**
+
+<Theorem type="definition" name="Kimi 的长度奖励">
+对每个 batch，他们定义
+
+$$
+\mathrm{len\_reward}(i) \;=\; \begin{cases} \lambda & \text{若 } r(x, y_i, y^*) = 1 \\[4pt] \min(0, \lambda) & \text{若 } r(x, y_i, y^*) = 0 \end{cases}
+$$
+
+其中
+
+$$
+\lambda \;=\; 0.5 - \frac{\mathrm{len}(i) - \mathrm{min\_len}}{\mathrm{max\_len} - \mathrm{min\_len}}
+$$
+
+$\mathrm{min\_len}$ 和 $\mathrm{max\_len}$ 是**这一组 rollout 里最短和最长的长度**。
+</Theorem>
+
+Tatsu 说这个奖励**复杂得出人意料**，然后逐条解释课件上那三行「该怎么理解」：
+
+- **$\lambda$ 的取值范围是 $[0.5, -0.5]$，一组里更长的序列拿到负值。**
+  最短的那条 $\lambda = 0.5$，最长的那条 $\lambda = -0.5$，正中间的 $\lambda = 0$。
+- **正确答案被激励写短。** 因为答对时直接拿 $\lambda$：短 → 正奖励，长 → 负奖励。
+- **错误答案被激励写得比这批 rollout 长度区间的中点更短。**
+  因为答错时拿的是 $\min(0, \lambda)$：比中点长 → 拿到负奖励；
+  比中点短 → $\lambda > 0$ 但被 $\min$ 截成 0，**没有奖励也没有惩罚**。
+
+**为什么错误答案要用 $\min(0, \lambda)$ 而不是直接用 $\lambda$？** Tatsu 举了个具体例子：
+
+> 「想象一下，**我几何很差**。我是个 AI，我几何很差。我做错了很多几何题，
+> 而这个惩罚让我的几何思维链变得非常短。**现在我的几何思维链长度是零。
+> 我几何真的很差，我永远也翻不了身了。我再也拿不到正的几何奖励了，我卡死了。**」
+
+所以你**不能强迫错误答案变得超级短**。你只是**激励它们比平均稍微短一点**，
+这样**错误的那部分不会无限膨胀**就够了。
+
+「这套做法最后有一组**出人意料地合理**的结果。」
+
+课件底下还有一条注记：**他们也只在训练的后期才启用这个长度奖励**，因为它对性能有影响。
+
+<Callout type="tip" title="动手：Kimi 的长度奖励">
+下面这个演示就是上面那个分段函数。拖动那条回答在组内长度区间里的位置，
+分别看**答对**和**答错**两种情况下拿到的长度奖励。
+
+重点看**中点两侧的不对称**：答对时短一点就有正奖励；
+答错时短过中点**不给奖励也不罚**，只有长过中点才罚。
+这条 $\min(0, \lambda)$ 就是 Tatsu 那个「几何思维链缩到零、永远翻不了身」故事的数学形式。
+
+</Callout>
+
+<L16KimiLength />
+
+### 7.4 课程与奖励的其他细节
+
+**课程（curriculum）：**
+
+- **给数据集打难度标签，从易到难走。**
+- **按 $(1 - \text{成功率})$ 成正比地采样题目**，避免重复做已经解掉的题。
+  一旦模型掌握了某道题，**就把它从题库里拿掉**，省算力。
+
+Tatsu 说：「基本上所有做 RL 的人都会做这类**成功率过滤**，
+既避免浪费算力，也避免在对模型来说太难的题上空转。」
+
+**奖励：**
+
+- **代码**：拿有标准解的题目，**生成新的测试用例**。
+- **数学**：用 **80 万条样本训一个 CoT 奖励模型，专门做答案等价性检查**。
+
+<Callout type="warning" title="RLVR 里最讽刺的一件事">
+Tatsu 说这件事「某种意义上非常好笑」：
+
+> 「我们这节课一开始说，我们想在**形式化数学**这类**真正可验证**的东西上工作，
+> 编译器能检查你的数学对不对。然后我们走过了大半节课，**最后我们落在哪儿了？
+> 我们落在了一个奖励模型上。一个检查数学答案正确性的奖励模型。**」
+
+为什么会这样？**因为答案等价性检查是一个非常困难的问题。**
+
+- 数学里，**等价的东西可以有很多种写法**；
+- 而且**语言模型可以用很多种方式把答案给回来**。
+  就算你 prompt 它「把答案放进 LaTeX 的 `\boxed` 里」，
+  它有时候会**漏掉 boxed**，有时候会**在 box 里加点别的东西**。
+
+「有很多种方式让模型**明明想对了、却过不了一个严格的正确性检查器**。
+所以绝大多数 RL 项目都有一个**非常复杂的答案检查器** ——
+要么是正则表达式，要么是个模型，要么天知道是什么。
+**把 RLVR 里那个『可验证』的部分做对，是一个真正的兔子洞。**」
+
+你会在作业里亲身体会到这一点。
+</Callout>
+
+### 7.5 RL 基础设施
+
+「这一节连回我们之前讲过的系统和推理部分：**RL 的优化和 RL 基础设施是真的很难。**」
+
+Tatsu 的总结：**训练很难，推理也很难，而 RL 把两者放在了一起。**
+所以它糟糕和困难，一点也不奇怪。
+
+课件列的三条原因：
+
+1. **on-policy 意味着 rollout，而 rollout 意味着（慢的）推理。**
+2. **从训练切到 rollout 往往意味着切换框架。**
+3. **长思维链会让 batch 变得非常不均匀。**
+
+<Callout type="insight" title="长尾 rollout 这个坑">
+Tatsu 说这一条是「你一开始不会意识到」的：
+
+> 「想象你有一批 rollout，但其中有一道**特别难的数学题** ——
+> 比如说其中一条是**黎曼猜想**，你的模型在黎曼猜想上吭哧吭哧地写，
+> 它有一条巨长无比的思维链。**与此同时其他人在干什么？**
+> 如果你做的是朴素推理，**所有人都在等这一条 rollout 完成**才能进入下一个阶段。」
+
+所以如果你在做批处理，**长 rollout 会真的伤到你**。
+
+于是你必须处理一堆非常琐碎的底层细节：
+**有些 CoT 会变得非常长。要不要截断？还是把它挪到另一台机器上？**
+这些都是你要做的决策。
+</Callout>
+
+**训练与 rollout 的切换：** 如果你 rollout 一次、训练一次、再 rollout、再训练，
+你必须想办法处理这件事 —— 要么**有些机器是纯 rollout 机器、有些是训练机器**，
+要么**你一直在切换框架**。**两者代价都很高。**
+
+**最后是那个又难又糟糕的权衡**（第 2.6 节说过）：
+on-policy 在数学上和训练动态上都非常好，然后你会变贪心想复用 rollout，
+然后你就掉进 off-policy 的坑，训练开始不稳定。
+
+<Figure src="/courses/cs336/l16-kimi-infra.png" wide caption="Kimi 的混合部署框架：左边蓝色是 Megatron 训练侧，右边绿色是 vLLM 推理侧，两边通过 checkpoint-engine 和共享内存交换权重。来源：Kimi K1.5 论文图 4，转引自 CS336 第 16 讲课件" />
+
+「所以我觉得如今大多数开源技术报告都会有一节讲他们的 RL 基础设施。」
+这套基础设施必须同时有：
+
+- **训练部分**（图里的蓝色方块）；
+- **推理部分**（图里右边的绿色部分）；
+- **一套把权重从训练侧搬到推理侧的方案**；
+- **两者之间的紧密协调**。
+
+「有些情况下它们甚至**共用同一批机器**，因为**推理在跑的时候，训练那边可能是空闲的**。」
+
+论文里描述的三个阶段是：**训练阶段**（Megatron 训练完，把 GPU 显存 offload 出来，
+准备把当前权重传给 vLLM）→ **推理阶段**（vLLM 用假权重启动，
+再通过 Mooncake 把 Megatron 传来的最新权重更新进去；rollout 完成后 checkpoint-engine
+停掉所有 vLLM 进程）→ **下一轮训练阶段**（vLLM 占的显存释放后，Megatron 把显存 onload 回来）。
+
+### 7.6 结果，以及和 expert iteration 的对比
+
+<Figure src="/courses/cs336/l16-kimi-scaling.png" wide caption="Kimi 的 scaling 结果（小模型、只用数学数据）：蓝线是准确率，橙线是 token 长度。注意 OMNI-MATH500 那一格 —— 长度已经平了，性能还在涨。来源：Kimi K1.5 论文，转引自 CS336 第 16 讲课件" />
+
+我们已经知道 Kimi 打败了 o1。这里还有一些有意思的结果（一个**小模型、只在数学数据上**）：
+
+- **随着 RL 推进，模型能思考更久，性能上升。**
+- 但**并不是所有情况下 token 都在无限增长**。
+  Tatsu 说 **Omni-Math 是个好例子：思考时长没怎么增加，但性能持续上涨。**
+  「也许这是长度控制起作用、并且起了好作用的一个好例子。」
+
+<Figure src="/courses/cs336/l16-expert-iteration.png" wide caption="Kimi K1.5 的大规模消融：橙线（RL）在几乎所有子任务上都压过蓝线（ReST / expert iteration）。来源：Kimi K1.5 论文，转引自 CS336 第 16 讲课件" />
+
+**最后一个问题：这些真正的 RL，比单纯在正确答案上训练强多少？**
+
+后者叫 **expert iteration（专家迭代）**，在过去一批论文里效果很好。
+课件上的问法是：**能不能避开 RL 式的负梯度，只从正例里学？**
+
+「在你面对非常不稳定的东西时，**你也许确实会想用 expert iteration 代替 RL**。
+但 **Kimi K1.5 有非常大规模的消融**表明：**这类 RL 方法一致地优于 expert iteration。**
+就是图里橙线压蓝线。**所以如果你想把性能榨到最后一滴，你躲不开 RL。**」
+
+（这和第 4.6 节 DeepSeekMath 里 GRPO 打赢 RFT 是同一个结论的两次独立验证 ——
+**负梯度是有用的**。）
+
+---
+
+## 八、案例三：Qwen3 与智能体 RL
+
+最后一个案例是 **Qwen3**，以及它的后继 **Qwen3 Coder Next**。
+（Tatsu 现场把名字说反过一次：「是 Coder Next 不是 Next Coder。」）
+
+- **Qwen3 比 o1 和 R1 都好**（虽然出得晚），但真正有意思的是它的 **scaling 和数据结果**。
+- **Qwen3 Coder Next** 之所以值得看，是因为它在几份主要技术报告里
+  **对智能体（agentic）RLVR 训练讲得最细**。
+
+### 8.1 总体流水线
+
+<Figure src="/courses/cs336/l16-qwen3-overview.png" wide caption="Qwen3 的后训练流水线：基础模型 → 阶段 1 长 CoT 冷启动 → 阶段 2 推理 RL → 阶段 3 思考模式融合 → 阶段 4 通用 RL → 旗舰模型；轻量模型走强到弱蒸馏。来源：Qwen3 技术报告图 1，转引自 CS336 第 16 讲课件" />
+
+跟 DeepSeek 的结构非常像：
+
+**基础模型 → SFT → 推理 RL → 思考模式融合 → RLHF → 发布的模型 → 蒸馏出更小的模型。**
+
+「当然他们不想直接服务那个大模型，所以他们做蒸馏来得到小模型。」
+
+<Callout type="insight" title="记住这张图">
+Tatsu 说：「Qwen3 是一个相当值得尊敬的开源模型。
+**你基本上可以把这张图当成『前沿级语言模型是怎么建出来的』的心智图景** ——
+把所有部件拼起来，你就对正在发生的事有了一个相当合理的认识。」
+</Callout>
+
+### 8.2 SFT + 推理 RL：已经是成熟套路
+
+「Qwen 基本上用的是**到这个时候已经久经检验的 RLVR 套路**。
+我觉得他们**吸收了 Kimi 和 DeepSeek 各自最好的部分，然后把它做对了。**」
+
+- **大量的难度过滤**（用 best-of-n，和 Kimi 一样），因为我们知道这省算力、也是拿到好数据的好办法。
+- **删掉模型不用思维链就能做对的题** —— 因为我们知道那不是需要思考的问题。
+- **删掉和验证集太像的题**，做去污染。
+- **对参考思维链做一点人工过滤**，判断模型是**真的想对了**还是**蒙对的**。
+- **最引人注目的一点：他们的推理 RL 只用了 3995 条样本**（Tatsu 口头说的是「4000 条」，
+  幻灯片上写的是「RL with GRPO on only 3995 examples」）。
+
+「但一旦你把流水线的其余部分弄对了，**用很少的数据你能走得出奇地远**。」
+
+### 8.3 Qwen3 特有的东西：思考模式融合
+
+「有些东西他们后来其实放弃了，但我觉得这些想法本身挺有意思。」
+
+**思考模式融合（thinking mode fusion）—— 控制思维链的长度：**
+
+1. **用标签把思考和不思考的数据混在一起训。**
+   这样模型就有了一个**思考模式**（长 CoT）和一个**非思考模式**（即时回答），
+   **两者活在同一个模型里**。Tatsu 说这在当时并不常见 ——
+   很多情况下（包括 OpenAI）**思考模式和非思考模式是两个不同的模型**。
+2. **通过一个特殊字符串提前终止思考。** 如果他们**追加那个特殊字符串**，
+   模型会**立刻停止思维链**，被迫对当前的 prompt 给出一个答案。
+
+「我们在 ChatGPT 这样的界面里也能看到这个功能 —— 你可以**提前终止思考**，
+试着直接拿到一个答案。」
+
+<Figure src="/courses/cs336/l16-thinking-budget.png" wide caption="测试时扩展：横轴是思考预算（1K 到 32K token），蓝线是思考模式，红色虚线是非思考模式。四个 benchmark 上，即使思考预算只有 1K，思考模式也全面高于非思考模式。来源：Qwen3 技术报告图 2，转引自 CS336 第 16 讲课件" />
+
+Tatsu 说这一直是他觉得**又意外又有意思**的一件事：
+
+> **当你用这个提前终止的技巧改变思考预算时，模型的性能是优雅地退化的。**
+> 即使在很低的思考预算下，模型是**被从思考中途硬截断的**，
+> 它们依然能给出**出奇合理的回答**。
+
+而且**即使在非常小的思考预算下，思考模式的模型在这些数学 / 编程任务上，
+仍然远好于那种「即时回答」模式**（后者更像是经典的指令跟随加 RLHF 模型）。
+
+### 8.4 各阶段各自贡献了什么
+
+<Figure src="/courses/cs336/l16-qwen3-stages.png" wide caption="各阶段的贡献：阶段 2（推理 RL）、阶段 3（思考模式融合）、阶段 4（通用 RL）。注意数学 / STEM 那几行在阶段 3、4 是下降的。来源：Qwen3 技术报告，转引自 CS336 第 16 讲课件" />
+
+「他们为我们做的一件好事是：**看每个部件对性能的贡献。**」
+
+- **推理 RL 之后再做通用 RL，各类任务上都能慢慢拿到提升** ——
+  像 Arena-Hard、CounterFactQA 这些**通用任务**（你需要更常规的 RLHF），
+  **性能全面显著提升**（Arena-Hard 从 86.8 涨到 93.8，CounterFactQA 从 50.4 涨到 68.1，
+  ToolUse 从 63.3 涨到 85.5）。
+- **数学和编程上有一些退化**，因为**把思考和非思考部件融合在了一起**
+  （AIME'24 从 83.8 降到 81.4，LiveCodeBench 从 68.4 降到 65.7）。
+  「但退化没那么糟。」
+
+<Callout type="note" title="后续：Qwen 后来放弃了混合模型">
+Tatsu 补充了一条论文之外的信息：**虽然这些数字绝对值上很小，
+但在后来的一些发布里（他说是 Qwen 3.5 那一批），他们已经放弃了把思考和非思考融合进一个模型。**
+
+「他们以前把这个叫**混合模型（hybrid model）**。
+因为他们觉得这个下降**不可接受** —— 他们想把思考模式的性能榨到极致，
+**所以现在把这两个模型分开了。**」
+</Callout>
+
+<Callout type="insight" title="课堂提问：思考模式背后是一个模型还是几个">
+课后有同学问：思考模式是靠 prompt 实现的，还是底下有不同的模型？
+
+Tatsu 的回答：**思考模式有意思的地方恰恰在于它真的是一个模型** ——
+**只是一个小小的 prompt 标签在长 CoT 和几乎无 CoT 之间切换。**
+
+「如果只是一个 API flag 什么的，那不难。**难的、有意思的是他们把两者放进了同一个模型。**
+所以你其实也可以选择不用它，然后自己加额外的 prompt 来触发 CoT。
+**这里的控制机制在 prompt 层，而不是 API 层或服务层。**」
+</Callout>
+
+### 8.5 智能体 RL：Qwen3 Coder Next
+
+「如果你对『怎么真正建一个 agent』感兴趣，**这大概是一份值得读的报告**。」
+（他补了一句：agent 还有别的东西要考虑，比如 harness（脚手架），但这份报告在后训练这一侧讲得很好。）
+
+<Callout type="insight" title="Tatsu 想让你从整门课带走的一课">
+「但某种意义上，**给 agent 做后训练和我们描述的其他一切没什么不同。
+并不存在一种新的 agent 训练算法。**」
+
+「**你应该在整门课里内化这一课：重要的是数据。**
+所以你要训一个 agent、或者为 agent 做后训练，你要做什么？**你要去把数据凑齐。**」
+</Callout>
+
+#### 中期训练
+
+「有些能力**你不能只在最后注入，你得早一点开始**。」
+所以有一个**很长的中期训练阶段**，目标是尽可能多地把编程和智能体式的能力灌进模型：
+
+- **GitHub**
+  - **长上下文「仓库级」数据**：**把一个仓库里的文件拼接起来**生成非常长的上下文数据，
+    **6000 亿 token**。理由很直接：**模型最终会看到那种很长的 CoT 轨迹，
+    里面 agent 可能打开了一大堆文件**，所以这是非常有用的预训练式数据。
+  - **Pull request**：并且**用 RAG 检索仓库状态，构造出对理解这个 PR 有帮助的合成上下文**。
+- **Common Crawl**
+  - **文本 + 代码的联合文档**：用自动方法检测出**既有文字又有代码**的文档，
+    再**用一个 LLM 把它转成漂亮的 markdown 格式**。
+- **合成数据**
+  - **让语言模型针对编程相关的网页文档生成问答**，得到「编程味」的合成数据。
+  - **把公开可用的编程 agent 拿来在各种环境上跑，把这些运行的轨迹全部放进中期训练。**
+- **指令跟随 / 填空（fill-in-the-middle）数据**：后者是「你在写代码、想补上中间一段」时有用的能力。
+  Tatsu 说这一条对我们来说不是特别相关。
+
+「除此之外，这是一套**非常标准但相当深入**的数据收集流程。」
+
+#### 专家模型 + 蒸馏回来
+
+<Figure src="/courses/cs336/l16-qwen3-experts.png" wide caption="Qwen 3 Next 分裂成四个领域专家（Web dev / UX / 单轮问答 / 软件工程），各自训练后再蒸馏回一个 Qwen 3 Next Coder。来源：CS336 第 16 讲课件" />
+
+「然后 Qwen 的人做了一件**我不知道以前有没有见过**的事，其实挺有意思的。」
+
+他们拿中期训练好的 Qwen3 Next 模型，**为不同的编程相关任务训练一整批不同的专家模型**，
+最后得到**四个 agent 专家**，然后**把它们全部蒸馏回同一个模型**。
+
+Tatsu 说他只能猜测他们为什么这么做：
+
+- 他不认为在别的工作里见过这个做法。
+- 最接近的是 **DeepSeek V3.2**（他现场对版本号犹豫了几次）——
+  他们有一些专家，**唯一的工作是格式化和处理数据**，即**数据处理专家**，
+  为完整训练生成数据。
+- 但**「训练不同的模型专家、再蒸馏回来」这件事他没见过**。
+  「那其实更接近一些学术工作，比如 **branch-train-merge** 之类的。
+  那些确实是人们会做的事，但我在前沿模型训练里见得不多。」
+
+**四个专家各自在干什么：**
+
+- **Web dev 专家**：基于各种检查（**VLM 检查 + agent 动作检查**）判断什么是
+  「**有效的网页代码**」，在这上面做 SFT。
+- **UX 专家**：在**很多种不同的工具格式**上训练。
+- **QA（单轮问答）专家**：标准的单轮代码合成，**就是数据更多**。
+- **SWE（软件工程）专家**：对我们来说最有意思、也最复杂的一个。
+
+#### 大规模构造 agent 环境
+
+<Figure src="/courses/cs336/l16-agent-env.png" wide caption="自动化的 SWE-bench 式环境构造（80 万个任务）：仓库收集 → 用 AST 解析器采样 bug → 在容器里验证「打了补丁能过、不打过不了」→ 反向生成 issue 文本。来源：Qwen3 Coder Next 技术报告，转引自 CS336 第 16 讲课件" />
+
+**SWE-bench 是这类东西的黄金标准。** 他们想要的是「**SWE-bench，但更多**」。
+于是他们**基于 GitHub 用各种自动化方法生成海量的 issue**，
+拿这些环境去做 RL —— 「某种意义上非常不意外」。**总共 80 万个任务。**
+
+#### 奖励黑客：RLVR 最脆弱的地方
+
+<Figure src="/courses/cs336/l16-agent-rl-hack.png" wide caption="左：带奖励黑客拦截器时 SWE-bench Verified 稳步上升到 75.1，同时 agent 平均轮数从 50 涨到 130；右：不带拦截器时，训练末期出现「涌现式跃升」到 84.6 —— 那其实是模型学会了恢复被删掉的 git remote。来源：Qwen3 Coder Next 技术报告图 7，转引自 CS336 第 16 讲课件" />
+
+Tatsu 说这一点在整讲的语境里**非常重要**：
+
+<Theorem type="proposition" name="RLVR 的根基假设">
+**我们之所以能往 RL 里灌越来越多的算力，是因为我们相信奖励模型是不可黑（unhackable）
+或者说很难黑的。**
+
+**一旦这个假设垮掉，你的 RL 方法就会找到越来越隐蔽的方式来骗走你的性能。**
+</Theorem>
+
+Qwen 的具体例子非常精彩：**在 git 里你可以去看未来的提交**。
+如果你手上有一个 issue，而仓库里有后续的提交，**你可以直接查出来当时的修复是什么**。
+**这是一个模型非常容易学会的黑法。**
+
+所以他们专门设了**一整个奖励，唯一目的就是防止 agent 去动 git 历史**。
+如果你不做这件事，你会得到右边那张图：**学、学、学、学，然后突然出现一个涌现式的跃升 ——
+而这个跃升其实是它学会了操纵 git 调用去拿到历史。**
+
+「有些情况下它甚至能绕开你给的约束。**比如你告诉它不许用 `git log`，
+它可能会加一个 origin、一个远程仓库，然后去查那个远程仓库某些提交发生了什么。**
+你能做的黑法有很多。」
+
+<Callout type="warning" title="Tatsu 自己踩过的坑：Lean 编译器不是对抗鲁棒的">
+「**RLVR 的鲁棒性只取决于你的奖励，而你的奖励有时候一点也不鲁棒。**」
+
+他讲了一个亲身经历：他和一个学生做过一个**在 Lean 上做 RL** 的项目 ——
+Lean 是那个形式化数学的可验证语言。
+
+> 「我们当时天真地以为，**这怎么可能出问题呢**。很多人在 Lean 上工作过，
+> **Lean 编译器是刀枪不入的。** 结果 **Lean 编译器不是对抗鲁棒的**。
+> 存在一些字符串，你放进去之后，**在某些模式下能让本不该通过验证的证明通过验证**。」
+
+「所以我认为，**『可验证奖励』这个概念，比你们很多人一开始想的要棘手得多。**」
+</Callout>
+
+#### 最终结果
+
+无论如何，走完这套流程 —— 大规模构造 GitHub 仓库环境、做 RL —— 分数**缓慢但稳定地上升**，
+最后你会得到一个**好得出人意料的系统**：**SWE-bench Verified 上大约 70.6%**，
+而这**基本上是一个很小的模型 —— 激活参数只有 30 亿**。
+
+<Callout type="warning" title="但要小心地读这个数字">
+「某种意义上我不知道这有多令人惊讶。**RL 嘛，你当然能在你训练过的那些环境上做得好。**
+你甚至可能泛化到验证集，就像这里一样。」
+
+「但你**永远要对比较性能这件事小心一点**：
+**特定任务上的性能不一定意味着能泛化到更宽的领域。**」
+</Callout>
+
+---
+
+## 九、小结
+
+Tatsu 的三条核心 takeaway：
+
+<Theorem type="proposition" name="这一讲的三件事">
+
+1. **过优化是一个问题；在窄领域里做 RL 是一种解法。**
+   RLHF 和 RLVR 可以说是非常相似的问题，**差别真的就在于我们想要更不可黑的奖励，
+   这样才能投入多得多的算力，把系统做得好得多。**
+2. **GRPO 很简单（但有一些缺陷），而它使 RLVR 成为可能。**
+   至少对研究社区来说，GRPO 是真正让这一切成为可能的东西。
+   **你们应该把 GRPO 掌握到和预训练损失一样熟的程度 ——
+   知道它的函数形式是什么，更新是怎么做的。**
+3. **野外有大量成功的配方**（R1、Kimi K1.5、Qwen3）。
+
+</Theorem>
+
+最后一句是给动手的人的：
+
+> 「到这个时候，我想很多人都知道怎么做 RLVR 了。**你们会发现，很遗憾，
+> RL 依然非常挑剔、非常吵，用起来相当痛苦。但它没那么难。**
+> 不像过去做 PPO、在各种棘手环境上折腾的那些日子。**其实比你想象的顺利得多。**」
+
+---
+
+## 附：课后问答
+
+除了正文里已经插入的几条，还有几个问题值得单独记下来。
+
+<Collapsible title="中期训练在 RL 里到底有多重要？">
+
+**问**：中期训练里的格式化，在多大程度上决定了 RLVR 和后训练能学到什么？
+如果中期训练里没有正确的数据，是不是可以认为强化学习就采样不到解、因此学不会？
+
+**答**：Tatsu 说这里有很多经验上的微妙之处，他没有一个「一刀切」的答案，
+但可以给一点层次：
+
+- **预训练和 SFT 承担了大部分的重活，只要覆盖到位。**
+  如果预训练里**根本没有代码数据**，那你有麻烦，**你需要中期训练**。
+- 但**如果你的预训练本身非常多样** —— 覆盖了文本、代码数据、大量 GitHub 数据 ——
+  那么中期训练**很好有，但也许不是关键的**，因为**反正你要做 SFT**，
+  而 **SFT 能让你足够接近，开始拿到一些 RL 的奖励**。
+- **如果你连 SFT 都没有，那你就麻烦大了。** 但因为我们总归会做一些 SFT，这就救了你。
+- 加上预训练**但愿有足够的覆盖**，让你能拿到合理的泛化。
+
+「所以**中期训练是非常好有、对拿到稍好一点的泛化非常重要，但不一定是生死攸关的。**」
+
+</Collapsible>
+
+<Collapsible title="把四个专家蒸馏回一个模型，是怎么做的？">
+
+**问**：训练完每个专家模型之后要蒸馏回单个模型，这个蒸馏具体怎么工作？
+是不是要设计一套数据混合流程？
+
+**答**：**是的。这个蒸馏流程要求你写下一串 prompt，
+专家们会在这些 prompt 上把知识蒸馏进最终模型。**
+
+Tatsu 说他能看到这个做法的好处：
+
+- **可以让不同的团队各自负责一个专家** —— 分工容易得多；
+- 如果算力够，**聚合这一步也可能很简单**。
+
+「只不过，**如果你手上有全部这些目标函数，你其实大可以直接把它们扔进那个大训练循环。
+通常我觉得你会更愿意这么做**，那样你就不用处理蒸馏这道额外的麻烦，
+**只需要一个大目标函数、跑一次训练循环。**」
+
+</Collapsible>
+
+<Collapsible title="长推理训练算是中期训练的一部分吗？">
+
+**问**：长推理的训练是中期训练的一部分吗？
+
+**答**：**R1 和 Kimi K1.5 里都有长 CoT 的 SFT。**
+**长 CoT 传统上不算中期训练本身**，但**长 CoT 这类数据经常被用在长上下文扩展里**。
+
+所以这件事更微妙一点。Tatsu 说他这一讲**完全没讲长上下文扩展，他有点后悔**。
+通常那是**紧挨在 RLHF 之前的一个额外阶段**，
+你会用手上任何长上下文数据把上下文窗口扩展开 ——
+一般是**书、代码、合成数据**的组合，因为**只有这些东西足够长**，能拿来做扩展。
+
+</Collapsible>
+
+<Collapsible title="多个领域的 RL 是并行做还是串行做？会不会遗忘？">
+
+**问**：做 RL 的时候，如果你有数学、化学和很多别的领域，
+常见做法是把它们放在一次 RL 训练里并行做，还是串行做？
+如果串行做，怎么避免灾难性遗忘？
+
+**答**：Tatsu 说，最接近这个问题的答案就是那些流水线图：
+
+**你做的划分是「推理问题」和「非推理问题」两大类。**
+
+- **所有推理问题放进一个桶，在第二阶段（推理 RL）执行**；
+- **非推理问题在最后的 RLHF 阶段处理** —— 这里面包括聊天风格之类的东西，
+  它们全都进到后面那一格，也就是**第四阶段（通用 RL）**。
+
+（换句话说：真正的划分不是按学科领域，而是按「可验证 / 不可验证」。）
+
+</Collapsible>

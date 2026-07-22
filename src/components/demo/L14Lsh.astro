@@ -1,0 +1,404 @@
+---
+// 局部敏感哈希（LSH）的分带结构：n = b × r 个 MinHash 分成 b 个带、每带 r 个。
+// 「某一个带里全部相等」就判为碰撞，于是碰撞概率 = 1 − (1 − s^r)^b，
+// 把原本平缓的 P = s 掰成一条 S 形曲线。
+// 相变阈值在 s* = (1/b)^(1/r)，那里碰撞概率恒为 1 − (1 − 1/b)^b ≈ 1 − 1/e。
+// 数值已用 node 核对，和课件 get_prob_collision 的输出一致。
+---
+
+<div class="demo" data-demo="l14-lsh">
+  <div class="ctrl">
+    <label>带数 b <input type="range" data-b min="1" max="40" step="1" value="10" /></label>
+    <span class="val" data-b-v></span>
+    <label>每带哈希数 r <input type="range" data-r min="1" max="60" step="1" value="10" /></label>
+    <span class="val" data-r-v></span>
+  </div>
+  <div class="ctrl">
+    <label class="chk"><input type="checkbox" data-zoom /> 放大到相变附近</label>
+    <span class="tag">预设</span>
+    <button data-p="5,10">课件例子 b=5, r=10</button>
+    <button data-p="10,10">b=10, r=10</button>
+    <button data-p="10,20">增大 r</button>
+    <button data-p="20,20">再增大 b</button>
+    <button data-p="20,450">论文实际设置 b=20, r=450</button>
+  </div>
+
+  <div class="bands" data-bands></div>
+
+  <div class="plot" data-plot></div>
+
+  <div class="scroll">
+    <table class="out" data-out>
+      <thead>
+        <tr><th>真实 Jaccard s</th><th class="m">一个带全中 s^r</th><th class="m">碰撞概率 1−(1−s^r)^b</th><th>判定</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.55rem;
+    margin-bottom: 0.5rem;
+  }
+  .ctrl label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+  }
+  .ctrl input[type='range'] {
+    width: 9rem;
+    accent-color: var(--indigo);
+  }
+  .ctrl input[type='checkbox'] {
+    accent-color: var(--indigo);
+  }
+  .val {
+    min-width: 3rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--madder);
+  }
+  .tag {
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .ctrl button {
+    padding: 0.24rem 0.6rem;
+    font: inherit;
+    font-size: 0.76rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .ctrl button:hover {
+    color: var(--indigo);
+    border-color: var(--indigo);
+  }
+
+  .bands {
+    margin: 0.7rem 0 0.4rem;
+    overflow-x: auto;
+  }
+  .bands :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 400px;
+    height: auto;
+  }
+  .bands :global(.cell) {
+    fill: var(--indigo);
+    opacity: 0.5;
+  }
+  .bands :global(.cell.hit) {
+    fill: var(--madder);
+    opacity: 1;
+  }
+  .bands :global(.bandbox) {
+    fill: none;
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .bands :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 8px;
+  }
+
+  .plot {
+    overflow-x: auto;
+  }
+  .plot :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 420px;
+    height: auto;
+  }
+  .plot :global(.curve) {
+    fill: none;
+    stroke: var(--indigo);
+    stroke-width: 1.8;
+  }
+  .plot :global(.naive) {
+    fill: none;
+    stroke: var(--ink-faint);
+    stroke-width: 1;
+    stroke-dasharray: 3 3;
+  }
+  .plot :global(.thr) {
+    stroke: var(--madder);
+    stroke-width: 1.2;
+    stroke-dasharray: 4 3;
+  }
+  .plot :global(.axis) {
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .plot :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 8.5px;
+  }
+  .plot :global(text.title) {
+    fill: var(--indigo);
+    font-size: 10px;
+    font-weight: 700;
+  }
+  .plot :global(text.hot) {
+    fill: var(--madder);
+    font-weight: 700;
+  }
+
+  .scroll {
+    overflow-x: auto;
+  }
+  .out {
+    width: 100%;
+    margin-top: 0.7rem;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+  }
+  .out :global(th) {
+    padding: 0.26rem 0.35rem;
+    text-align: left;
+    font-weight: 600;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(td) {
+    padding: 0.26rem 0.35rem;
+    color: var(--ink-muted);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(th.m),
+  .out :global(td.m) {
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .out :global(tr.keep td) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL14Lsh() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l14-lsh"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+
+      const pColl = (s: number, b: number, r: number) => 1 - Math.pow(1 - Math.pow(s, r), b);
+
+      function draw() {
+        const b = +$<HTMLInputElement>('[data-b]').value;
+        const r = +$<HTMLInputElement>('[data-r]').value;
+        const zoom = $<HTMLInputElement>('[data-zoom]').checked;
+        $('[data-b-v]').textContent = 'b = ' + b;
+        $('[data-r-v]').textContent = 'r = ' + r;
+
+        const n = b * r;
+        const thr = Math.pow(1 / b, 1 / r);
+        const pAtThr = 1 - Math.pow(1 - 1 / b, b);
+
+        // ── 分带示意图（带数太多就只画前 8 个带）──
+        const showB = Math.min(b, 8),
+          showR = Math.min(r, 12);
+        const cw = 11,
+          ch = 11,
+          gap = 8;
+        const BW = 620,
+          BH = 26 + showB * (ch + 3);
+        const bs = svgEl('svg', { viewBox: `0 0 ${BW} ${BH}` });
+        bs.append(
+          svgEl(
+            'text',
+            { x: 0, y: 9 },
+            `一共 n = b × r = ${n} 个 MinHash，分成 ${b} 个带、每带 ${r} 个` +
+              (b > showB || r > showR ? `（图里只画前 ${showB} 个带、每带前 ${showR} 个）` : ''),
+          ),
+        );
+        for (let i = 0; i < showB; i++) {
+          const y = 18 + i * (ch + 3);
+          bs.append(svgEl('text', { x: 0, y: y + ch - 2 }, `带 ${i + 1}`));
+          for (let j = 0; j < showR; j++) {
+            const x = 30 + j * (cw + 2);
+            // 第一个带画成「全中」，用来说明「某一个带全中就算碰撞」
+            bs.append(svgEl('rect', { class: 'cell' + (i === 0 ? ' hit' : ''), x, y, width: cw, height: ch, rx: 2 }));
+          }
+          bs.append(
+            svgEl('rect', {
+              class: 'bandbox',
+              x: 28,
+              y: y - 2,
+              width: showR * (cw + 2) + 4,
+              height: ch + 4,
+              rx: 3,
+            }),
+          );
+          if (i === 0)
+            bs.append(
+              svgEl('text', { x: 30 + showR * (cw + 2) + gap, y: y + ch - 2 }, '← 这个带里 r 个哈希全部相等 ⇒ 判为碰撞'),
+            );
+        }
+        $('[data-bands]').replaceChildren(bs);
+
+        // ── S 曲线 ──
+        const W = 620,
+          H = 220,
+          ML = 40,
+          MR = 14,
+          MT = 22,
+          MB = 32;
+        const iw = W - ML - MR,
+          ih = H - MT - MB;
+        const x0 = zoom ? Math.max(0, thr - 4 * (1 - thr) - 0.02) : 0;
+        const x1 = zoom ? Math.min(1, thr + 4 * (1 - thr) + 0.02) : 1;
+        const xOf = (s: number) => ML + ((s - x0) / (x1 - x0)) * iw;
+        const yOf = (p: number) => MT + (1 - p) * ih;
+
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+        svg.append(
+          svgEl('text', { class: 'title', x: 4, y: 12 }, '横轴 = 两个文档真实的 Jaccard，纵轴 = 它们被判为「碰撞」的概率'),
+        );
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: MT, x2: ML, y2: MT + ih }));
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: MT + ih, x2: ML + iw, y2: MT + ih }));
+        for (const v of [0, 0.25, 0.5, 0.75, 1])
+          svg.append(svgEl('text', { x: ML - 5, y: yOf(v) + 3, 'text-anchor': 'end' }, v.toFixed(2)));
+        for (let i = 0; i <= 4; i++) {
+          const s = x0 + ((x1 - x0) * i) / 4;
+          svg.append(svgEl('text', { x: xOf(s), y: MT + ih + 12, 'text-anchor': 'middle' }, s.toFixed(zoom ? 4 : 2)));
+        }
+        svg.append(svgEl('text', { x: ML + iw / 2, y: H - 4, 'text-anchor': 'middle' }, 'Jaccard 相似度 s'));
+
+        // 只用一个 MinHash 时的基线 P = s
+        const nv: string[] = [];
+        for (let i = 0; i <= 200; i++) {
+          const s = x0 + ((x1 - x0) * i) / 200;
+          nv.push(`${xOf(s).toFixed(2)},${yOf(s).toFixed(2)}`);
+        }
+        svg.append(svgEl('polyline', { class: 'naive', points: nv.join(' ') }));
+
+        const pts: string[] = [];
+        for (let i = 0; i <= 400; i++) {
+          const s = x0 + ((x1 - x0) * i) / 400;
+          pts.push(`${xOf(s).toFixed(2)},${yOf(pColl(s, b, r)).toFixed(2)}`);
+        }
+        svg.append(svgEl('polyline', { class: 'curve', points: pts.join(' ') }));
+
+        if (thr >= x0 && thr <= x1) {
+          svg.append(svgEl('line', { class: 'thr', x1: xOf(thr), y1: MT, x2: xOf(thr), y2: MT + ih }));
+          svg.append(
+            svgEl(
+              'text',
+              { class: 'hot', x: xOf(thr) + 3, y: MT + 10 },
+              `相变阈值 s* = (1/b)^(1/r) = ${thr.toFixed(4)}`,
+            ),
+          );
+          svg.append(svgEl('text', { class: 'hot', x: xOf(thr) + 3, y: MT + 20 }, `那里的碰撞概率 = ${pAtThr.toFixed(4)}`));
+        }
+        svg.append(svgEl('text', { x: ML + 4, y: MT + ih - 4 }, '灰虚线 = 只用 1 个 MinHash 时的 P = s'));
+        $('[data-plot]').replaceChildren(svg);
+
+        // ── 读数表 ──
+        const tb = $('[data-out] tbody');
+        tb.replaceChildren();
+        const sims = zoom
+          ? [thr - 0.01, thr - 0.004, thr - 0.001, thr, thr + 0.001, thr + 0.003, thr + 0.006].map((x) =>
+              Math.max(0, Math.min(1, x)),
+            )
+          : [0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 0.98];
+        for (const s of sims) {
+          const pm = Math.pow(s, r);
+          const pc = pColl(s, b, r);
+          const tr = document.createElement('tr');
+          if (pc >= 0.5) tr.className = 'keep';
+          const mk = (t: string, cls = '') => {
+            const td = document.createElement('td');
+            td.className = cls;
+            td.textContent = t;
+            return td;
+          };
+          tr.append(
+            mk(s.toFixed(zoom ? 4 : 2)),
+            mk(pm < 1e-4 ? pm.toExponential(2) : pm.toFixed(5), 'm'),
+            mk(pc.toFixed(5), 'm'),
+            mk(pc >= 0.5 ? '多半会被抓成近重复' : '多半漏掉'),
+          );
+          tb.append(tr);
+        }
+
+        // ── 结论 ──
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        const strong = document.createElement('strong');
+        strong.textContent = thr.toFixed(4);
+        v.append(
+          document.createTextNode(`b = ${b}、r = ${r} 时一共要算 ${n} 个 MinHash，相变阈值落在 `),
+          strong,
+          document.createTextNode(
+            `。两条规律可以自己拖出来：调大 r（每带的哈希数）会让曲线整体右移、同时变陡 —— 一个带要「全中」变难了；调大 b（带数）会让曲线左移 —— 多给了几次抓中的机会。真实系统里两个都开得很大：课上引的那篇去重论文用 b = 20、r = 450，阈值刚好压在 0.9934，等于说「Jaccard 低于 0.99 的基本都放走，高于 0.995 的基本都抓住」。`,
+          ),
+        );
+      }
+
+      // 控件只绑定一次
+      root.querySelectorAll<HTMLInputElement>('input').forEach((el) => el.addEventListener('input', draw));
+      root.querySelectorAll<HTMLButtonElement>('[data-p]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const [b, r] = btn.dataset.p!.split(',');
+          const bi = $<HTMLInputElement>('[data-b]');
+          const ri = $<HTMLInputElement>('[data-r]');
+          if (+r > +ri.max) ri.max = r;
+          bi.value = b;
+          ri.value = r;
+          draw();
+        });
+      });
+
+      draw();
+    });
+  }
+
+  setupL14Lsh();
+  document.addEventListener('astro:page-load', setupL14Lsh);
+</script>

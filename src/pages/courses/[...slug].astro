@@ -4,6 +4,14 @@ import BaseLayout from '../../layouts/BaseLayout.astro';
 import * as MDX from '../../components/mdx';
 import Annotatable from '../../components/Annotatable.astro';
 
+// 讲次显示名：客座讲座这类没有编号的用 lectureLabel 覆盖。
+//
+// 注意：下面 getStaticPaths() 里没有调用这个函数，而是把同样的表达式内联写了一遍。
+// 不是疏忽 —— Astro 会把 getStaticPaths() 提取到独立作用域里执行，
+// 它引用不到这里的模块级变量，调用会在构建时炸掉。别「顺手」合并回来。
+const label = (d: { lecture: number; lectureLabel?: string }) =>
+  d.lectureLabel ?? `第 ${d.lecture} 讲`;
+
 export async function getStaticPaths() {
   const notes = await getCollection('courses', ({ data }) => !data.draft);
   // 同一门课内按讲次排序，好算上一讲 / 下一讲
@@ -19,8 +27,8 @@ export async function getStaticPaths() {
       params: { slug: note.id },
       props: {
         note,
-        prev: prev && { id: prev.id, title: prev.data.title, lecture: prev.data.lecture },
-        next: next && { id: next.id, title: next.data.title, lecture: next.data.lecture },
+        prev: prev && { id: prev.id, title: prev.data.title, label: prev.data.lectureLabel ?? `第 ${prev.data.lecture} 讲` },
+        next: next && { id: next.id, title: next.data.title, label: next.data.lectureLabel ?? `第 ${next.data.lecture} 讲` },
       },
     };
   });
@@ -37,7 +45,7 @@ const fmt = (d: Date) =>
   <article class="prose">
     <header class="post-head">
       <a href="/courses" class="course-name">{note.data.courseTitle}</a>
-      <h1>第 {note.data.lecture} 讲 · {note.data.title}</h1>
+      <h1>{label(note.data)} · {note.data.title}</h1>
       <div class="meta">
         {note.data.speaker && <span>主讲 {note.data.speaker}</span>}
         <time datetime={note.data.date.toISOString()}>{fmt(note.data.date)}</time>
@@ -88,7 +96,7 @@ const fmt = (d: Date) =>
         <a href={`/courses/${prev.id}`} class="pager-link prev">
           <span>← 上一讲</span>
           <strong>
-            第 {prev.lecture} 讲 · {prev.title}
+            {prev.label} · {prev.title}
           </strong>
         </a>
       ) : (
@@ -100,7 +108,7 @@ const fmt = (d: Date) =>
         <a href={`/courses/${next.id}`} class="pager-link next">
           <span>下一讲 →</span>
           <strong>
-            第 {next.lecture} 讲 · {next.title}
+            {next.label} · {next.title}
           </strong>
         </a>
       )

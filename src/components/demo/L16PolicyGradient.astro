@@ -1,0 +1,496 @@
+---
+// 策略梯度的一步更新 + 基线为什么降方差。
+//
+// 玩具设定：一个 prompt，4 个候选回答，策略是这 4 个候选上的 softmax 分布。
+// 目标 J(θ) = Σ_i p_i r_i。对 logit z_j 的精确梯度是
+//     ∂J/∂z_j = p_j (r_j - r̄),   r̄ = Σ_i p_i r_i
+// 也就是「概率 × 优势」—— 正好是 REINFORCE 加组内均值基线的期望形式。
+//
+// 右边那条曲线是单样本估计量 g_j = (r_i - b)(1[i=j] - p_j)（i ~ p）
+// 的总方差 Σ_j Var(g_j)，对 4 个候选精确求和算出来的，不是蒙特卡洛。
+// 期望与 b 无关（基线定理），方差随 b 变化 —— 这就是基线的全部作用。
+---
+
+<div class="demo" data-demo="l16-pg">
+  <div class="ctrl">
+    <span class="tag">奖励向量</span>
+    <button data-preset="mix">2 对 2 错</button>
+    <button data-preset="one">只有 1 条对</button>
+    <button data-preset="shift">奖励整体 +5</button>
+    <button data-preset="all">全对</button>
+  </div>
+  <div class="ctrl">
+    <label>步长 η <input type="range" data-eta min="0" max="10" step="0.1" value="1" /></label>
+    <span class="val" data-eta-v></span>
+    <label>基线 b <input type="range" data-b min="-2" max="7" step="0.05" value="0" /></label>
+    <span class="val" data-b-v></span>
+  </div>
+
+  <p class="derived" data-derived></p>
+
+  <div class="two">
+    <div class="plot" data-plot-p></div>
+    <div class="plot" data-plot-v></div>
+  </div>
+
+  <table class="out" data-out>
+    <thead>
+      <tr>
+        <th>候选</th><th>奖励 r</th><th>当前 p</th><th>优势 r − r̄</th>
+        <th>Δz = η·p(r−r̄)</th><th>更新后 p′</th><th>变化</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.5rem;
+  }
+  .tag {
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .ctrl label {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+  }
+  .ctrl input[type='range'] {
+    width: 150px;
+    accent-color: var(--indigo);
+  }
+  .val {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--madder);
+    font-variant-numeric: tabular-nums;
+  }
+  .ctrl button {
+    padding: 0.26rem 0.65rem;
+    font: inherit;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .ctrl button:hover {
+    color: var(--indigo);
+    border-color: var(--indigo);
+  }
+
+  .derived {
+    margin: 0.8rem 0 0.2rem;
+    padding: 0.5rem 0.7rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.85;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+  }
+
+  .two {
+    display: grid;
+    gap: 0.8rem;
+    margin-top: 0.9rem;
+  }
+  @media (min-width: 700px) {
+    .two {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  .plot {
+    overflow-x: auto;
+  }
+  .plot :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 300px;
+    height: auto;
+  }
+  .plot :global(.axis) {
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .plot :global(.grid) {
+    stroke: var(--rule);
+    stroke-width: 0.6;
+    stroke-dasharray: 2 3;
+  }
+  .plot :global(.barold) {
+    fill: var(--thread);
+  }
+  .plot :global(.barnew) {
+    fill: var(--indigo);
+  }
+  .plot :global(.barneg) {
+    fill: var(--madder);
+  }
+  .plot :global(.curve) {
+    fill: none;
+    stroke: var(--indigo);
+    stroke-width: 2;
+  }
+  .plot :global(.mark) {
+    stroke: var(--madder);
+    stroke-width: 1.6;
+  }
+  .plot :global(.mark2) {
+    stroke: var(--weld);
+    stroke-width: 1.4;
+    stroke-dasharray: 3 3;
+  }
+  .plot :global(.dot) {
+    fill: var(--madder);
+  }
+  .plot :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 9px;
+  }
+  .plot :global(text.title) {
+    fill: var(--indigo);
+    font-size: 10.5px;
+    font-weight: 700;
+  }
+  .plot :global(text.lab) {
+    fill: var(--ink-muted);
+    font-size: 8.5px;
+  }
+  .plot :global(text.note) {
+    fill: var(--madder);
+    font-size: 9px;
+  }
+
+  .out {
+    width: 100%;
+    margin-top: 0.9rem;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+  }
+  .out :global(th) {
+    padding: 0.25rem 0.35rem;
+    text-align: right;
+    font-weight: 400;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(th:first-child) {
+    text-align: left;
+  }
+  .out :global(td) {
+    padding: 0.25rem 0.35rem;
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(td:first-child) {
+    text-align: left;
+    font-family: inherit;
+  }
+  .out :global(td.up) {
+    color: var(--indigo);
+  }
+  .out :global(td.down) {
+    color: var(--madder);
+  }
+  .out :global(td.dim) {
+    color: var(--ink-faint);
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL16PolicyGradient() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l16-pg"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+
+      // 起始策略：四个候选回答的概率。固定不变，这样换奖励向量时可比。
+      const P0 = [0.4, 0.1, 0.3, 0.2];
+      const NAMES = ['回答 A', '回答 B', '回答 C', '回答 D'];
+
+      const PRESETS: Record<string, { r: number[]; blo: number; bhi: number; b: number }> = {
+        mix: { r: [1, 1, 0, 0], blo: -1, bhi: 2, b: 0 },
+        one: { r: [1, 0, 0, 0], blo: -1, bhi: 2, b: 0 },
+        shift: { r: [6, 6, 5, 5], blo: 0, bhi: 8, b: 0 },
+        all: { r: [1, 1, 1, 1], blo: -1, bhi: 2, b: 0 },
+      };
+      let rewards = PRESETS.mix.r.slice();
+
+      const softmax = (z: number[]) => {
+        const m = Math.max(...z);
+        const e = z.map((x) => Math.exp(x - m));
+        const s = e.reduce((a, b) => a + b, 0);
+        return e.map((x) => x / s);
+      };
+
+      // 单样本估计量 g_j = (r_i - b)(1[i=j] - p_j) 的总方差，对 i 精确求和
+      const varTotal = (p: number[], r: number[], b: number) => {
+        let tot = 0;
+        for (let j = 0; j < p.length; j++) {
+          let m1 = 0,
+            m2 = 0;
+          for (let i = 0; i < p.length; i++) {
+            const g = (r[i] - b) * ((i === j ? 1 : 0) - p[j]);
+            m1 += p[i] * g;
+            m2 += p[i] * g * g;
+          }
+          tot += m2 - m1 * m1;
+        }
+        return tot;
+      };
+
+      const W = 340,
+        H = 175,
+        ML = 34,
+        MR = 12,
+        MT = 26,
+        MB = 26;
+
+      function drawProbs(host: HTMLElement, p: number[], pn: number[]) {
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+        svg.append(svgEl('text', { class: 'title', x: 4, y: 13 }, '更新前后的概率'));
+        const hi = Math.max(0.6, ...p, ...pn) * 1.12;
+        const y = (v: number) => H - MB - (v / hi) * (H - MT - MB);
+        for (let k = 0; k <= 4; k++) {
+          const v = (hi * k) / 4;
+          svg.append(svgEl('line', { class: 'grid', x1: ML, y1: y(v), x2: W - MR, y2: y(v) }));
+          svg.append(
+            svgEl('text', { x: ML - 4, y: y(v) + 3, 'text-anchor': 'end' }, v.toFixed(2)),
+          );
+        }
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: H - MB, x2: W - MR, y2: H - MB }));
+
+        const bw = (W - ML - MR) / p.length;
+        p.forEach((v, i) => {
+          const x0 = ML + i * bw;
+          svg.append(
+            svgEl('rect', {
+              class: 'barold',
+              x: x0 + bw * 0.14,
+              y: y(v),
+              width: bw * 0.34,
+              height: H - MB - y(v),
+            }),
+          );
+          svg.append(
+            svgEl('rect', {
+              class: pn[i] >= v ? 'barnew' : 'barneg',
+              x: x0 + bw * 0.52,
+              y: y(pn[i]),
+              width: bw * 0.34,
+              height: H - MB - y(pn[i]),
+            }),
+          );
+          svg.append(
+            svgEl(
+              'text',
+              { class: 'lab', x: x0 + bw / 2, y: H - MB + 11, 'text-anchor': 'middle' },
+              NAMES[i].slice(-1),
+            ),
+          );
+        });
+        svg.append(
+          svgEl('text', { class: 'lab', x: W - MR, y: MT - 6, 'text-anchor': 'end' }, '灰=更新前　彩=更新后'),
+        );
+        host.replaceChildren(svg);
+      }
+
+      function drawVar(host: HTMLElement, p: number[], r: number[], b: number, lo: number, hi: number) {
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+        svg.append(svgEl('text', { class: 'title', x: 4, y: 13 }, '单样本梯度估计的总方差 vs 基线 b'));
+
+        const N = 160;
+        const xs: number[] = [];
+        const vs: number[] = [];
+        for (let i = 0; i <= N; i++) {
+          const bb = lo + ((hi - lo) * i) / N;
+          xs.push(bb);
+          vs.push(varTotal(p, r, bb));
+        }
+        const vmax = Math.max(...vs) * 1.08 || 1;
+        const px = (v: number) => ML + ((v - lo) / (hi - lo)) * (W - ML - MR);
+        const py = (v: number) => H - MB - (v / vmax) * (H - MT - MB);
+
+        for (let k = 0; k <= 3; k++) {
+          const v = (vmax * k) / 3;
+          svg.append(svgEl('line', { class: 'grid', x1: ML, y1: py(v), x2: W - MR, y2: py(v) }));
+          svg.append(
+            svgEl('text', { x: ML - 4, y: py(v) + 3, 'text-anchor': 'end' }, v.toFixed(2)),
+          );
+        }
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: H - MB, x2: W - MR, y2: H - MB }));
+        for (let k = 0; k <= 4; k++) {
+          const bb = lo + ((hi - lo) * k) / 4;
+          svg.append(
+            svgEl('text', { x: px(bb), y: H - MB + 11, 'text-anchor': 'middle' }, bb.toFixed(1)),
+          );
+        }
+
+        svg.append(
+          svgEl('path', {
+            class: 'curve',
+            d: xs.map((x, i) => `${i ? 'L' : 'M'}${px(x).toFixed(2)},${py(vs[i]).toFixed(2)}`).join(' '),
+          }),
+        );
+
+        // 组内均值那条参考线
+        const rbar = p.reduce((a, pi, i) => a + pi * r[i], 0);
+        if (rbar >= lo && rbar <= hi) {
+          svg.append(svgEl('line', { class: 'mark2', x1: px(rbar), y1: MT, x2: px(rbar), y2: H - MB }));
+          svg.append(
+            svgEl('text', { class: 'lab', x: px(rbar) + 3, y: MT + 8 }, `r̄ = ${rbar.toFixed(2)}`),
+          );
+        }
+        // 当前 b
+        const bc = Math.min(Math.max(b, lo), hi);
+        svg.append(svgEl('line', { class: 'mark', x1: px(bc), y1: MT, x2: px(bc), y2: H - MB }));
+        svg.append(svgEl('circle', { class: 'dot', cx: px(bc), cy: py(varTotal(p, r, bc)), r: 3.2 }));
+        host.replaceChildren(svg);
+      }
+
+      function draw() {
+        const eta = parseFloat($<HTMLInputElement>('[data-eta]').value);
+        const b = parseFloat($<HTMLInputElement>('[data-b]').value);
+        const bslider = $<HTMLInputElement>('[data-b]');
+        const lo = parseFloat(bslider.min),
+          hi = parseFloat(bslider.max);
+
+        $('[data-eta-v]').textContent = eta.toFixed(1);
+        $('[data-b-v]').textContent = b.toFixed(2);
+
+        const p = P0.slice();
+        const rbar = p.reduce((a, pi, i) => a + pi * rewards[i], 0);
+        const grad = p.map((pi, i) => pi * (rewards[i] - rbar));
+        const z = p.map((x) => Math.log(x));
+        const pn = softmax(z.map((zi, i) => zi + eta * grad[i]));
+        const Jold = rbar;
+        const Jnew = pn.reduce((a, pi, i) => a + pi * rewards[i], 0);
+
+        const v0 = varTotal(p, rewards, 0);
+        const vbar = varTotal(p, rewards, rbar);
+        const vb = varTotal(p, rewards, b);
+
+        $('[data-derived]').textContent =
+          `奖励 r = [${rewards.join(', ')}]　　r̄ = Σ p_i r_i = ${rbar.toFixed(4)}\n` +
+          `期望奖励 J：更新前 ${Jold.toFixed(4)} → 更新后 ${Jnew.toFixed(4)}` +
+          `　（Δ = ${(Jnew - Jold >= 0 ? '+' : '') + (Jnew - Jold).toFixed(4)}）\n` +
+          `方差：b = 0 时 ${v0.toFixed(4)}　b = r̄ 时 ${vbar.toFixed(4)}　当前 b 时 ${vb.toFixed(4)}` +
+          `　（b = 0 相对 b = r̄ 大 ${vbar > 1e-12 ? (v0 / vbar).toFixed(2) + ' 倍' : '无穷多倍 —— 用 r̄ 当基线时方差恰好是 0'}）`;
+
+        const tb = $('[data-out] tbody');
+        tb.replaceChildren();
+        NAMES.forEach((nm, i) => {
+          const tr = document.createElement('tr');
+          const d = pn[i] - p[i];
+          const cells: [string, string][] = [
+            [nm, ''],
+            [rewards[i].toFixed(1), ''],
+            [p[i].toFixed(4), 'dim'],
+            [(rewards[i] - rbar).toFixed(4), rewards[i] - rbar >= 0 ? 'up' : 'down'],
+            [(eta * grad[i]).toFixed(4), grad[i] >= 0 ? 'up' : 'down'],
+            [pn[i].toFixed(4), ''],
+            [(d >= 0 ? '+' : '') + d.toFixed(4), d >= 0 ? 'up' : 'down'],
+          ];
+          cells.forEach(([t, cls]) => {
+            const td = document.createElement('td');
+            td.textContent = t;
+            if (cls) td.className = cls;
+            tr.append(td);
+          });
+          tb.append(tr);
+        });
+
+        drawProbs($('[data-plot-p]'), p, pn);
+        drawVar($('[data-plot-v]'), p, rewards, b, lo, hi);
+
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        const strong = (t: string) => {
+          const s = document.createElement('strong');
+          s.textContent = t;
+          return s;
+        };
+        const flat = Math.abs(Jnew - Jold) < 1e-9;
+        v.append(
+          document.createTextNode('左图：优势为正的候选被推高、为负的被压低，力度 '),
+          strong('正比于它当前的概率'),
+          document.createTextNode(
+            '（Δz = η·p(r−r̄)）—— 所以一个概率极低的正确回答，一步只能被推高一点点。' +
+              (flat
+                ? ' 现在四条奖励完全相同，所有优势都是 0，梯度是零向量：一整组全对（或全错）时没有任何学习信号，这正是 GRPO 里需要难度过滤的原因。'
+                : '') +
+              '　右图：曲线是单样本估计量的总方差，',
+          ),
+          strong('注意曲线是一条抛物线，而左边的更新完全不随 b 变化'),
+          document.createTextNode(
+            ' —— 这就是基线定理：基线改变方差，不改变期望。把「奖励整体 +5」那个预设点开，' +
+              'b 停在 0 时方差会大得离谱，把 b 拖到 r̄ 附近立刻塌下来；而左边那张图一个像素都不动。',
+          ),
+        );
+      }
+
+      root.querySelectorAll('input').forEach((el) => el.addEventListener('input', draw));
+      root.querySelectorAll<HTMLButtonElement>('[data-preset]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const cfg = PRESETS[btn.dataset.preset!];
+          if (!cfg) return;
+          rewards = cfg.r.slice();
+          const bs = $<HTMLInputElement>('[data-b]');
+          bs.min = String(cfg.blo);
+          bs.max = String(cfg.bhi);
+          bs.value = String(cfg.b);
+          draw();
+        });
+      });
+      draw();
+    });
+  }
+
+  setupL16PolicyGradient();
+  document.addEventListener('astro:page-load', setupL16PolicyGradient);
+</script>

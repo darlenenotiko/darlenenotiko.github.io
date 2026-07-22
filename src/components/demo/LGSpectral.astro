@@ -1,0 +1,362 @@
+---
+// CS336 客座讲座（Dan Fu）演示 3：循环 Transformer 为什么会炸，Parcae 怎么按住它。
+//
+// 讲者的做法：把循环块里所有非线性的东西（注意力、门控、前馈）打包扔进一个盒子 R，
+// 剩下的就是一个线性系统 —— 残差每绕一圈被 A 乘一次，初始向量被 B 注入一次。
+// 丢掉 R 之后可以直接解出闭式解：
+//
+//   x_{t+1} = A^{t+1} x_0 + (I + A + A^2 + … + A^t) B u
+//
+// 标量化（把 A 换成它的谱半径 ρ）就是这个演示画的东西：
+//
+//   |x_{t+1}| = ρ^{t+1} |x_0| + (1 + ρ + … + ρ^t) |Bu|
+//
+// ρ > 1 → 指数爆炸（讲者：ρ=2、t=16 就是 2^16）；ρ = 1 → 边缘稳定（线性增长）；
+// ρ < 1 → 稳定，几何级数收敛到 1/(1−ρ)。
+// 这是我按讲者口头讲的推导写的标量版，用来看形状，不是论文里的矩阵版本。
+---
+
+<div class="demo" data-demo="lg-spectral">
+  <div class="row">
+    <span class="plabel">前人的选择 / Parcae：</span>
+    <button data-preset="id">恒等 A（ρ = 1，边缘稳定）</button>
+    <button data-preset="free" class="on">自由学习的 A（ρ = 2，不稳定）</button>
+    <button data-preset="parcae">Parcae：负对角 A（ρ = 0.9，稳定）</button>
+  </div>
+
+  <div class="row">
+    <label class="sld">
+      谱半径 ρ(A) = <span data-r-val>2.00</span>
+      <input type="range" data-r min="10" max="80" step="1" value="40" />
+    </label>
+    <label class="sld">
+      循环次数 t = <span data-t-val>16</span>
+      <input type="range" data-t min="1" max="32" step="1" value="16" />
+    </label>
+  </div>
+
+  <div class="two">
+    <div>
+      <canvas data-canvas width="720" height="290"></canvas>
+      <p class="axis">
+        横轴是循环了几圈，纵轴是残差的模长（对数轴，从 10⁻³ 到 10²⁰）。
+        靛蓝曲线是闭式解算出来的模长，竖直虚线是当前的 t，
+        黄色横线是讲者说的「无约束基线一路冲到 10¹⁹」那个高度。
+      </p>
+    </div>
+    <div>
+      <table><tbody data-stats></tbody></table>
+      <p class="hint" data-hint></p>
+    </div>
+  </div>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1.1rem;
+    margin-bottom: 0.7rem;
+  }
+  .plabel {
+    font-size: 0.8rem;
+    color: var(--ink-faint);
+  }
+  button {
+    font: inherit;
+    font-size: 0.79rem;
+    padding: 0.22rem 0.6rem;
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    background: var(--bg-raised);
+    color: var(--ink-muted);
+    cursor: pointer;
+    transition: all 0.15s var(--ease);
+  }
+  button.on {
+    border-color: var(--indigo);
+    color: var(--indigo);
+    font-weight: 600;
+  }
+  .sld {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.83rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .sld input[type='range'] {
+    width: 150px;
+    accent-color: var(--indigo);
+  }
+  .two {
+    display: grid;
+    gap: 1.2rem;
+    align-items: start;
+  }
+  @media (min-width: 860px) {
+    .two {
+      grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+    }
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .axis {
+    margin: 0.45rem 0 0;
+    font-size: 0.76rem;
+    color: var(--ink-faint);
+    line-height: 1.7;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.81rem;
+    font-variant-numeric: tabular-nums;
+  }
+  table :global(td) {
+    padding: 0.28rem 0.4rem;
+    color: var(--ink-muted);
+    border-bottom: 1px solid var(--rule);
+  }
+  table :global(td.k) {
+    color: var(--ink-faint);
+  }
+  table :global(td.v) {
+    text-align: right;
+    font-family: var(--font-mono);
+    color: var(--ink);
+  }
+  table :global(tr.hi td.v) {
+    color: var(--indigo);
+    font-weight: 700;
+  }
+  table :global(tr.bad td.v) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+  .hint {
+    margin: 0.9rem 0 0;
+    font-size: 0.83rem;
+    line-height: 1.8;
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupLGSpectral() {
+    document.querySelectorAll<HTMLElement>('[data-demo="lg-spectral"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const cv = $<HTMLCanvasElement>('[data-canvas]');
+      const ctx = cv.getContext('2d')!;
+      const css = (n: string) =>
+        getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+      const TMAX = 32;
+      const X0 = 1; // 进入循环前的残差模长
+      const BU = 1; // 每圈注入的那一项 |B u|
+
+      const rIn = $<HTMLInputElement>('[data-r]');
+      const tIn = $<HTMLInputElement>('[data-t]');
+
+      // 闭式解的标量版：绕了 n 圈之后的模长
+      const normAt = (rho: number, n: number) => {
+        const pow = Math.pow(rho, n);
+        const geo = Math.abs(rho - 1) < 1e-9 ? n : (1 - pow) / (1 - rho);
+        return pow * X0 + geo * BU;
+      };
+
+      function draw() {
+        const rho = parseInt(rIn.value, 10) / 20;
+        const t = parseInt(tIn.value, 10);
+        $('[data-r-val]').textContent = rho.toFixed(2);
+        $('[data-t-val]').textContent = String(t);
+
+        const indigo = css('--indigo');
+        const madder = css('--madder');
+        const rule = css('--rule');
+        const faint = css('--ink-faint');
+        const weld = css('--weld');
+
+        ctx.clearRect(0, 0, cv.width, cv.height);
+        ctx.font = '11px ui-monospace, monospace';
+        ctx.textBaseline = 'middle';
+
+        const padL = 52,
+          padR = 16,
+          padT = 12,
+          padB = 28;
+        const W = cv.width - padL - padR;
+        const H = cv.height - padT - padB;
+        const LO = -3,
+          HI = 20; // 纵轴的 10 的幂次范围
+        const xOf = (n: number) => padL + (n / TMAX) * W;
+        const yOf = (v: number) => {
+          const e = Math.log10(Math.max(v, 1e-30));
+          return padT + H - ((Math.min(Math.max(e, LO), HI) - LO) / (HI - LO)) * H;
+        };
+
+        // 网格
+        ctx.strokeStyle = rule;
+        ctx.lineWidth = 1;
+        ctx.fillStyle = faint;
+        for (let e = LO; e <= HI; e += 4) {
+          const y = yOf(Math.pow(10, e));
+          ctx.beginPath();
+          ctx.moveTo(padL, y + 0.5);
+          ctx.lineTo(padL + W, y + 0.5);
+          ctx.stroke();
+          ctx.textAlign = 'right';
+          ctx.fillText('1e' + e, padL - 6, y);
+        }
+        ctx.textAlign = 'center';
+        for (let n = 0; n <= TMAX; n += 8) {
+          ctx.fillText(String(n), xOf(n), padT + H + 12);
+        }
+        ctx.fillText('循环圈数 t', padL + W / 2, padT + H + 24);
+
+        // 10^19 参考线
+        const y19 = yOf(1e19);
+        ctx.strokeStyle = weld;
+        ctx.lineWidth = 1.4;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(padL, y19 + 0.5);
+        ctx.lineTo(padL + W, y19 + 0.5);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = weld;
+        ctx.textAlign = 'left';
+        ctx.fillText('无约束基线冲到的 10¹⁹', padL + 6, y19 - 9);
+
+        // ρ = 1 那条（边缘稳定）作为对照
+        ctx.strokeStyle = faint;
+        ctx.lineWidth = 1.2;
+        ctx.setLineDash([2, 3]);
+        ctx.beginPath();
+        for (let n = 0; n <= TMAX; n++) {
+          const x = xOf(n),
+            y = yOf(normAt(1, n));
+          n === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // 主曲线
+        ctx.strokeStyle = rho > 1 ? madder : indigo;
+        ctx.lineWidth = 2.4;
+        ctx.beginPath();
+        for (let n = 0; n <= TMAX; n++) {
+          const x = xOf(n),
+            y = yOf(normAt(rho, n));
+          n === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+
+        // 当前的 t
+        ctx.strokeStyle = faint;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.moveTo(xOf(t), padT);
+        ctx.lineTo(xOf(t), padT + H);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = rho > 1 ? madder : indigo;
+        ctx.beginPath();
+        ctx.arc(xOf(t), yOf(normAt(rho, t)), 4.5, 0, Math.PI * 2);
+        ctx.fill();
+
+        // ── 表格 ──
+        const val = normAt(rho, t);
+        const pow = Math.pow(rho, t);
+        const regime =
+          rho > 1.0001 ? '不稳定（会炸）' : rho < 0.9999 ? '稳定（收敛）' : '边缘稳定（线性增长）';
+        const fmt = (v: number) =>
+          v >= 1e5 || (v < 1e-2 && v > 0) ? v.toExponential(2) : v.toFixed(3);
+        const rows: [string, string, string][] = [
+          ['谱半径 ρ(A)', rho.toFixed(2), ''],
+          ['判定', regime, rho > 1.0001 ? 'bad' : rho < 0.9999 ? 'hi' : ''],
+          ['循环 t 圈后的 ρ^t', fmt(pow), rho > 1.0001 ? 'bad' : ''],
+          ['残差模长 |x_t|', fmt(val), rho > 1.0001 ? 'bad' : 'hi'],
+          ['稳态上界 1/(1−ρ)', rho < 0.9999 ? (1 / (1 - rho)).toFixed(2) : '不存在', ''],
+          ['距 10¹⁹ 还差几圈', rho > 1.0001 ? String(Math.max(0, Math.ceil(19 / Math.log10(rho)) - t)) : '永远到不了', ''],
+        ];
+        const tb = $('[data-stats]');
+        tb.replaceChildren();
+        for (const [a1, v, cls] of rows) {
+          const tr = document.createElement('tr');
+          if (cls) tr.className = cls;
+          const a = document.createElement('td');
+          a.className = 'k';
+          a.textContent = a1;
+          const b = document.createElement('td');
+          b.className = 'v';
+          b.textContent = v;
+          tr.append(a, b);
+          tb.append(tr);
+        }
+
+        let hint: string;
+        if (rho > 1.0001) {
+          hint =
+            `ρ = ${rho.toFixed(2)} > 1：每绕一圈就放大一次，${t} 圈之后是 ${fmt(pow)} 倍。` +
+            `讲者举的就是这个例子 —— ρ = 2、t = 16，激活被放大到 2¹⁶ = 65536 倍。` +
+            `这就是那些「学习率一动就炸」的循环模型在数学上的样子。`;
+        } else if (rho < 0.9999) {
+          hint =
+            `ρ = ${rho.toFixed(2)} < 1：每圈都在衰减，残差被几何级数按住，` +
+            `无论循环多少圈都收敛到 ${(1 / (1 - rho)).toFixed(2)} 附近。` +
+            `Parcae 就是靠「把 A 做成负对角矩阵」强行落在这个区间里 —— ` +
+            `于是循环次数可以放心地往上加。`;
+        } else {
+          hint =
+            `ρ = 1：这是前人「把 A 取成恒等、每圈直接相加」的做法，属于边缘稳定 —— ` +
+            `不指数爆炸，但残差随圈数线性增长（注意对数轴上它是一条向上弯的线）。` +
+            `讲者说前人的选择「要么边缘稳定、要么不稳定」，说的就是这两种。`;
+        }
+        $('[data-hint]').textContent = hint;
+      }
+
+      const PRESETS: Record<string, number> = { id: 20, free: 40, parcae: 18 };
+      root.querySelectorAll<HTMLButtonElement>('[data-preset]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          rIn.value = String(PRESETS[btn.dataset.preset!]);
+          root.querySelectorAll('[data-preset]').forEach((b) => b.classList.toggle('on', b === btn));
+          draw();
+        });
+      });
+      root.querySelectorAll('input').forEach((el) =>
+        el.addEventListener('input', () => {
+          root.querySelectorAll('[data-preset]').forEach((b) => b.classList.remove('on'));
+          draw();
+        }),
+      );
+      new MutationObserver(draw).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-theme'],
+      });
+      draw();
+    });
+  }
+
+  setupLGSpectral();
+  document.addEventListener('astro:page-load', setupLGSpectral);
+</script>

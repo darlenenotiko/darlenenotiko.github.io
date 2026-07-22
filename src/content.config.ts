@@ -72,6 +72,11 @@ const courses = defineCollection({
     courseTitle: z.string(),
     /** 第几讲，列表页排序与上下讲导航用 */
     lecture: z.number(),
+    /**
+     * 显示用的讲次名。默认显示「第 N 讲」；客座讲座这类没有课次编号的，
+     * 用它覆盖成「客座讲座」之类，而 lecture 只用来排序。
+     */
+    lectureLabel: z.string().optional(),
     title: z.string(),
     date: z.date(),
     description: z.string().optional(),

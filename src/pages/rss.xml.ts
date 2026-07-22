@@ -15,7 +15,7 @@ export async function GET(context: APIContext) {
       link: `/blog/${post.id}/`,
     })),
     ...courses.map((note) => ({
-      title: `${note.data.courseTitle} 第 ${note.data.lecture} 讲 · ${note.data.title}`,
+      title: `${note.data.courseTitle} ${note.data.lectureLabel ?? `第 ${note.data.lecture} 讲`} · ${note.data.title}`,
       description: note.data.description ?? '',
       pubDate: note.data.date,
       link: `/courses/${note.id}/`,

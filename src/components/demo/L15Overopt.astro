@@ -1,0 +1,312 @@
+---
+// 奖励过优化：代理奖励（你训练时看到的那个学出来的奖励模型的分数）一路上涨，
+// 金标准奖励（真人实际有多满意）先涨后跌。
+// 函数形式取自 Gao, Schulman, Hilton 2023《Scaling Laws for Reward Model Overoptimization》：
+// 令 d = sqrt(KL)，RL 情形下奖励随 d 的关系是 R(d) = d(α − β log d)。
+// 课上只给了图、没给公式，所以这两条曲线是本讲义补的；代理和金标准用同一族函数、不同的 β。
+---
+
+<div class="demo" data-demo="l15-overopt">
+  <div class="ctrl">
+    <label
+      >优化强度：策略走出去多远 √KL <input type="range" data-d min="2" max="160" step="2" value="40" />
+      <span data-d-v class="num"></span></label
+    >
+  </div>
+  <div class="ctrl">
+    <label
+      >奖励信号有多容易被钻空子 <input type="range" data-b min="4" max="60" step="1" value="35" />
+      <span data-b-v class="num"></span></label
+    >
+    <span class="tag" data-regime></span>
+  </div>
+
+  <div class="plot" data-plot></div>
+
+  <table class="out" data-out><tbody></tbody></table>
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1.3rem;
+    margin-bottom: 0.55rem;
+  }
+  .tag {
+    font-size: 0.75rem;
+    color: var(--ink-faint);
+  }
+  .ctrl label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+  }
+  .ctrl input[type='range'] {
+    width: 150px;
+    accent-color: var(--indigo);
+  }
+  .num {
+    display: inline-block;
+    min-width: 3.4em;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 0.78rem;
+    color: var(--ink);
+  }
+
+  .plot {
+    overflow-x: auto;
+  }
+  .plot :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 440px;
+    height: auto;
+  }
+  .plot :global(.proxy) {
+    fill: none;
+    stroke: var(--indigo);
+    stroke-width: 1.8;
+    stroke-dasharray: 5 3;
+  }
+  .plot :global(.gold) {
+    fill: none;
+    stroke: var(--madder);
+    stroke-width: 2;
+  }
+  .plot :global(.axis) {
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .plot :global(.mark) {
+    stroke: var(--ink-faint);
+    stroke-width: 1;
+    stroke-dasharray: 3 3;
+  }
+  .plot :global(.peak) {
+    stroke: var(--weld);
+    stroke-width: 1.4;
+  }
+  .plot :global(.dot) {
+    fill: var(--madder);
+  }
+  .plot :global(.dot.p) {
+    fill: var(--indigo);
+  }
+  .plot :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 9px;
+  }
+  .plot :global(text.title) {
+    fill: var(--indigo);
+    font-size: 10.5px;
+    font-weight: 700;
+  }
+
+  .out {
+    width: 100%;
+    margin-top: 0.9rem;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+  }
+  .out :global(td) {
+    padding: 0.28rem 0.35rem;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-muted);
+  }
+  .out :global(td.v) {
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    white-space: nowrap;
+  }
+  .out :global(tr.hi td) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL15Overopt() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l15-overopt"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+
+      const ALPHA = 1.0;
+      const DMAX = 16;
+
+      function draw() {
+        const d = +$<HTMLInputElement>('[data-d]').value / 10; // 0.2 ~ 16.0
+        const b = +$<HTMLInputElement>('[data-b]').value / 100; // 0.04 ~ 0.60
+        const bp = Math.min(0.55 * b, 0.15); // 代理奖励也会衰减，只是慢得多
+
+        const gold = (x: number) => x * (ALPHA - b * Math.log(x));
+        const proxy = (x: number) => x * (ALPHA - bp * Math.log(x));
+        const dStar = Math.exp(ALPHA / b - 1); // 解 α − β log d − β = 0
+
+        $('[data-d-v]').textContent = d.toFixed(1);
+        $('[data-b-v]').textContent = b.toFixed(2);
+        $('[data-regime]').textContent =
+          b <= 0.1
+            ? '≈ 幻灯片右边那张「无噪声的 LM 偏好」：几乎不过优化'
+            : b <= 0.35
+              ? '≈ 中间那张「有噪声的 LM 偏好」'
+              : '≈ 左边那张「真人偏好」：很快就过优化';
+
+        const kl = d * d;
+        const gNow = gold(d);
+        const pNow = proxy(d);
+        const onChart = dStar < DMAX;
+        const gBest = onChart ? gold(dStar) : gold(DMAX);
+
+        // ── 曲线 ──
+        const W = 640,
+          H = 240,
+          ML = 46,
+          MR = 12,
+          MT = 26,
+          MB = 42;
+        const gw = W - ML - MR,
+          gh = H - MT - MB;
+        let ymax = 0;
+        for (let i = 1; i <= 400; i++) ymax = Math.max(ymax, proxy((DMAX * i) / 400));
+        ymax *= 1.06;
+        let gmin = 0;
+        for (let i = 1; i <= 400; i++) gmin = Math.min(gmin, gold((DMAX * i) / 400));
+        const ymin = Math.max(gmin, -0.28 * ymax); // 金标准掉太狠时截断，免得把图压扁
+
+        const X = (v: number) => ML + (v / DMAX) * gw;
+        const Y = (v: number) => MT + gh - ((Math.max(v, ymin) - ymin) / (ymax - ymin)) * gh;
+
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+        svg.append(
+          svgEl(
+            'text',
+            { class: 'title', x: 4, y: 12 },
+            '虚线 = 代理奖励（学出来的奖励模型打的分）　实线 = 金标准奖励（真人实际有多满意）',
+          ),
+        );
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: MT, x2: ML, y2: MT + gh }));
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: Y(0), x2: ML + gw, y2: Y(0) }));
+
+        const line = (f: (x: number) => number, cls: string) => {
+          const pts: string[] = [];
+          for (let i = 1; i <= 400; i++) {
+            const x = (DMAX * i) / 400;
+            pts.push(`${X(x).toFixed(2)},${Y(f(x)).toFixed(2)}`);
+          }
+          svg.append(svgEl('polyline', { class: cls, points: pts.join(' ') }));
+        };
+        line(proxy, 'proxy');
+        line(gold, 'gold');
+
+        if (onChart) {
+          svg.append(svgEl('line', { class: 'peak', x1: X(dStar), y1: MT, x2: X(dStar), y2: MT + gh }));
+          svg.append(svgEl('text', { x: X(dStar) + 3, y: MT + 10 }, '金标准的最高点'));
+        }
+        svg.append(svgEl('line', { class: 'mark', x1: X(d), y1: MT, x2: X(d), y2: MT + gh }));
+        svg.append(svgEl('circle', { class: 'dot p', cx: X(d), cy: Y(pNow), r: 3.4 }));
+        svg.append(svgEl('circle', { class: 'dot', cx: X(d), cy: Y(gNow), r: 3.8 }));
+
+        svg.append(svgEl('text', { x: ML - 5, y: MT + 4, 'text-anchor': 'end' }, ymax.toFixed(1)));
+        svg.append(svgEl('text', { x: ML - 5, y: Y(0) + 3, 'text-anchor': 'end' }, '0'));
+        for (let k = 0; k <= 4; k++) {
+          const x = (DMAX * k) / 4;
+          svg.append(svgEl('text', { x: X(x), y: MT + gh + 13, 'text-anchor': 'middle' }, x.toFixed(0)));
+        }
+        svg.append(
+          svgEl(
+            'text',
+            { x: ML + gw / 2, y: MT + gh + 28, 'text-anchor': 'middle' },
+            '横轴 √KL：策略离 SFT 模型走了多远（KL 是它的平方）',
+          ),
+        );
+        $('[data-plot]').replaceChildren(svg);
+
+        // ── 读数 ──
+        const tb = $('[data-out] tbody');
+        tb.replaceChildren();
+        const row = (k: string, v: string, cls = '') => {
+          const tr = document.createElement('tr');
+          if (cls) tr.className = cls;
+          const a = document.createElement('td');
+          a.textContent = k;
+          const b2 = document.createElement('td');
+          b2.className = 'v';
+          b2.textContent = v;
+          tr.append(a, b2);
+          tb.append(tr);
+        };
+        row('当前 KL', kl.toFixed(1) + ' nats');
+        row('代理奖励（训练日志里看到的那个数）', pNow.toFixed(2));
+        row('金标准奖励（真人实际有多满意）', gNow.toFixed(2), 'hi');
+        row(
+          '金标准最高能到多少',
+          onChart ? gBest.toFixed(2) + '（√KL ≈ ' + dStar.toFixed(1) + '）' : '这张图上还没到顶（≥ ' + gBest.toFixed(2) + '）',
+        );
+        row('你比最高点掉了多少', Math.max(gBest - gNow, 0).toFixed(2), gNow < gBest - 1e-9 ? 'hi' : '');
+
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        const s = document.createElement('strong');
+        const past = onChart && d > dStar;
+        s.textContent = past ? '已经越过峰值了' : '还在峰值左边';
+        v.append(
+          document.createTextNode('当前状态：'),
+          s,
+          document.createTextNode(
+            past
+              ? '。注意两条曲线现在在往相反的方向走：代理奖励还在涨 —— 你在训练日志里只会看到「奖励一路上升，一切顺利」——' +
+                  '而真人已经觉得模型变差了。这正是过优化最坑人的地方：你唯一能直接看到的那个数，恰好是骗你的那个数。' +
+                  ' 把左边的滑块往回拖，或者把右边的滑块调小（换一个更难被钻空子的奖励信号），峰值就会往右移。'
+              : '。代理奖励和金标准奖励还在同向上升，这一段区间里「再多优化一点」确实是赚的。' +
+                  ' 继续往右拖左边那个滑块，看实线什么时候掉头 —— 那个拐点就是 KL 正则项要拦住你的地方，' +
+                  '也是为什么 InstructGPT 的目标函数里非要挂一个 KL 项。',
+          ),
+        );
+      }
+
+      root.querySelectorAll<HTMLInputElement>('input[type="range"]').forEach((r) => {
+        r.addEventListener('input', draw);
+        r.addEventListener('change', draw);
+      });
+
+      draw();
+    });
+  }
+
+  setupL15Overopt();
+  document.addEventListener('astro:page-load', setupL15Overopt);
+</script>

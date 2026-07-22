@@ -1,0 +1,429 @@
+---
+// 第 17 讲演示 2：CLIP / SigLIP 的对比学习矩阵。
+// 一批 n 个（图像, 文本）对，编码后两两点积得到 n×n 的相似度矩阵。
+// CLIP：按行、按列各做一次 softmax 多分类，正确答案是对角线。
+// SigLIP：每个格子独立做一次二分类，对角线是正例、其余是负例。
+// 拖「训练进度」看矩阵怎么从一团噪声被推成一条对角线。
+---
+
+<div class="demo" data-demo="l17-clip-matrix">
+  <div class="row">
+    <span class="lab">目标函数</span>
+    <button data-obj="clip" class="on">CLIP（softmax 多分类）</button>
+    <button data-obj="siglip">SigLIP（sigmoid 二分类）</button>
+  </div>
+
+  <div class="row">
+    <span class="lab">批大小 n</span>
+    <button data-n="4">4</button>
+    <button data-n="6" class="on">6</button>
+    <button data-n="8">8</button>
+  </div>
+
+  <div class="knobs">
+    <label>
+      <span>训练进度 <code data-out="p"></code></span>
+      <input type="range" data-k="p" min="0" max="100" step="1" value="0" />
+    </label>
+    <label>
+      <span>温度 τ = <code data-out="t"></code></span>
+      <input type="range" data-k="t" min="2" max="100" step="1" value="20" />
+    </label>
+    <label>
+      <span>SigLIP 的偏置 b = <code data-out="b"></code></span>
+      <input type="range" data-k="b" min="-80" max="20" step="1" value="-20" />
+    </label>
+  </div>
+
+  <div class="matwrap">
+    <div class="mat" data-mat></div>
+  </div>
+
+  <div class="cards">
+    <div class="card hot">
+      <h4>当前损失</h4>
+      <div class="big" data-loss></div>
+      <p class="sub" data-loss-sub></p>
+    </div>
+    <div class="card">
+      <h4>对角线平均得分</h4>
+      <div class="big" data-diag></div>
+      <p class="sub">正例：图 i 和它自己的说明文字</p>
+    </div>
+    <div class="card">
+      <h4>非对角线平均得分</h4>
+      <div class="big" data-off></div>
+      <p class="sub">负例：图 i 和别人的说明文字</p>
+    </div>
+  </div>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.45rem;
+    margin-bottom: 0.55rem;
+  }
+  .lab {
+    font-size: 0.75rem;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+  .row button {
+    padding: 0.24rem 0.62rem;
+    font: inherit;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .row button:hover {
+    color: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .row button.on {
+    color: var(--bg-raised);
+    background: var(--indigo);
+    border-color: var(--indigo);
+  }
+
+  .knobs {
+    display: grid;
+    gap: 0.7rem;
+    margin: 0.8rem 0 0.4rem;
+  }
+  @media (min-width: 640px) {
+    .knobs {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  }
+  .knobs label {
+    display: block;
+    font-size: 0.78rem;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+  }
+  .knobs label span {
+    display: block;
+    margin-bottom: 0.25rem;
+  }
+  .knobs code {
+    font-family: var(--font-mono);
+    color: var(--indigo);
+    font-size: 0.85rem;
+  }
+  .knobs input[type='range'] {
+    width: 100%;
+    accent-color: var(--indigo);
+  }
+
+  .matwrap {
+    overflow-x: auto;
+    margin: 0.9rem 0 0.3rem;
+  }
+  .mat {
+    display: grid;
+    gap: 2px;
+    min-width: 320px;
+  }
+  .cell {
+    position: relative;
+    min-height: 42px;
+    padding: 3px 2px;
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    background: var(--bg-raised);
+    text-align: center;
+    overflow: hidden;
+  }
+  .cell .fill {
+    position: absolute;
+    inset: 0;
+    background: var(--indigo);
+  }
+  .cell .v,
+  .cell .q {
+    position: relative;
+    display: block;
+    font-family: var(--font-mono);
+    line-height: 1.3;
+  }
+  .cell .v {
+    font-size: 0.76rem;
+    color: var(--ink);
+  }
+  .cell .q {
+    font-size: 0.66rem;
+    color: var(--ink-muted);
+  }
+  .cell.diag {
+    border-color: var(--madder);
+    border-width: 2px;
+  }
+  .hdr {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 42px;
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    color: var(--ink-faint);
+  }
+  .corner {
+    min-height: 42px;
+  }
+
+  .cards {
+    display: grid;
+    gap: 0.6rem;
+    margin-top: 0.8rem;
+  }
+  @media (min-width: 640px) {
+    .cards {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  }
+  .card {
+    padding: 0.6rem 0.75rem 0.7rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 7px;
+  }
+  .card h4 {
+    margin: 0 0 0.3rem;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+  .card .big {
+    font-family: var(--font-mono);
+    font-size: 1.35rem;
+    color: var(--indigo);
+    line-height: 1.15;
+  }
+  .card.hot .big {
+    color: var(--madder);
+  }
+  .card .sub {
+    margin: 0.25rem 0 0;
+    font-size: 0.74rem;
+    color: var(--ink-muted);
+    line-height: 1.5;
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.82rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict b {
+    color: var(--ink);
+  }
+</style>
+
+<script>
+  function setupL17ClipMatrix() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l17-clip-matrix"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+
+      let n = 6;
+      let obj: 'clip' | 'siglip' = 'clip';
+
+      const slider = (k: string) => $<HTMLInputElement>(`[data-k="${k}"]`);
+      const sig = (x: number) => 1 / (1 + Math.exp(-x));
+
+      // 确定性的「初始（未训练）相似度」：编码器随机初始化时，
+      // 图文点积基本就是噪声，跟对不对齐没关系。
+      const noise = (i: number, j: number) => {
+        const s = Math.sin(i * 12.9898 + j * 78.233) * 43758.5453;
+        return (s - Math.floor(s)) * 1.2 - 0.6;
+      };
+
+      // 相似度矩阵：从噪声线性插值到「对角线 1、其余 -0.3」的理想状态
+      function simMatrix() {
+        const p = Number(slider('p').value) / 100;
+        const S: number[][] = [];
+        for (let i = 0; i < n; i++) {
+          S.push([]);
+          for (let j = 0; j < n; j++) {
+            const target = i === j ? 1 : -0.3;
+            S[i].push((1 - p) * noise(i, j) + p * target);
+          }
+        }
+        return S;
+      }
+
+      function compute() {
+        const S = simMatrix();
+        const tau = Number(slider('t').value) / 100;
+        const b = Number(slider('b').value) / 10;
+
+        // 概率矩阵 P：CLIP 是按行 softmax，SigLIP 是逐格 sigmoid
+        const P: number[][] = [];
+        let loss = 0;
+        let lossI = 0;
+        let lossT = 0;
+
+        if (obj === 'clip') {
+          // 行方向：给定图 i，在 n 段文本里挑
+          for (let i = 0; i < n; i++) {
+            const z = S[i].map((v) => v / tau);
+            const m = Math.max(...z);
+            const e = z.map((v) => Math.exp(v - m));
+            const sum = e.reduce((a, v) => a + v, 0);
+            P.push(e.map((v) => v / sum));
+            lossI += -Math.log(P[i][i]);
+          }
+          lossI /= n;
+          // 列方向：给定文本 j，在 n 张图里挑
+          for (let j = 0; j < n; j++) {
+            const z: number[] = [];
+            for (let i = 0; i < n; i++) z.push(S[i][j] / tau);
+            const m = Math.max(...z);
+            const e = z.map((v) => Math.exp(v - m));
+            const sum = e.reduce((a, v) => a + v, 0);
+            lossT += -Math.log(e[j] / sum);
+          }
+          lossT /= n;
+          loss = (lossI + lossT) / 2;
+        } else {
+          let acc = 0;
+          for (let i = 0; i < n; i++) {
+            P.push([]);
+            for (let j = 0; j < n; j++) {
+              const z = S[i][j] / tau + b;
+              P[i].push(sig(z));
+              const label = i === j ? 1 : -1;
+              acc += -Math.log(Math.max(1e-12, sig(label * z)));
+            }
+          }
+          loss = acc / n;
+        }
+
+        let diag = 0;
+        let off = 0;
+        for (let i = 0; i < n; i++)
+          for (let j = 0; j < n; j++) {
+            if (i === j) diag += S[i][j];
+            else off += S[i][j];
+          }
+        diag /= n;
+        off /= n * n - n;
+
+        return { S, P, loss, lossI, lossT, diag, off, tau, b };
+      }
+
+      function render() {
+        const r = compute();
+        slider('b').closest('label')!.style.opacity = obj === 'siglip' ? '1' : '0.4';
+
+        $('[data-out="p"]').textContent = slider('p').value + '%';
+        $('[data-out="t"]').textContent = r.tau.toFixed(2);
+        $('[data-out="b"]').textContent = r.b.toFixed(1);
+
+        // 矩阵每次重画（它里面没有任何控件）
+        const mat = $('[data-mat]');
+        mat.style.gridTemplateColumns = `36px repeat(${n}, minmax(48px, 1fr))`;
+        mat.replaceChildren();
+
+        const corner = document.createElement('div');
+        corner.className = 'corner';
+        mat.append(corner);
+        for (let j = 0; j < n; j++) {
+          const h = document.createElement('div');
+          h.className = 'hdr';
+          h.textContent = 'T' + (j + 1);
+          mat.append(h);
+        }
+        for (let i = 0; i < n; i++) {
+          const h = document.createElement('div');
+          h.className = 'hdr';
+          h.textContent = 'I' + (i + 1);
+          mat.append(h);
+          for (let j = 0; j < n; j++) {
+            const c = document.createElement('div');
+            c.className = 'cell' + (i === j ? ' diag' : '');
+            const fill = document.createElement('span');
+            fill.className = 'fill';
+            fill.style.opacity = String(Math.min(0.55, Math.max(0, r.P[i][j]) * 0.55));
+            const v = document.createElement('span');
+            v.className = 'v';
+            v.textContent = r.S[i][j].toFixed(2);
+            const q = document.createElement('span');
+            q.className = 'q';
+            q.textContent = r.P[i][j].toFixed(2);
+            c.append(fill, v, q);
+            mat.append(c);
+          }
+        }
+
+        $('[data-loss]').textContent = r.loss.toFixed(3);
+        $('[data-loss-sub]').textContent =
+          obj === 'clip'
+            ? `按图找文 ${r.lossI.toFixed(3)}，按文找图 ${r.lossT.toFixed(3)}，取平均`
+            : `${n * n} 个格子各算一次 −log σ，求和再除以 n = ${n}`;
+        $('[data-diag]').textContent = r.diag.toFixed(2);
+        $('[data-off]').textContent = r.off.toFixed(2);
+
+        const gap = r.diag - r.off;
+        $('[data-verdict]').innerHTML =
+          obj === 'clip'
+            ? `每个格子上面那行是<b>相似度</b>（两个向量的点积），下面那行是 <b>softmax 之后的概率</b>：` +
+              `第 i 行的 n 个数加起来等于 1 —— 也就是「给定图 ${'I'}i，模型认为哪段文字才是它的说明」。` +
+              `目前对角线比非对角线高 <b>${gap.toFixed(2)}</b>。` +
+              `注意这个 softmax <b>横跨整批 ${n} 个样本</b>：批越大，每个正例要压过的负例越多，学到的表示越好 —— ` +
+              `这就是 CLIP 要开到 32768 这种批大小的原因，也是它不好切分到多卡的原因。`
+            : `SigLIP 把同一张矩阵改成 <b>${n * n} 个互相独立的是非题</b>：这一格是不是一对？` +
+              `下面那行是 σ(相似度/τ + b)，每一格自己算自己的，<b>行与行之间不再耦合</b>。` +
+              `偏置 b 默认是负的（现在 ${r.b.toFixed(1)}），因为 ${n * n} 个格子里只有 ${n} 个是正例，` +
+              `不压一下的话模型一上来会把什么都判成「是一对」。` +
+              `目前对角线比非对角线高 <b>${gap.toFixed(2)}</b>。`;
+      }
+
+      root.querySelectorAll<HTMLInputElement>('input[type="range"]').forEach((el) => {
+        el.addEventListener('input', render);
+      });
+      root.querySelectorAll<HTMLButtonElement>('[data-obj]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          obj = btn.dataset.obj as 'clip' | 'siglip';
+          root.querySelectorAll('[data-obj]').forEach((o) => o.classList.remove('on'));
+          btn.classList.add('on');
+          render();
+        });
+      });
+      root.querySelectorAll<HTMLButtonElement>('[data-n]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          n = Number(btn.dataset.n);
+          root.querySelectorAll('[data-n]').forEach((o) => o.classList.remove('on'));
+          btn.classList.add('on');
+          render();
+        });
+      });
+
+      render();
+    });
+  }
+
+  setupL17ClipMatrix();
+  document.addEventListener('astro:page-load', setupL17ClipMatrix);
+</script>

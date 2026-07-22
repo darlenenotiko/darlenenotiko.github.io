@@ -1,0 +1,482 @@
+---
+// 数据混合配比器：调各来源的权重，看分到的 token 量、以及每个来源被重复训练了多少遍（epoch）。
+// 课上那个例子是这里的默认值：低质来源 10T token、高质来源 10B token，
+// 各占一半、训 1T token，高质那边就是 50 个 epoch。
+// 还带 UniMax 的 epoch 上限，以及「模拟 epoching」——
+// 把所有来源按同一比例下采样，让小规模实验里也会出现和大规模一样的重复。
+---
+
+<div class="demo" data-demo="l14-mixture">
+  <div class="ctrl" data-weights></div>
+
+  <div class="ctrl">
+    <label>训练 token 总量 <input type="range" data-train min="0" max="6" step="1" value="4" /></label>
+    <span class="val" data-train-v></span>
+    <span class="tag">滑块是相对权重，右边显示的是归一化之后的 p</span>
+  </div>
+  <div class="ctrl">
+    <label class="chk"><input type="checkbox" data-cap /> UniMax：给 epoch 数设上限</label>
+    <label>上限 C <input type="range" data-capv min="1" max="30" step="1" value="4" /></label>
+    <span class="val" data-capv-v></span>
+  </div>
+  <div class="ctrl">
+    <span class="tag">预设</span>
+    <button data-p="naive">课上的例子：一半一半</button>
+    <button data-p="prop">按 token 数成比例</button>
+    <button data-p="unif">均匀</button>
+    <button data-p="greedy">全压高质量</button>
+  </div>
+
+  <div class="scroll">
+    <table class="out" data-out>
+      <thead>
+        <tr>
+          <th>来源</th><th class="m">权重 p</th><th class="m">要喂进去的 token</th>
+          <th class="m">这个来源一共有</th><th class="m">epoch 数</th><th>状态</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="plot" data-plot></div>
+
+  <div class="sim" data-sim></div>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.55rem;
+    margin-bottom: 0.5rem;
+  }
+  .ctrl label {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+  }
+  .ctrl input[type='range'] {
+    width: 8rem;
+    accent-color: var(--indigo);
+  }
+  .ctrl input[type='checkbox'] {
+    accent-color: var(--indigo);
+  }
+  .val {
+    min-width: 3.6rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--madder);
+  }
+  .tag {
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .ctrl button {
+    padding: 0.24rem 0.6rem;
+    font: inherit;
+    font-size: 0.76rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .ctrl button:hover {
+    color: var(--indigo);
+    border-color: var(--indigo);
+  }
+  [data-weights] :global(label) {
+    flex: 0 0 auto;
+  }
+  [data-weights] :global(.wv) {
+    min-width: 2.6rem;
+    font-family: var(--font-mono);
+    font-size: 0.76rem;
+    font-variant-numeric: tabular-nums;
+    color: var(--indigo);
+  }
+
+  .scroll {
+    overflow-x: auto;
+  }
+  .out {
+    width: 100%;
+    margin-top: 0.7rem;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+  }
+  .out :global(th) {
+    padding: 0.26rem 0.35rem;
+    text-align: left;
+    font-weight: 600;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(td) {
+    padding: 0.26rem 0.35rem;
+    color: var(--ink-muted);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(th.m),
+  .out :global(td.m) {
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .out :global(tr.bad td) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+  .out :global(tr.capped td) {
+    color: var(--weld);
+  }
+
+  .plot {
+    margin-top: 0.8rem;
+    overflow-x: auto;
+  }
+  .plot :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 420px;
+    height: auto;
+  }
+  .plot :global(.have) {
+    fill: var(--rule);
+  }
+  .plot :global(.want) {
+    fill: var(--indigo);
+  }
+  .plot :global(.want.over) {
+    fill: var(--madder);
+  }
+  .plot :global(.axis) {
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .plot :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 8.5px;
+  }
+  .plot :global(text.title) {
+    fill: var(--indigo);
+    font-size: 10px;
+    font-weight: 700;
+  }
+
+  .sim {
+    margin-top: 0.9rem;
+    padding: 0.6rem 0.8rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 7px;
+  }
+  .sim :global(h4) {
+    margin: 0 0 0.35rem;
+    font-size: 0.8rem;
+    font-weight: 700;
+    color: var(--indigo);
+  }
+  .sim :global(table) {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.77rem;
+  }
+  .sim :global(th) {
+    padding: 0.22rem 0.3rem;
+    text-align: left;
+    font-weight: 600;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+  }
+  .sim :global(td) {
+    padding: 0.22rem 0.3rem;
+    color: var(--ink-muted);
+    border-bottom: 1px solid var(--rule);
+  }
+  .sim :global(td.m) {
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+  .sim :global(td.hi) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+  .sim :global(p) {
+    margin: 0.4rem 0 0;
+    font-size: 0.77rem;
+    color: var(--ink-faint);
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL14Mixture() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l14-mixture"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+
+      const SRC = [
+        { name: '网页（过滤后的 Common Crawl）', tok: 10e12, w: 50 },
+        { name: '代码（The Stack）', tok: 500e9, w: 0 },
+        { name: '学术论文', tok: 60e9, w: 0 },
+        { name: '百科（Wikipedia）', tok: 10e9, w: 50 },
+      ];
+      const TRAIN = [10e9, 30e9, 100e9, 300e9, 1e12, 3e12, 10e12];
+
+      const fmt = (x: number) =>
+        x >= 1e12 ? (x / 1e12).toFixed(x / 1e12 < 10 ? 2 : 1) + 'T' : x >= 1e9 ? (x / 1e9).toFixed(x / 1e9 < 10 ? 2 : 0) + 'B' : (x / 1e6).toFixed(0) + 'M';
+
+      // UniMax：把超过 epoch 上限的来源掐掉，多出来的权重按原比例分给还没掐的来源
+      function applyCap(p: number[], train: number, cap: number) {
+        const q = p.slice();
+        const locked = new Array(SRC.length).fill(false);
+        for (let iter = 0; iter < 20; iter++) {
+          let changed = false;
+          let free = 0;
+          for (let i = 0; i < SRC.length; i++) {
+            if (locked[i]) continue;
+            const maxP = (cap * SRC[i].tok) / train;
+            if (q[i] > maxP + 1e-12) {
+              free += q[i] - maxP;
+              q[i] = maxP;
+              locked[i] = true;
+              changed = true;
+            }
+          }
+          if (!changed) break;
+          const rest = q.reduce((a, v, i) => a + (locked[i] ? 0 : v), 0);
+          if (rest <= 0) break;
+          for (let i = 0; i < SRC.length; i++) if (!locked[i]) q[i] += (free * q[i]) / rest;
+        }
+        return q;
+      }
+
+      function weightsNow() {
+        const raw = SRC.map((_, i) => +root.querySelector<HTMLInputElement>(`[data-w="${i}"]`)!.value);
+        const sum = raw.reduce((a, b) => a + b, 0) || 1;
+        return raw.map((x) => x / sum);
+      }
+
+      function draw() {
+        const ti = +$<HTMLInputElement>('[data-train]').value;
+        const train = TRAIN[ti];
+        const useCap = $<HTMLInputElement>('[data-cap]').checked;
+        const cap = +$<HTMLInputElement>('[data-capv]').value;
+        $('[data-train-v]').textContent = fmt(train) + ' token';
+        $('[data-capv-v]').textContent = 'C = ' + cap;
+
+        let p = weightsNow();
+        if (useCap) p = applyCap(p, train, cap);
+        SRC.forEach((_, i) => {
+          root.querySelector<HTMLElement>(`[data-wv="${i}"]`)!.textContent = (p[i] * 100).toFixed(1) + '%';
+        });
+
+        const want = p.map((x) => x * train);
+        const ep = want.map((w, i) => w / SRC[i].tok);
+
+        // ── 读数表 ──
+        const tb = $('[data-out] tbody');
+        tb.replaceChildren();
+        SRC.forEach((s, i) => {
+          const tr = document.createElement('tr');
+          if (ep[i] > 4) tr.className = 'bad';
+          else if (useCap && Math.abs(ep[i] - cap) < 1e-6) tr.className = 'capped';
+          const mk = (t: string, cls = '') => {
+            const td = document.createElement('td');
+            td.className = cls;
+            td.textContent = t;
+            return td;
+          };
+          const state =
+            ep[i] === 0
+              ? '没用上'
+              : ep[i] < 1
+                ? `只看了这个来源的 ${(ep[i] * 100).toFixed(1)}%`
+                : ep[i] <= 2
+                  ? '完整过完，重复不多'
+                  : ep[i] <= 4
+                    ? '开始重复，还能接受'
+                    : '重复太多，有过拟合风险';
+          tr.append(
+            mk(s.name),
+            mk((p[i] * 100).toFixed(1) + '%', 'm'),
+            mk(fmt(want[i]), 'm'),
+            mk(fmt(s.tok), 'm'),
+            mk(ep[i] < 0.01 && ep[i] > 0 ? ep[i].toExponential(1) : ep[i].toFixed(2), 'm'),
+            mk(state),
+          );
+          tb.append(tr);
+        });
+
+        // ── 柱状图：想喂多少 vs 手上有多少（对数刻度）──
+        const W = 620,
+          H = 46 + SRC.length * 30,
+          ML = 160,
+          MR = 50,
+          MT = 22;
+        const iw = W - ML - MR;
+        const lo = 1e8,
+          hi = 2e13;
+        const xOf = (v: number) => (Math.log10(Math.max(v, lo)) - Math.log10(lo)) / (Math.log10(hi) - Math.log10(lo));
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+        svg.append(svgEl('text', { class: 'title', x: 4, y: 12 }, '灰条 = 这个来源手上有多少 token；实条 = 这次训练要喂进去多少（对数刻度）'));
+        SRC.forEach((s, i) => {
+          const y = MT + i * 30;
+          svg.append(svgEl('text', { x: ML - 6, y: y + 14, 'text-anchor': 'end' }, s.name));
+          svg.append(svgEl('rect', { class: 'have', x: ML, y: y + 2, width: Math.max(xOf(s.tok) * iw, 1), height: 8, rx: 1 }));
+          svg.append(
+            svgEl('rect', {
+              class: 'want' + (ep[i] > 1 ? ' over' : ''),
+              x: ML,
+              y: y + 12,
+              width: Math.max(xOf(want[i]) * iw, want[i] > 0 ? 1 : 0),
+              height: 8,
+              rx: 1,
+            }),
+          );
+          svg.append(svgEl('text', { x: ML + iw + 4, y: y + 18 }, ep[i] > 0 ? ep[i].toFixed(2) + ' epoch' : '—'));
+        });
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: H - 14, x2: ML + iw, y2: H - 14 }));
+        for (const v of [1e8, 1e10, 1e12, 1e13]) {
+          svg.append(svgEl('text', { x: ML + xOf(v) * iw, y: H - 4, 'text-anchor': 'middle' }, fmt(v)));
+        }
+        $('[data-plot]').replaceChildren(svg);
+
+        // ── 模拟 epoching ──
+        const proxy = 10e9;
+        const ratio = proxy / train;
+        const sim = $('[data-sim]');
+        sim.replaceChildren();
+        const hh = document.createElement('h4');
+        hh.textContent = `模拟 epoching：拿同一个配比去跑 ${fmt(proxy)} token 的小规模实验，会看到什么？`;
+        sim.append(hh);
+        const t = document.createElement('table');
+        t.innerHTML =
+          '<thead><tr><th>来源</th><th class="m">大规模的 epoch</th><th class="m">小规模·照搬源（天真做法）</th><th class="m">小规模·源按 ' +
+          (ratio < 1 ? '1/' + Math.round(1 / ratio) : '1') +
+          ' 下采样</th></tr></thead>';
+        const tbody = document.createElement('tbody');
+        SRC.forEach((s, i) => {
+          const naive = (p[i] * proxy) / s.tok;
+          const down = (p[i] * proxy) / (s.tok * ratio);
+          const tr = document.createElement('tr');
+          const mk = (x: string, cls = '') => {
+            const td = document.createElement('td');
+            td.className = cls;
+            td.textContent = x;
+            return td;
+          };
+          tr.append(
+            mk(s.name),
+            mk(ep[i] < 0.01 && ep[i] > 0 ? ep[i].toExponential(1) : ep[i].toFixed(2), 'm' + (ep[i] > 4 ? ' hi' : '')),
+            mk(naive < 0.01 && naive > 0 ? naive.toExponential(1) : naive.toFixed(2), 'm'),
+            mk(down < 0.01 && down > 0 ? down.toExponential(1) : down.toFixed(2), 'm' + (down > 4 ? ' hi' : '')),
+          );
+          tbody.append(tr);
+        });
+        t.append(tbody);
+        sim.append(t);
+        const note = document.createElement('p');
+        note.textContent =
+          '第三列是天真做法：小规模上谁都不用重复，于是「多压高质量来源」看起来毫无代价，回归模型学到的最优配比会严重偏向小来源。第四列把所有来源按同一比例下采样，第二列和第四列就完全对上了 —— 小规模实验里也会尝到重复的苦，优化出来的配比才是均衡的。';
+        sim.append(note);
+
+        // ── 结论 ──
+        const worst = ep.indexOf(Math.max(...ep));
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        const strong = document.createElement('strong');
+        strong.textContent = `${SRC[worst].name} 要过 ${ep[worst].toFixed(1)} 遍`;
+        v.append(
+          document.createTextNode(`按当前配比训 ${fmt(train)} token，重复最狠的是 `),
+          strong,
+          document.createTextNode(
+            '。默认这一组就是课上那个例子：低质来源 10T、高质来源 10B，一半一半、训 1T token —— 低质那边连 5% 都没看完，高质那边已经过了 50 遍。把训练量往小拖，这个矛盾就消失了；这正是「小规模上看着对的配比，放到大规模会炸」的来源。勾上 UniMax 的上限看它怎么把权重压回去。',
+          ),
+        );
+      }
+
+      // ── 权重滑块只建一次 ──
+      const wrap = $('[data-weights]');
+      const tag = document.createElement('span');
+      tag.className = 'tag';
+      tag.textContent = '各来源权重';
+      wrap.append(tag);
+      SRC.forEach((s, i) => {
+        const lab = document.createElement('label');
+        lab.append(document.createTextNode(s.name.replace(/（.*/, '')));
+        const inp = document.createElement('input');
+        inp.type = 'range';
+        inp.min = '0';
+        inp.max = '100';
+        inp.step = '1';
+        inp.value = String(s.w);
+        inp.setAttribute('data-w', String(i));
+        lab.append(inp);
+        const val = document.createElement('span');
+        val.className = 'wv';
+        val.setAttribute('data-wv', String(i));
+        lab.append(val);
+        wrap.append(lab);
+      });
+
+      root.querySelectorAll<HTMLInputElement>('input').forEach((el) => el.addEventListener('input', draw));
+      root.querySelectorAll<HTMLButtonElement>('[data-p]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const kind = btn.dataset.p;
+          const total = SRC.reduce((a, s) => a + s.tok, 0);
+          SRC.forEach((s, i) => {
+            const el = root.querySelector<HTMLInputElement>(`[data-w="${i}"]`)!;
+            if (kind === 'naive') el.value = i === 0 ? '50' : i === 3 ? '50' : '0';
+            else if (kind === 'prop') el.value = String(Math.max(1, Math.round((s.tok / total) * 100)));
+            else if (kind === 'unif') el.value = '25';
+            else el.value = i === 3 ? '90' : i === 2 ? '10' : '0';
+          });
+          draw();
+        });
+      });
+      draw();
+    });
+  }
+
+  setupL14Mixture();
+  document.addEventListener('astro:page-load', setupL14Mixture);
+</script>

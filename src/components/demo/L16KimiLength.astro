@@ -1,0 +1,288 @@
+---
+// Kimi K1.5 的长度奖励。
+//
+//   len_reward(i) = λ            若 r(x, y_i, y*) = 1（答对）
+//                 = min(0, λ)    若 r(x, y_i, y*) = 0（答错）
+//   λ = 0.5 − (len(i) − min_len) / (max_len − min_len)
+//
+// min_len / max_len 是这一组 rollout 里最短和最长的长度，所以 λ ∈ [0.5, −0.5]。
+// 关键在 min(0, λ)：答错时比中点短不给奖励也不罚，只有比中点长才罚 ——
+// 这样错误回答不会被逼到长度为零、再也翻不了身。
+---
+
+<div class="demo" data-demo="l16-kimi-len">
+  <div class="ctrl">
+    <label>这条回答的长度 <input type="range" data-len min="500" max="4000" step="25" value="1500" /></label>
+    <span class="val" data-len-v></span>
+  </div>
+  <div class="ctrl">
+    <label>组内最短 min_len <input type="range" data-min min="200" max="1500" step="25" value="500" /></label>
+    <span class="val" data-min-v></span>
+    <label>组内最长 max_len <input type="range" data-max min="2000" max="8000" step="50" value="4000" /></label>
+    <span class="val" data-max-v></span>
+  </div>
+
+  <p class="derived" data-derived></p>
+
+  <div class="plot" data-plot></div>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.45rem;
+  }
+  .ctrl label {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+  }
+  .ctrl input[type='range'] {
+    width: 175px;
+    accent-color: var(--indigo);
+  }
+  .val {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--madder);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .derived {
+    margin: 0.8rem 0 0.2rem;
+    padding: 0.5rem 0.7rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.85;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+  }
+
+  .plot {
+    margin-top: 0.9rem;
+    overflow-x: auto;
+  }
+  .plot :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 340px;
+    height: auto;
+  }
+  .plot :global(.axis) {
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .plot :global(.zero) {
+    stroke: var(--selvage);
+    stroke-width: 1.1;
+  }
+  .plot :global(.grid) {
+    stroke: var(--rule);
+    stroke-width: 0.6;
+    stroke-dasharray: 2 3;
+  }
+  .plot :global(.right) {
+    fill: none;
+    stroke: var(--indigo);
+    stroke-width: 2.2;
+  }
+  .plot :global(.wrong) {
+    fill: none;
+    stroke: var(--madder);
+    stroke-width: 2.2;
+  }
+  .plot :global(.mark) {
+    stroke: var(--weld);
+    stroke-width: 1.5;
+  }
+  .plot :global(.dot1) {
+    fill: var(--indigo);
+  }
+  .plot :global(.dot2) {
+    fill: var(--madder);
+  }
+  .plot :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 9px;
+  }
+  .plot :global(text.title) {
+    fill: var(--indigo);
+    font-size: 10.5px;
+    font-weight: 700;
+  }
+  .plot :global(text.lab) {
+    fill: var(--ink-muted);
+    font-size: 8.5px;
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL16KimiLength() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l16-kimi-len"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+
+      const W = 640,
+        H = 220,
+        ML = 46,
+        MR = 100,
+        MT = 26,
+        MB = 28;
+
+      function draw() {
+        const lenEl = $<HTMLInputElement>('[data-len]');
+        const minEl = $<HTMLInputElement>('[data-min]');
+        const maxEl = $<HTMLInputElement>('[data-max]');
+        const minLen = parseInt(minEl.value, 10);
+        const maxLen = parseInt(maxEl.value, 10);
+        lenEl.min = String(minLen);
+        lenEl.max = String(maxLen);
+        let len = parseInt(lenEl.value, 10);
+        if (len < minLen) {
+          len = minLen;
+          lenEl.value = String(minLen);
+        }
+        if (len > maxLen) {
+          len = maxLen;
+          lenEl.value = String(maxLen);
+        }
+
+        $('[data-len-v]').textContent = `${len} token`;
+        $('[data-min-v]').textContent = `${minLen} token`;
+        $('[data-max-v]').textContent = `${maxLen} token`;
+
+        const lam = (L: number) => 0.5 - (L - minLen) / (maxLen - minLen);
+        const rRight = (L: number) => lam(L);
+        const rWrong = (L: number) => Math.min(0, lam(L));
+        const mid = (minLen + maxLen) / 2;
+        const l = lam(len);
+
+        $('[data-derived]').textContent =
+          `λ = 0.5 − (len − min_len) / (max_len − min_len)` +
+          `　=　0.5 − (${len} − ${minLen}) / (${maxLen} − ${minLen}) = ${l.toFixed(4)}\n` +
+          `答对（r = 1）：len_reward = λ = ${rRight(len).toFixed(4)}\n` +
+          `答错（r = 0）：len_reward = min(0, λ) = ${rWrong(len).toFixed(4)}` +
+          `　　区间中点 = ${mid.toFixed(0)} token（λ 在这里正好是 0）`;
+
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+        svg.append(svgEl('text', { class: 'title', x: 4, y: 13 }, '长度奖励 vs 回答长度'));
+        const y0 = MT + (H - MT - MB) / 2;
+        const y = (v: number) => y0 - (v / 0.62) * ((H - MT - MB) / 2);
+        const px = (L: number) => ML + ((L - minLen) / (maxLen - minLen)) * (W - ML - MR);
+
+        for (const v of [0.5, 0.25, 0, -0.25, -0.5]) {
+          svg.append(
+            svgEl('line', { class: v === 0 ? 'zero' : 'grid', x1: ML, y1: y(v), x2: W - MR, y2: y(v) }),
+          );
+          svg.append(svgEl('text', { x: ML - 4, y: y(v) + 3, 'text-anchor': 'end' }, v.toFixed(2)));
+        }
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: H - MB, x2: W - MR, y2: H - MB }));
+        for (const L of [minLen, mid, maxLen]) {
+          svg.append(
+            svgEl('text', { x: px(L), y: H - MB + 12, 'text-anchor': 'middle' }, L.toFixed(0)),
+          );
+        }
+
+        const path = (f: (L: number) => number) => {
+          const pts: string[] = [];
+          for (let i = 0; i <= 120; i++) {
+            const L = minLen + ((maxLen - minLen) * i) / 120;
+            pts.push(`${i ? 'L' : 'M'}${px(L).toFixed(2)},${y(f(L)).toFixed(2)}`);
+          }
+          return pts.join(' ');
+        };
+        svg.append(svgEl('path', { class: 'right', d: path(rRight) }));
+        svg.append(svgEl('path', { class: 'wrong', d: path(rWrong) }));
+
+        svg.append(svgEl('line', { class: 'mark', x1: px(len), y1: MT, x2: px(len), y2: H - MB }));
+        svg.append(svgEl('circle', { class: 'dot1', cx: px(len), cy: y(rRight(len)), r: 3.4 }));
+        svg.append(svgEl('circle', { class: 'dot2', cx: px(len), cy: y(rWrong(len)), r: 3.4 }));
+
+        svg.append(
+          svgEl('text', { class: 'lab', x: W - MR + 6, y: MT + 14 }, `答对：${rRight(len).toFixed(3)}`),
+        );
+        svg.append(
+          svgEl('text', { class: 'lab', x: W - MR + 6, y: MT + 28 }, `答错：${rWrong(len).toFixed(3)}`),
+        );
+        svg.append(svgEl('text', { class: 'lab', x: W - MR + 6, y: H - MB - 22 }, '蓝线 = 答对'));
+        svg.append(svgEl('text', { class: 'lab', x: W - MR + 6, y: H - MB - 8 }, '红线 = 答错'));
+        $('[data-plot]').replaceChildren(svg);
+
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        const strong = (t: string) => {
+          const s = document.createElement('strong');
+          s.textContent = t;
+          return s;
+        };
+        let msg: (Node | string)[];
+        if (len < mid) {
+          msg = [
+            `当前这条回答比区间中点（${mid.toFixed(0)} token）短。答对的话拿到 +${rRight(len).toFixed(3)} 的正奖励；` +
+              '答错的话 λ 是正的，但被 min(0, λ) 截成了 ',
+            strong('0 —— 不奖也不罚'),
+            document.createTextNode(
+              '。这一条是 Kimi 特意设计的：如果对错误答案也给「越短越好」的正奖励，' +
+                '模型会把不擅长的领域（Tatsu 举的例子是几何）的思维链压到零长度，从此再也拿不到正奖励、永远翻不了身。',
+            ),
+          ];
+        } else {
+          msg = [
+            `当前这条回答比区间中点（${mid.toFixed(0)} token）长。答对拿到 ${rRight(len).toFixed(3)}，` +
+              `答错拿到 ${rWrong(len).toFixed(3)} —— `,
+            strong('两种情况都是负奖励'),
+            document.createTextNode(
+              '。所以在中点右侧，长度奖励是一个纯粹的「别啰嗦」压力，' +
+                '这正是 GRPO 那个长度归一化偏置的反向修正：GRPO 鼓励错误答案越写越长，Kimi 直接罚它。' +
+                '把滑块拖到中点左边，看红线怎么被 min(0, λ) 压平。',
+            ),
+          ];
+        }
+        msg.forEach((m) => v.append(m as Node | string));
+      }
+
+      root.querySelectorAll('input').forEach((el) => el.addEventListener('input', draw));
+      draw();
+    });
+  }
+
+  setupL16KimiLength();
+  document.addEventListener('astro:page-load', setupL16KimiLength);
+</script>

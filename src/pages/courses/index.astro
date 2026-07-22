@@ -31,7 +31,7 @@ const groups = [...byCourse.values()]
           {lectures.map((n) => (
             <li>
               <a href={`/courses/${n.id}`} class="card">
-                <span class="num">第 {n.data.lecture} 讲</span>
+                <span class="num">{n.data.lectureLabel ?? `第 ${n.data.lecture} 讲`}</span>
                 <h3>{n.data.title}</h3>
                 {n.data.description && <p>{n.data.description}</p>}
               </a>

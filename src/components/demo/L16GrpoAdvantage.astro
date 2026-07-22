@@ -1,0 +1,364 @@
+---
+// GRPO 的组内优势：A_i = (r_i - mean) / std。
+//
+// 一个 prompt 采 G 条 rollout，验证器给 0/1 奖励，本组答对 k 条。
+// 标准差用总体标准差（分母 G，和幻灯片上 numpy 的 .std() 一致），
+// 并加上 nano-aha-moment 的 1e-4 稳定项。
+// 「除以标准差」可以关掉 —— 关掉之后就是 Dr. GRPO 的优势。
+---
+
+<div class="demo" data-demo="l16-grpo-adv">
+  <div class="ctrl">
+    <label>组大小 G <input type="range" data-g min="2" max="16" step="1" value="8" /></label>
+    <span class="val" data-g-v></span>
+    <label>本组答对的条数 k <input type="range" data-k min="0" max="16" step="1" value="4" /></label>
+    <span class="val" data-k-v></span>
+  </div>
+  <div class="ctrl">
+    <label><input type="checkbox" data-std checked /> 除以标准差（GRPO；取消勾选就是 Dr. GRPO）</label>
+  </div>
+
+  <p class="derived" data-derived></p>
+
+  <div class="plot" data-plot></div>
+
+  <table class="out" data-out>
+    <thead>
+      <tr>
+        <th>rollout</th><th>验证器</th><th>奖励 r</th><th>r − 均值</th><th>优势 A</th><th>梯度方向</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.5rem;
+  }
+  .ctrl label {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+  }
+  .ctrl input[type='range'] {
+    width: 170px;
+    accent-color: var(--indigo);
+  }
+  .ctrl input[type='checkbox'] {
+    accent-color: var(--madder);
+  }
+  .val {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--madder);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .derived {
+    margin: 0.8rem 0 0.2rem;
+    padding: 0.5rem 0.7rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.85;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+  }
+
+  .plot {
+    margin-top: 0.9rem;
+    overflow-x: auto;
+  }
+  .plot :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 320px;
+    height: auto;
+  }
+  .plot :global(.axis) {
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .plot :global(.zero) {
+    stroke: var(--selvage);
+    stroke-width: 1.1;
+  }
+  .plot :global(.grid) {
+    stroke: var(--rule);
+    stroke-width: 0.6;
+    stroke-dasharray: 2 3;
+  }
+  .plot :global(.up) {
+    fill: var(--indigo);
+  }
+  .plot :global(.down) {
+    fill: var(--madder);
+  }
+  .plot :global(.nil) {
+    fill: var(--thread);
+  }
+  .plot :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 9px;
+  }
+  .plot :global(text.title) {
+    fill: var(--indigo);
+    font-size: 10.5px;
+    font-weight: 700;
+  }
+  .plot :global(text.note) {
+    fill: var(--madder);
+    font-size: 9px;
+  }
+
+  .out {
+    width: 100%;
+    margin-top: 0.9rem;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+  }
+  .out :global(th) {
+    padding: 0.25rem 0.35rem;
+    text-align: right;
+    font-weight: 400;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(th:first-child),
+  .out :global(th:nth-child(2)),
+  .out :global(th:last-child) {
+    text-align: left;
+  }
+  .out :global(td) {
+    padding: 0.25rem 0.35rem;
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(td:first-child),
+  .out :global(td:nth-child(2)),
+  .out :global(td:last-child) {
+    text-align: left;
+  }
+  .out :global(td.up) {
+    color: var(--indigo);
+  }
+  .out :global(td.down) {
+    color: var(--madder);
+  }
+  .out :global(td.dim) {
+    color: var(--ink-faint);
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL16GrpoAdvantage() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l16-grpo-adv"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+
+      const EPS = 1e-4; // nano-aha-moment 里那个稳定项
+
+      const W = 640,
+        H = 200,
+        ML = 40,
+        MR = 90,
+        MT = 26,
+        MB = 24;
+
+      function drawBars(host: HTMLElement, adv: number[], rewards: number[]) {
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+        svg.append(svgEl('text', { class: 'title', x: 4, y: 13 }, '每条 rollout 的优势 A_i'));
+
+        const amax = Math.max(1e-6, ...adv.map(Math.abs)) * 1.15;
+        const y0 = MT + (H - MT - MB) / 2;
+        const y = (v: number) => y0 - (v / amax) * ((H - MT - MB) / 2);
+
+        for (const v of [amax, amax / 2, 0, -amax / 2, -amax]) {
+          svg.append(
+            svgEl('line', { class: v === 0 ? 'zero' : 'grid', x1: ML, y1: y(v), x2: W - MR, y2: y(v) }),
+          );
+          svg.append(svgEl('text', { x: ML - 4, y: y(v) + 3, 'text-anchor': 'end' }, v.toFixed(2)));
+        }
+
+        const bw = (W - ML - MR) / adv.length;
+        adv.forEach((a, i) => {
+          const x0 = ML + i * bw + bw * 0.18;
+          const w = bw * 0.64;
+          const cls = Math.abs(a) < 1e-9 ? 'nil' : a > 0 ? 'up' : 'down';
+          const h = Math.max(1, Math.abs(y(a) - y(0)));
+          svg.append(svgEl('rect', { class: cls, x: x0, y: Math.min(y(a), y(0)), width: w, height: h }));
+          svg.append(
+            svgEl(
+              'text',
+              { x: x0 + w / 2, y: H - MB + 11, 'text-anchor': 'middle' },
+              rewards[i] === 1 ? '对' : '错',
+            ),
+          );
+        });
+
+        svg.append(svgEl('text', { class: 'note', x: W - MR + 6, y: MT + 20 }, '↑ 被推高'));
+        svg.append(svgEl('text', { class: 'note', x: W - MR + 6, y: H - MB - 12 }, '↓ 被压低'));
+        host.replaceChildren(svg);
+      }
+
+      function draw() {
+        const gEl = $<HTMLInputElement>('[data-g]');
+        const kEl = $<HTMLInputElement>('[data-k]');
+        const G = parseInt(gEl.value, 10);
+        kEl.max = String(G);
+        let k = parseInt(kEl.value, 10);
+        if (k > G) {
+          k = G;
+          kEl.value = String(G);
+        }
+        const useStd = $<HTMLInputElement>('[data-std]').checked;
+
+        $('[data-g-v]').textContent = String(G);
+        $('[data-k-v]').textContent = `${k} / ${G}`;
+
+        const rewards = Array.from({ length: G }, (_, i) => (i < k ? 1 : 0));
+        const mean = k / G;
+        const varp = rewards.reduce((a, r) => a + (r - mean) * (r - mean), 0) / G;
+        const std = Math.sqrt(varp);
+        const denom = useStd ? std + EPS : 1;
+        const adv = rewards.map((r) => (r - mean) / denom);
+        const amp = 1 / (std + EPS);
+
+        $('[data-derived]').textContent =
+          `奖励 r = [${rewards.join(', ')}]\n` +
+          `均值 mean = k/G = ${mean.toFixed(4)}　　总体标准差 std = √(p(1−p)) = ${std.toFixed(5)}\n` +
+          (useStd
+            ? `A_i = (r_i − mean) / (std + 1e-4)　→　答对 ${adv[0] !== undefined && k > 0 ? adv[0].toFixed(4) : '—'}` +
+              `　答错 ${k < G ? adv[G - 1].toFixed(4) : '—'}\n`
+            : `A_i = r_i − mean（Dr. GRPO，不除标准差）　→　答对 ${k > 0 ? adv[0].toFixed(4) : '—'}` +
+              `　答错 ${k < G ? adv[G - 1].toFixed(4) : '—'}\n`) +
+          `相对放大倍数 1/std = ${std < 1e-9 ? '（退化，分子也是 0）' : amp.toFixed(3)}　` +
+          `组内优势之和 = ${Math.abs(adv.reduce((a, b) => a + b, 0)).toFixed(6)}（永远是 0）`;
+
+        const tb = $('[data-out] tbody');
+        tb.replaceChildren();
+        rewards.forEach((r, i) => {
+          const tr = document.createElement('tr');
+          const a = adv[i];
+          const dir = Math.abs(a) < 1e-9 ? '不动（无信号）' : a > 0 ? '推高这条回答' : '压低这条回答';
+          const cells: [string, string][] = [
+            [`#${i + 1}`, ''],
+            [r === 1 ? '答案正确' : '答案错误', ''],
+            [r.toFixed(1), 'dim'],
+            [(r - mean).toFixed(4), r - mean >= 0 ? 'up' : 'down'],
+            [a.toFixed(4), Math.abs(a) < 1e-9 ? 'dim' : a > 0 ? 'up' : 'down'],
+            [dir, Math.abs(a) < 1e-9 ? 'dim' : a > 0 ? 'up' : 'down'],
+          ];
+          cells.forEach(([t, cls]) => {
+            const td = document.createElement('td');
+            td.textContent = t;
+            if (cls) td.className = cls;
+            tr.append(td);
+          });
+          tb.append(tr);
+        });
+
+        drawBars($('[data-plot]'), adv, rewards);
+
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        const strong = (t: string) => {
+          const s = document.createElement('strong');
+          s.textContent = t;
+          return s;
+        };
+        if (k === 0 || k === G) {
+          v.append(
+            document.createTextNode('这一组'),
+            strong(k === 0 ? '全错' : '全对'),
+            document.createTextNode(
+              '：所有奖励一样，分子 r_i − mean 恰好是 0，所以每条优势都是 0 —— ',
+            ),
+            strong('这道题这一轮完全没有学习信号'),
+            document.createTextNode(
+              '，采样和前向传播的算力全白花了。这正是 Kimi、Qwen3 都要用 best-of-K 做难度过滤的原因。',
+            ),
+          );
+        } else {
+          const balanced = 2 * k === G;
+          v.append(
+            document.createTextNode(
+              `本组 ${k} 对 ${G - k} 错。正确的那 ${k} 条被推高、错误的那 ${G - k} 条被压低。`,
+            ),
+            balanced
+              ? document.createTextNode(
+                  '现在恰好一半一半，两边优势的绝对值相等（±' +
+                    Math.abs(adv[0]).toFixed(3) +
+                    '）。把 k 拖到不平衡的位置，你会看到',
+                )
+              : document.createTextNode('而且'),
+            strong('少数派那一边的优势绝对值更大'),
+            document.createTextNode(
+              balanced
+                ? ' —— 稀有的正确答案值得多学，稀有的错误答案值得多罚。'
+                : `（当前 ${Math.abs(adv[0]).toFixed(3)} 对 ${Math.abs(adv[G - 1]).toFixed(3)}）` +
+                    ' —— 稀有的正确答案值得多学，稀有的错误答案值得多罚。',
+            ),
+            document.createTextNode(
+              useStd
+                ? `　另外注意「相对放大倍数 1/std」现在是 ${amp.toFixed(2)}，把 k 拖到接近 0 或 G 时它会飙升：`
+                : '　勾上「除以标准差」再看：',
+            ),
+            strong('除以标准差，等于在上调那些太简单或太难的题的整体权重'),
+            document.createTextNode('。这就是第五节说 GRPO 的标准差项不是合法基线的那个副作用。'),
+          );
+        }
+      }
+
+      root.querySelectorAll('input').forEach((el) => {
+        el.addEventListener('input', draw);
+        el.addEventListener('change', draw);
+      });
+      draw();
+    });
+  }
+
+  setupL16GrpoAdvantage();
+  document.addEventListener('astro:page-load', setupL16GrpoAdvantage);
+</script>

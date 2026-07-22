@@ -1,0 +1,372 @@
+---
+// 第 17 讲演示 3：VQ-VAE 的码本量化。
+// 编码器吐出的是连续向量（这里画成平面上的点），
+// 量化这一步把每个向量替换成码本里离它最近的那一条 —— 于是它变成一个整数下标。
+// 拖码本大小 K，看量化误差怎么掉、每个 token 值多少比特怎么涨。
+---
+
+<div class="demo" data-demo="l17-codebook">
+  <div class="knobs">
+    <label>
+      <span>码本大小 K = <code data-out="k"></code></span>
+      <input type="range" data-k="k" min="1" max="7" step="1" value="3" />
+    </label>
+    <label>
+      <span>编码器输出多少个向量 <code data-out="n"></code></span>
+      <input type="range" data-k="n" min="40" max="400" step="20" value="200" />
+    </label>
+  </div>
+
+  <div class="row">
+    <span class="lab">显示</span>
+    <label class="chk"><input type="checkbox" data-lines checked /><span>连线到所属码字</span></label>
+    <button data-reseed>换一批数据</button>
+  </div>
+
+  <canvas data-canvas height="320"></canvas>
+
+  <div class="cards">
+    <div class="card hot">
+      <h4>平均量化误差</h4>
+      <div class="big" data-err></div>
+      <p class="sub">原向量到它被替换成的那条码字的平均距离</p>
+    </div>
+    <div class="card">
+      <h4>每个 token 的信息量</h4>
+      <div class="big" data-bits></div>
+      <p class="sub" data-bits-sub></p>
+    </div>
+    <div class="card">
+      <h4>Chameleon 的口径</h4>
+      <div class="big" data-cham></div>
+      <p class="sub" data-cham-sub></p>
+    </div>
+  </div>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .knobs {
+    display: grid;
+    gap: 0.7rem;
+  }
+  @media (min-width: 640px) {
+    .knobs {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  .knobs label {
+    display: block;
+    font-size: 0.78rem;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+  }
+  .knobs label span {
+    display: block;
+    margin-bottom: 0.25rem;
+  }
+  .knobs code {
+    font-family: var(--font-mono);
+    color: var(--indigo);
+    font-size: 0.85rem;
+  }
+  .knobs input[type='range'] {
+    width: 100%;
+    accent-color: var(--indigo);
+  }
+
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin-top: 0.8rem;
+  }
+  .lab {
+    font-size: 0.75rem;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+  .chk {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+  }
+  .chk input {
+    accent-color: var(--indigo);
+  }
+  .row button {
+    padding: 0.24rem 0.62rem;
+    font: inherit;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .row button:hover {
+    color: var(--indigo);
+    border-color: var(--indigo);
+  }
+
+  canvas {
+    display: block;
+    width: 100%;
+    margin: 0.9rem 0 0.2rem;
+  }
+
+  .cards {
+    display: grid;
+    gap: 0.6rem;
+    margin-top: 0.7rem;
+  }
+  @media (min-width: 640px) {
+    .cards {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  }
+  .card {
+    padding: 0.6rem 0.75rem 0.7rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 7px;
+  }
+  .card h4 {
+    margin: 0 0 0.3rem;
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+  .card .big {
+    font-family: var(--font-mono);
+    font-size: 1.35rem;
+    color: var(--indigo);
+    line-height: 1.15;
+  }
+  .card.hot .big {
+    color: var(--madder);
+  }
+  .card .sub {
+    margin: 0.25rem 0 0;
+    font-size: 0.74rem;
+    color: var(--ink-muted);
+    line-height: 1.5;
+  }
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.82rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict b {
+    color: var(--ink);
+  }
+</style>
+
+<script>
+  function setupL17Codebook() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l17-codebook"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const canvas = $<HTMLCanvasElement>('[data-canvas]');
+      const ctx = canvas.getContext('2d');
+      const css = (n: string) => getComputedStyle(root).getPropertyValue(n).trim() || '#888';
+
+      let seed = 7;
+      // 可复现的伪随机数：换 seed 就是换一批数据
+      function rng(s: number) {
+        let x = s;
+        return () => {
+          x = (x * 1664525 + 1013904223) % 4294967296;
+          return x / 4294967296;
+        };
+      }
+
+      // 造一批「编码器输出」：几团高斯，模拟真实图像块在隐空间里成簇分布
+      function makePoints(count: number) {
+        const r = rng(seed);
+        const centers: number[][] = [];
+        for (let i = 0; i < 6; i++) centers.push([0.15 + r() * 0.7, 0.15 + r() * 0.7]);
+        const pts: number[][] = [];
+        for (let i = 0; i < count; i++) {
+          const c = centers[i % centers.length];
+          // Box–Muller，把均匀分布变成正态分布
+          const u1 = Math.max(1e-9, r());
+          const u2 = r();
+          const g = Math.sqrt(-2 * Math.log(u1));
+          pts.push([
+            Math.min(0.98, Math.max(0.02, c[0] + 0.08 * g * Math.cos(2 * Math.PI * u2))),
+            Math.min(0.98, Math.max(0.02, c[1] + 0.08 * g * Math.sin(2 * Math.PI * u2))),
+          ]);
+        }
+        return pts;
+      }
+
+      // k-means：码本其实就是学出来的一组「原型向量」，用 Lloyd 迭代近似一下
+      function fit(pts: number[][], K: number) {
+        const step = Math.max(1, Math.floor(pts.length / K));
+        let cb: number[][] = [];
+        for (let i = 0; i < K; i++) cb.push([...pts[(i * step) % pts.length]]);
+
+        let assign = new Array(pts.length).fill(0);
+        for (let it = 0; it < 25; it++) {
+          for (let i = 0; i < pts.length; i++) {
+            let best = 0;
+            let bd = Infinity;
+            for (let k = 0; k < K; k++) {
+              const dx = pts[i][0] - cb[k][0];
+              const dy = pts[i][1] - cb[k][1];
+              const d = dx * dx + dy * dy;
+              if (d < bd) {
+                bd = d;
+                best = k;
+              }
+            }
+            assign[i] = best;
+          }
+          const sum = Array.from({ length: K }, () => [0, 0, 0]);
+          for (let i = 0; i < pts.length; i++) {
+            sum[assign[i]][0] += pts[i][0];
+            sum[assign[i]][1] += pts[i][1];
+            sum[assign[i]][2] += 1;
+          }
+          for (let k = 0; k < K; k++) {
+            if (sum[k][2] > 0) cb[k] = [sum[k][0] / sum[k][2], sum[k][1] / sum[k][2]];
+          }
+        }
+        let err = 0;
+        for (let i = 0; i < pts.length; i++) {
+          const dx = pts[i][0] - cb[assign[i]][0];
+          const dy = pts[i][1] - cb[assign[i]][1];
+          err += Math.sqrt(dx * dx + dy * dy);
+        }
+        return { cb, assign, err: err / pts.length };
+      }
+
+      function draw(pts: number[][], cb: number[][], assign: number[]) {
+        if (!ctx) return;
+        const dpr = window.devicePixelRatio || 1;
+        const cw = canvas.clientWidth || 640;
+        const ch = 320;
+        canvas.width = cw * dpr;
+        canvas.height = ch * dpr;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, cw, ch);
+
+        const pad = 14;
+        const size = Math.min(cw - 2 * pad, ch - 2 * pad);
+        const x0 = (cw - size) / 2;
+        const y0 = (ch - size) / 2;
+        const X = (v: number) => x0 + v * size;
+        const Y = (v: number) => y0 + (1 - v) * size;
+
+        ctx.fillStyle = css('--bg-raised');
+        ctx.fillRect(x0, y0, size, size);
+        ctx.strokeStyle = css('--rule');
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x0 + 0.5, y0 + 0.5, size - 1, size - 1);
+
+        if ($<HTMLInputElement>('[data-lines]').checked) {
+          ctx.strokeStyle = css('--indigo');
+          ctx.globalAlpha = 0.28;
+          ctx.lineWidth = 0.8;
+          ctx.beginPath();
+          for (let i = 0; i < pts.length; i++) {
+            ctx.moveTo(X(pts[i][0]), Y(pts[i][1]));
+            ctx.lineTo(X(cb[assign[i]][0]), Y(cb[assign[i]][1]));
+          }
+          ctx.stroke();
+          ctx.globalAlpha = 1;
+        }
+
+        ctx.fillStyle = css('--ink-faint');
+        for (const p of pts) {
+          ctx.beginPath();
+          ctx.arc(X(p[0]), Y(p[1]), 1.9, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        ctx.fillStyle = css('--madder');
+        for (const c of cb) {
+          ctx.beginPath();
+          ctx.moveTo(X(c[0]), Y(c[1]) - 4.5);
+          ctx.lineTo(X(c[0]) + 4.5, Y(c[1]));
+          ctx.lineTo(X(c[0]), Y(c[1]) + 4.5);
+          ctx.lineTo(X(c[0]) - 4.5, Y(c[1]));
+          ctx.closePath();
+          ctx.fill();
+        }
+
+        ctx.fillStyle = css('--ink-faint');
+        ctx.font = '11px ui-monospace, monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText('· 编码器输出的连续向量', x0 + 6, y0 + 14);
+        ctx.fillStyle = css('--madder');
+        ctx.fillText('◆ 码本里的码字（token）', x0 + 6, y0 + 28);
+      }
+
+      function render() {
+        const K = 2 ** Number($<HTMLInputElement>('[data-k="k"]').value);
+        const count = Number($<HTMLInputElement>('[data-k="n"]').value);
+        $('[data-out="k"]').textContent = String(K);
+        $('[data-out="n"]').textContent = String(count);
+
+        const pts = makePoints(count);
+        const { cb, assign, err } = fit(pts, Math.min(K, count));
+        draw(pts, cb, assign);
+
+        const bits = Math.log2(K);
+        $('[data-err]').textContent = err.toFixed(4);
+        $('[data-bits]').textContent = bits.toFixed(0) + ' bit';
+        $('[data-bits-sub]').textContent = `log₂ ${K} = ${bits.toFixed(0)}：一个下标要 ${bits.toFixed(0)} 个比特写下来`;
+
+        // Chameleon：512×512 的图 → 1024 个 token，码本 8192
+        const rawBits = 512 * 512 * 3 * 8;
+        const tokBits = 1024 * Math.log2(8192);
+        $('[data-cham]').textContent = (rawBits / tokBits).toFixed(0) + '×';
+        $('[data-cham-sub]').textContent =
+          `512×512×3 字节 = ${(rawBits / 8 / 1024).toFixed(0)} KB 的原图，` +
+          `压成 1024 个 token × 13 bit = ${(tokBits / 8).toFixed(0)} 字节`;
+
+        const used = new Set(assign).size;
+        $('[data-verdict]').innerHTML =
+          `现在码本里有 <b>${K}</b> 条码字，实际被用上的有 <b>${used}</b> 条。` +
+          `每一个连续向量都被换成离它最近的那条码字 —— 从此它只剩一个整数下标，` +
+          `Transformer 可以像对待一个汉字那样对待它。` +
+          `代价是原向量和码字之间那段距离（图上的连线）<b>永久丢失</b>，平均 <b>${err.toFixed(4)}</b>。` +
+          `把 K 从 2 拉到 128，看误差怎么掉、比特数怎么涨 —— ` +
+          `这正是第 1 讲那个「词表越大压缩率越高、但每个符号见到的数据越少」的取舍，换到了图像上。`;
+      }
+
+      root.querySelectorAll<HTMLInputElement>('input[type="range"]').forEach((el) => {
+        el.addEventListener('input', render);
+      });
+      $('[data-lines]').addEventListener('change', render);
+      $('[data-reseed]').addEventListener('click', () => {
+        seed = (seed * 31 + 17) % 100000;
+        render();
+      });
+      window.addEventListener('resize', render);
+
+      render();
+    });
+  }
+
+  setupL17Codebook();
+  document.addEventListener('astro:page-load', setupL17Codebook);
+</script>

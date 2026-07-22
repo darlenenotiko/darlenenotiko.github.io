@@ -1,0 +1,344 @@
+---
+// CS336 客座讲座（Dan Fu）演示 2：kernel 之间的气泡怎么吃掉 decode 的带宽。
+//
+// 这是我为帮助理解补的「气泡账本」，不是论文里的模型。它复现讲者口头描述的那张图：
+// 横轴时间，纵轴是 GPU 上的每个 SM，实心条 = 有用的工作，空白 = 在等。
+//
+//   有用时间 T_mem = 权重字节 / 显存带宽      ← decode 是显存带宽受限的（第 10 讲）
+//   Llama-3.2-1B：1.24e9 参数 × 2 字节 = 2.48 GB；H100 3.35 TB/s → 740 µs
+//   kernel 数 N = 层数 × 每层 kernel 数 + 4（嵌入、输出头等）
+//   气泡 = N × τ（每个 kernel 的启动 + 拆除）+ 尾部效应
+//   尾部效应 = 每个 kernel 的墙钟时间里有 15% 是「最长的那个 SM 还没做完，别人在等」
+//   带宽利用率 = T_mem / (T_mem + 气泡)
+//
+// 参考线：50%（讲者说的现有引擎水平）、72%（讲者报告的 mega kernel 实测）、
+// 78%（Stanford Hazy Research 那篇 Llama-1B mega kernel 博客的公开数字）。
+---
+
+<div class="demo" data-demo="lg-megakernel">
+  <div class="row">
+    <label class="sld">
+      每层 kernel 数 = <span data-k-val>8</span>
+      <input type="range" data-k min="1" max="8" step="1" value="8" />
+    </label>
+    <label class="sld">
+      每个 kernel 的启动+拆除 = <span data-t-val>5.0</span> µs
+      <input type="range" data-t min="0" max="20" step="1" value="10" />
+    </label>
+    <label class="chk">
+      <input type="checkbox" data-tail checked />
+      尾部效应（每个 kernel 的 15% 墙钟时间在等最慢的 SM）
+    </label>
+  </div>
+
+  <div class="two">
+    <div>
+      <canvas data-canvas width="720" height="300"></canvas>
+      <p class="axis">
+        上半部分：横轴是一次 decode 步的时间，纵轴是 GPU 上的流多处理器（示意画 16 行，
+        H100 实际有 132 个）。靛蓝实心条 = 真的在搬数据、在算；空白 = 在等。
+        下半部分是由此算出的显存带宽利用率，三条刻度分别是现有引擎的水平、
+        讲者报告的 mega kernel 实测、以及公开博客里的数字。
+      </p>
+    </div>
+    <div>
+      <table><tbody data-stats></tbody></table>
+      <p class="hint" data-hint></p>
+    </div>
+  </div>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1.3rem;
+    margin-bottom: 0.7rem;
+  }
+  .sld,
+  .chk {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.83rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .sld input[type='range'] {
+    width: 132px;
+    accent-color: var(--indigo);
+  }
+  .chk input {
+    accent-color: var(--indigo);
+  }
+  .two {
+    display: grid;
+    gap: 1.2rem;
+    align-items: start;
+  }
+  @media (min-width: 860px) {
+    .two {
+      grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr);
+    }
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .axis {
+    margin: 0.45rem 0 0;
+    font-size: 0.76rem;
+    color: var(--ink-faint);
+    line-height: 1.7;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.81rem;
+    font-variant-numeric: tabular-nums;
+  }
+  table :global(td) {
+    padding: 0.26rem 0.4rem;
+    color: var(--ink-muted);
+    border-bottom: 1px solid var(--rule);
+  }
+  table :global(td.k) {
+    color: var(--ink-faint);
+  }
+  table :global(td.v) {
+    text-align: right;
+    font-family: var(--font-mono);
+    color: var(--ink);
+  }
+  table :global(tr.hi td.v) {
+    color: var(--indigo);
+    font-weight: 700;
+  }
+  table :global(tr.bad td.v) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+  .hint {
+    margin: 0.9rem 0 0;
+    font-size: 0.83rem;
+    line-height: 1.8;
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupLGMegakernel() {
+    document.querySelectorAll<HTMLElement>('[data-demo="lg-megakernel"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const cv = $<HTMLCanvasElement>('[data-canvas]');
+      const ctx = cv.getContext('2d')!;
+      const css = (n: string) =>
+        getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+      const PARAMS = 1.24e9; // Llama-3.2-1B
+      const BW = 3.35e12; // H100 显存带宽
+      const LAYERS = 16;
+      const T_MEM = (2 * PARAMS) / BW; // 秒：把权重完整读一遍的时间 = 「光速」
+      const ROWS = 16; // 示意画多少行 SM
+
+      // 固定的伪随机数，用来画参差不齐的尾部（不用 Math.random，免得每帧都在抖）
+      const jitter: number[] = [];
+      let seed = 7;
+      for (let i = 0; i < 2048; i++) {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        jitter.push(seed / 2147483648);
+      }
+
+      const kIn = $<HTMLInputElement>('[data-k]');
+      const tIn = $<HTMLInputElement>('[data-t]');
+      const tailIn = $<HTMLInputElement>('[data-tail]');
+
+      function draw() {
+        const k = parseInt(kIn.value, 10);
+        const tau = parseInt(tIn.value, 10) * 0.5e-6; // 秒
+        const tail = tailIn.checked;
+        $('[data-k-val]').textContent = String(k);
+        $('[data-t-val]').textContent = (parseInt(tIn.value, 10) * 0.5).toFixed(1);
+
+        const N = LAYERS * k + 4; // 总 kernel 数
+        const tailFactor = tail ? 0.85 : 1;
+        const workWall = T_MEM / tailFactor; // 有用工作占用的墙钟时间（含尾部空转）
+        const bubbles = N * tau;
+        const stepTime = workWall + bubbles;
+        const util = T_MEM / stepTime;
+        const tps = 1 / stepTime;
+
+        const indigo = css('--indigo');
+        const madder = css('--madder');
+        const rule = css('--rule');
+        const faint = css('--ink-faint');
+        const weld = css('--weld');
+
+        ctx.clearRect(0, 0, cv.width, cv.height);
+        ctx.font = '11px ui-monospace, monospace';
+        ctx.textBaseline = 'middle';
+
+        const padL = 14,
+          padR = 14;
+        const W = cv.width - padL - padR;
+        const scale = W / stepTime; // 像素 / 秒
+
+        // ── 上半：SM 时间线 ──
+        const top = 30;
+        const rowH = 9;
+        ctx.fillStyle = faint;
+        ctx.textAlign = 'left';
+        ctx.fillText(
+          `一次 decode 步 = ${(stepTime * 1e6).toFixed(0)} µs，共 ${N} 个 kernel`,
+          padL,
+          16,
+        );
+
+        const perKernelWall = workWall / N;
+        let x = padL;
+        let ji = 0;
+        for (let j = 0; j < N; j++) {
+          const wk = perKernelWall * scale;
+          for (let r = 0; r < ROWS; r++) {
+            const f = tail ? 0.55 + 0.45 * jitter[ji++ % jitter.length] : 1;
+            ctx.fillStyle = indigo;
+            ctx.fillRect(x, top + r * rowH, Math.max(0.7, wk * f), rowH - 2);
+          }
+          x += wk + tau * scale;
+        }
+
+        // 边框 + 「光速」参考线
+        ctx.strokeStyle = rule;
+        ctx.lineWidth = 1;
+        ctx.strokeRect(padL - 0.5, top - 3.5, W + 1, ROWS * rowH + 6);
+
+        const solX = padL + T_MEM * scale;
+        ctx.strokeStyle = weld;
+        ctx.lineWidth = 1.6;
+        ctx.setLineDash([4, 3]);
+        ctx.beginPath();
+        ctx.moveTo(solX, top - 6);
+        ctx.lineTo(solX, top + ROWS * rowH + 6);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = weld;
+        ctx.textAlign = solX > W * 0.6 ? 'right' : 'left';
+        ctx.fillText(
+          `「光速」${(T_MEM * 1e6).toFixed(0)} µs`,
+          solX + (solX > W * 0.6 ? -5 : 5),
+          top + ROWS * rowH + 16,
+        );
+
+        // ── 下半：带宽利用率 ──
+        const by = 232,
+          bh = 26;
+        ctx.fillStyle = faint;
+        ctx.textAlign = 'left';
+        ctx.fillText('显存带宽利用率', padL, by - 14);
+
+        ctx.fillStyle = css('--bg-sunken');
+        ctx.fillRect(padL, by, W, bh);
+        ctx.fillStyle = util >= 0.7 ? indigo : madder;
+        ctx.fillRect(padL, by, W * util, bh);
+        ctx.strokeStyle = rule;
+        ctx.strokeRect(padL + 0.5, by + 0.5, W - 1, bh - 1);
+
+        ctx.fillStyle = css('--bg-raised');
+        ctx.textAlign = 'left';
+        if (W * util > 60) ctx.fillText((util * 100).toFixed(1) + '%', padL + 8, by + bh / 2);
+
+        const marks: [number, string][] = [
+          [0.5, '50% 现有引擎'],
+          [0.72, '72% 讲者报告'],
+          [0.78, '78% 公开博客'],
+        ];
+        ctx.textAlign = 'center';
+        for (const [v, label] of marks) {
+          const mx = padL + W * v;
+          ctx.strokeStyle = faint;
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.moveTo(mx, by - 4);
+          ctx.lineTo(mx, by + bh + 4);
+          ctx.stroke();
+          ctx.fillStyle = faint;
+          ctx.fillText(label, mx, by + bh + 14);
+        }
+
+        // ── 表格 ──
+        const rows: [string, string, string][] = [
+          ['模型', 'Llama-3.2-1B（1.24B）', ''],
+          ['权重（bf16）', '2.48 GB', ''],
+          ['「光速」= 读完权重的时间', (T_MEM * 1e6).toFixed(0) + ' µs', ''],
+          ['kernel 总数', String(N), ''],
+          ['启动+拆除气泡合计', (bubbles * 1e6).toFixed(0) + ' µs', bubbles > T_MEM * 0.3 ? 'bad' : ''],
+          ['尾部效应浪费', ((workWall - T_MEM) * 1e6).toFixed(0) + ' µs', ''],
+          ['实际一步耗时', (stepTime * 1e6).toFixed(0) + ' µs', ''],
+          ['带宽利用率', (util * 100).toFixed(1) + '%', util >= 0.7 ? 'hi' : 'bad'],
+          ['单序列出词速度', tps.toFixed(0) + ' token/秒', 'hi'],
+        ];
+        const tb = $('[data-stats]');
+        tb.replaceChildren();
+        for (const [a1, v, cls] of rows) {
+          const tr = document.createElement('tr');
+          if (cls) tr.className = cls;
+          const a = document.createElement('td');
+          a.className = 'k';
+          a.textContent = a1;
+          const b = document.createElement('td');
+          b.className = 'v';
+          b.textContent = v;
+          tr.append(a, b);
+          tb.append(tr);
+        }
+
+        let hint: string;
+        if (k >= 6) {
+          hint =
+            `这是「一个操作一个 kernel」的写法：${N} 个 kernel，光启动和拆除就烧掉 ` +
+            `${(bubbles * 1e6).toFixed(0)} µs —— 和真正搬权重的 ${(T_MEM * 1e6).toFixed(0)} µs 是同一量级。` +
+            `把「每层 kernel 数」拖到 1，就是把整层融成一个 mega kernel。`;
+        } else if (k === 1) {
+          hint =
+            `整层一个 kernel：气泡只剩 ${(bubbles * 1e6).toFixed(0)} µs。` +
+            `但注意就算这样也到不了 100% —— 剩下的损失来自尾部效应（把勾去掉看差别）。` +
+            `这也是为什么实测是 72% 而不是 99%：mega kernel 内部的重叠同样做不到完美。`;
+        } else {
+          hint =
+            `${N} 个 kernel，气泡 ${(bubbles * 1e6).toFixed(0)} µs，利用率 ${(util * 100).toFixed(1)}%。` +
+            `注意气泡的总量和 kernel 的个数成正比，而和每个 kernel 做多少事无关 —— ` +
+            `所以在 decode 这种「本来就没多少活」的场景里，它才格外致命。`;
+        }
+        $('[data-hint]').textContent = hint;
+      }
+
+      root.querySelectorAll('input').forEach((el) => {
+        el.addEventListener('input', draw);
+        el.addEventListener('change', draw);
+      });
+      new MutationObserver(draw).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-theme'],
+      });
+      draw();
+    });
+  }
+
+  setupLGMegakernel();
+  document.addEventListener('astro:page-load', setupLGMegakernel);
+</script>

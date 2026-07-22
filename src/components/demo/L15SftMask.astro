@@ -1,0 +1,284 @@
+---
+// SFT 的训练样本长什么样：一段对话套上 chat template 之后变成一串 token，
+// 然后用一个 mask 决定「哪些位置上的下一 token 预测才计入损失」。
+// 三种口径：只算回答（标准 SFT）／连 prompt 一起算／中期训练（纯预训练，全算）。
+---
+
+<div class="demo" data-demo="l15-sft-mask">
+  <div class="ctrl">
+    <span class="tag">损失算在哪些位置</span>
+    <button data-mode="assistant" class="on">只算 assistant 回答</button>
+    <button data-mode="all">prompt 也一起算</button>
+    <button data-mode="mid">中期训练：纯预训练口径</button>
+  </div>
+  <div class="ctrl">
+    <label><input type="checkbox" data-multi /> 换成两轮对话</label>
+    <label><input type="checkbox" data-eos checked /> 回答末尾的 <code>&lt;|im_end|&gt;</code> 也算损失</label>
+  </div>
+
+  <div class="seq" data-seq></div>
+
+  <table class="out" data-out><tbody></tbody></table>
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 0.9rem;
+    margin-bottom: 0.6rem;
+  }
+  .tag {
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .ctrl button {
+    padding: 0.26rem 0.65rem;
+    font: inherit;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .ctrl button:hover {
+    color: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .ctrl button.on {
+    color: var(--bg);
+    background: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .ctrl label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    cursor: pointer;
+  }
+  .ctrl code {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+  }
+
+  .seq {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+    padding: 0.6rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    line-height: 1.9;
+  }
+  .seq :global(.tok) {
+    padding: 0.05rem 0.28rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    border-radius: 3px;
+    white-space: pre;
+    color: var(--ink-faint);
+    background: transparent;
+    border: 1px solid var(--rule);
+  }
+  .seq :global(.tok.hit) {
+    color: var(--bg);
+    background: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .seq :global(.tok.sp) {
+    font-weight: 700;
+  }
+  .seq :global(.tok.hit.sp) {
+    background: var(--madder);
+    border-color: var(--madder);
+  }
+  .seq :global(.br) {
+    flex-basis: 100%;
+    height: 0;
+  }
+
+  .out {
+    width: 100%;
+    margin-top: 0.9rem;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+  }
+  .out :global(td) {
+    padding: 0.28rem 0.35rem;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-muted);
+  }
+  .out :global(td.v) {
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    white-space: nowrap;
+  }
+  .out :global(tr.hi td) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL15SftMask() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l15-sft-mask"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+
+      // 一个 token 一条：文本 + 它属于哪一段。
+      // 中文按字切、英文按词切，粗略模拟真实分词器的粒度。
+      type Seg = 'sys' | 'user' | 'asst' | 'ctl';
+      type Tok = { t: string; seg: Seg; sp?: boolean; nl?: boolean };
+
+      const sp = (t: string, seg: Seg): Tok => ({ t, seg, sp: true });
+      const chars = (s: string, seg: Seg): Tok[] => [...s].map((c) => ({ t: c, seg }));
+
+      function build(multi: boolean): Tok[] {
+        const out: Tok[] = [];
+        const turn = (role: string, seg: Seg, text: string) => {
+          out.push(sp('<|im_start|>', 'ctl'));
+          out.push({ t: role, seg: 'ctl' });
+          out.push(...chars(text, seg));
+          out.push({ ...sp('<|im_end|>', seg), nl: true }); // 结束符归属于这一段
+        };
+        turn('system', 'sys', '你是一个乐于助人的助手。');
+        turn('user', 'user', '用一句话解释幂律。');
+        turn('assistant', 'asst', '幂律是指一个量随另一个量的固定次幂变化的关系。');
+        if (multi) {
+          turn('user', 'user', '举个例子。');
+          turn('assistant', 'asst', '模型损失随数据量的下降就是幂律。');
+        }
+        return out;
+      }
+
+      let mode: 'assistant' | 'all' | 'mid' = 'assistant';
+
+      function draw() {
+        const multi = $<HTMLInputElement>('[data-multi]').checked;
+        const eos = $<HTMLInputElement>('[data-eos]').checked;
+        const toks = build(multi);
+
+        // mask[i] = 这个位置上的 token 要不要算进交叉熵
+        const mask = toks.map((tk) => {
+          if (mode !== 'assistant') return true; // 全算
+          if (tk.seg !== 'asst') return false; // 只留 assistant
+          if (tk.sp && !eos) return false; // 结束符可选
+          return true;
+        });
+
+        const box = $('[data-seq]');
+        box.replaceChildren();
+        toks.forEach((tk, i) => {
+          const s = document.createElement('span');
+          s.className = 'tok' + (mask[i] ? ' hit' : '') + (tk.sp ? ' sp' : '');
+          s.textContent = tk.t;
+          box.append(s);
+          if (tk.nl) {
+            const br = document.createElement('span');
+            br.className = 'br';
+            box.append(br);
+          }
+        });
+
+        const total = toks.length;
+        const hit = mask.filter(Boolean).length;
+        const asstTotal = toks.filter((t) => t.seg === 'asst').length;
+
+        const tb = $('[data-out] tbody');
+        tb.replaceChildren();
+        const row = (k: string, v: string, cls = '') => {
+          const tr = document.createElement('tr');
+          if (cls) tr.className = cls;
+          const a = document.createElement('td');
+          a.textContent = k;
+          const b = document.createElement('td');
+          b.className = 'v';
+          b.textContent = v;
+          tr.append(a, b);
+          tb.append(tr);
+        };
+        row('这条样本一共多少个 token', String(total));
+        row('其中属于 assistant 回答的', String(asstTotal));
+        row('真正计入交叉熵的位置', String(hit), 'hi');
+        row('梯度利用率（计入 ÷ 总数）', ((hit / total) * 100).toFixed(1) + '%', 'hi');
+
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        const strong = document.createElement('strong');
+        const msg =
+          mode === 'assistant'
+            ? [
+                strong,
+                document.createTextNode(
+                  '。这是最标准的 SFT 口径：模型只因为「回答写得像不像」而受罚，不会因为「猜不出用户会问什么」而受罚 —— 用户问什么本来就不该由模型负责。' +
+                    '注意结束符 <|im_end|> 通常是要算的：不算的话模型学不会「什么时候停」，生成时会一直往下写。' +
+                    '代价是这条样本里有一大半 token 白算了前向，梯度利用率不高 —— 所以真做 SFT 时会把多条样本打包（packing）进同一条序列。',
+                ),
+              ]
+            : mode === 'all'
+              ? [
+                  strong,
+                  document.createTextNode(
+                    '。prompt 也一起算。听上去像是「学错了东西」，但课上说得很清楚：有些 SFT 配方本来就预测 prompt，实际差别不大。' +
+                      '直觉是 prompt 部分的损失相当于顺带做了一点领域内的预训练，而且它同时也在拉高分母，让每条样本的梯度不至于被极短的回答主导。',
+                  ),
+                ]
+              : [
+                  strong,
+                  document.createTextNode(
+                    '。这就是中期训练的口径 —— 有同学当场问「这种数据里 query 被 mask 掉了吗」，答案是没有：那是纯粹的预训练，prompt 也在预测。' +
+                      '换句话说，把指令数据混进预训练时，你根本不需要 mask 这套机制，一条对话就是一段普通文本。',
+                  ),
+                ];
+        strong.textContent = `${hit} / ${total} 个位置计入损失`;
+        v.append(...msg);
+      }
+
+      root.querySelectorAll<HTMLButtonElement>('[data-mode]').forEach((b) => {
+        b.addEventListener('click', () => {
+          mode = b.dataset.mode as typeof mode;
+          root.querySelectorAll('[data-mode]').forEach((x) => x.classList.toggle('on', x === b));
+          draw();
+        });
+      });
+      root.querySelectorAll<HTMLInputElement>('input').forEach((c) => {
+        c.addEventListener('change', draw);
+        c.addEventListener('input', draw);
+      });
+
+      draw();
+    });
+  }
+
+  setupL15SftMask();
+  document.addEventListener('astro:page-load', setupL15SftMask);
+</script>
