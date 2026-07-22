@@ -11,8 +11,16 @@ interface Props {
   wide?: boolean;
 }
 
+import { imageSize } from '../../lib/image-size';
+
 const { src, caption, alt = caption ?? '', video = false, loop = true, wide = false } = Astro.props;
 const isVideo = video || /\.(mp4|webm|mov)$/i.test(src);
+
+// 构建时读出固有宽高，写进 width/height 属性 —— 浏览器据此在图片下载前
+// 就按宽高比预留高度。没有它，懒加载的图在加载前是 0 高，整篇的高度要
+// 边滚边长，点目录跳转会落偏几千像素。读不出来就不写属性（见 lib/image-size.ts）。
+// 显示宽度仍然归 CSS 管，属性只提供比例。
+const dim = isVideo ? null : imageSize(src);
 ---
 
 <figure class:list={['figure', { wide }]}>
@@ -28,7 +36,14 @@ const isVideo = video || /\.(mp4|webm|mov)$/i.test(src);
         preload="metadata"
       />
     ) : (
-      <img src={src} alt={alt} loading="lazy" decoding="async" />
+      <img
+        src={src}
+        alt={alt}
+        loading="lazy"
+        decoding="async"
+        width={dim?.width}
+        height={dim?.height}
+      />
     )
   }
   {caption && <figcaption>{caption}</figcaption>}
