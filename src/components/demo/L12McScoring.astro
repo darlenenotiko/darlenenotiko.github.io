@@ -1,0 +1,342 @@
+---
+// 多选题的三种打分方式对比。题目就是课件上那道 HellaSwag：
+// "A woman is outside with a bucket and a dog..." 正确答案是 C。
+// 同一个模型，换一种「怎么从模型里读出答案」的规则，选出来的选项就不一样。
+---
+
+<div class="demo" data-demo="l12-mc-scoring">
+  <div class="stem">
+    <p class="ctx">
+      A woman is outside with a bucket and a dog. The dog is running around trying to avoid a
+      bath. She…
+    </p>
+  </div>
+
+  <table data-table>
+    <thead>
+      <tr>
+        <th>选项</th>
+        <th class="n">每 token 平均 log p</th>
+        <th class="n">token 数</th>
+        <th class="n">选项字母的概率</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <div class="cards" data-cards></div>
+
+  <p class="verdict" data-verdict></p>
+
+  <div class="ctrl">
+    <button data-reset class="ghost">回到默认值</button>
+  </div>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .stem {
+    padding: 0.6rem 0.8rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .ctx {
+    margin: 0;
+    font-size: 0.88rem;
+    line-height: 1.65;
+    color: var(--ink);
+  }
+
+  table {
+    width: 100%;
+    margin-top: 0.9rem;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+  }
+  table :global(th) {
+    padding: 0.25rem 0.35rem;
+    text-align: left;
+    font-size: 0.72rem;
+    letter-spacing: 0.03em;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+  }
+  table :global(td) {
+    padding: 0.35rem;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-muted);
+    vertical-align: top;
+  }
+  table :global(th.n),
+  table :global(td.n) {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  table :global(td.opt) {
+    color: var(--ink);
+    max-width: 22rem;
+  }
+  table :global(td.opt b) {
+    color: var(--indigo);
+  }
+  table :global(tr.gold td.opt b) {
+    color: var(--weld);
+  }
+  table :global(tr.gold td.opt::after) {
+    content: ' ← 正确答案';
+    font-size: 0.72rem;
+    color: var(--weld);
+    white-space: nowrap;
+  }
+  table :global(input[type='range']) {
+    width: 100%;
+    max-width: 130px;
+    accent-color: var(--indigo);
+  }
+  table :global(.v) {
+    display: block;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .cards {
+    display: grid;
+    gap: 0.7rem;
+    margin-top: 1rem;
+  }
+  @media (min-width: 640px) {
+    .cards {
+      grid-template-columns: repeat(3, 1fr);
+    }
+  }
+  .cards :global(.card) {
+    padding: 0.65rem 0.8rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+  }
+  .cards :global(.card h4) {
+    margin: 0 0 0.35rem;
+    font-size: 0.74rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+  }
+  .cards :global(.card .pick) {
+    font-size: 1.35rem;
+    font-weight: 700;
+    color: var(--madder);
+  }
+  .cards :global(.card.ok .pick) {
+    color: var(--weld);
+  }
+  .cards :global(.card .rank) {
+    margin: 0.3rem 0 0;
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    color: var(--ink-muted);
+  }
+
+  .verdict {
+    margin: 1rem 0 0;
+    padding: 0.6rem 0.8rem;
+    font-size: 0.83rem;
+    line-height: 1.7;
+    color: var(--ink-muted);
+    background: color-mix(in srgb, var(--weld) 12%, transparent);
+    border-left: 3px solid var(--weld);
+    border-radius: 0 5px 5px 0;
+  }
+
+  .ctrl {
+    margin-top: 0.8rem;
+  }
+  .ctrl button {
+    padding: 0.26rem 0.7rem;
+    font: inherit;
+    font-size: 0.82rem;
+    color: var(--ink-muted);
+    background: transparent;
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+  }
+</style>
+
+<script>
+  function setupL12McScoring() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l12-mc-scoring"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+
+      type Opt = { letter: string; text: string; mean: number; len: number; pLetter: number };
+
+      // 默认值是刻意挑的：三种打分法给出三个不同的答案。数值是示意用的，不是真跑出来的。
+      const DEFAULT: Opt[] = [
+        {
+          letter: 'A',
+          text: 'rinses the bucket off with soap and blow dry the dog’s head.',
+          mean: -2.1,
+          len: 12,
+          pLetter: 0.31,
+        },
+        {
+          letter: 'B',
+          text: 'uses a hose to keep it from getting soapy.',
+          mean: -1.75,
+          len: 10,
+          pLetter: 0.18,
+        },
+        {
+          letter: 'C',
+          text: 'gets the dog wet, then it runs away again.',
+          mean: -1.55,
+          len: 10,
+          pLetter: 0.22,
+        },
+        {
+          letter: 'D',
+          text: 'gets into a bath tub with the dog.',
+          mean: -1.8,
+          len: 8,
+          pLetter: 0.29,
+        },
+      ];
+      const GOLD = 'C';
+      let opts: Opt[] = DEFAULT.map((o) => ({ ...o }));
+
+      const rankBy = (score: (o: Opt) => number) =>
+        [...opts].sort((a, b) => score(b) - score(a)).map((o) => o.letter);
+
+      // 表格只建一次。滑块元素必须一直在，否则每次 input 事件重建 DOM 会把拖动打断。
+      type Cell = { v: HTMLElement; inp: HTMLInputElement; get: () => number; fmt: (n: number) => string };
+      const cells: Cell[] = [];
+
+      function buildTable() {
+        const tbody = $('[data-table] tbody');
+        tbody.replaceChildren();
+        opts.forEach((o, i) => {
+          const tr = document.createElement('tr');
+          if (o.letter === GOLD) tr.className = 'gold';
+
+          const c1 = document.createElement('td');
+          c1.className = 'opt';
+          c1.innerHTML = `<b>${o.letter}.</b> ${o.text}`;
+
+          const mk = (
+            min: number,
+            max: number,
+            step: number,
+            get: () => number,
+            fmt: (v: number) => string,
+            set: (v: number) => void,
+          ) => {
+            const td = document.createElement('td');
+            td.className = 'n';
+            const v = document.createElement('span');
+            v.className = 'v';
+            const inp = document.createElement('input');
+            inp.type = 'range';
+            inp.min = String(min);
+            inp.max = String(max);
+            inp.step = String(step);
+            inp.value = String(get());
+            inp.addEventListener('input', () => {
+              set(Number(inp.value));
+              draw();
+            });
+            td.append(v, inp);
+            cells.push({ v, inp, get, fmt });
+            return td;
+          };
+
+          tr.append(
+            c1,
+            mk(-4, -0.5, 0.05, () => opts[i].mean, (v) => v.toFixed(2), (v) => (opts[i].mean = v)),
+            mk(3, 20, 1, () => opts[i].len, (v) => String(v), (v) => (opts[i].len = v)),
+            mk(0.01, 0.9, 0.01, () => opts[i].pLetter, (v) => v.toFixed(2), (v) => (opts[i].pLetter = v)),
+          );
+          tbody.append(tr);
+        });
+      }
+
+      function drawTable() {
+        for (const c of cells) {
+          const val = c.get();
+          c.v.textContent = c.fmt(val);
+          if (c.inp.value !== String(val)) c.inp.value = String(val);
+        }
+      }
+
+      function drawCards() {
+        const defs: { title: string; note: string; rank: string[] }[] = [
+          {
+            title: '① 按字母打分',
+            note: 'p(“A”) / p(“B”) / …',
+            rank: rankBy((o) => o.pLetter),
+          },
+          {
+            title: '② 按选项文本的总对数似然',
+            note: 'Σ log p（不做归一化）',
+            rank: rankBy((o) => o.mean * o.len),
+          },
+          {
+            title: '③ 长度归一化的似然',
+            note: 'Σ log p ÷ token 数',
+            rank: rankBy((o) => o.mean),
+          },
+        ];
+        const el = $('[data-cards]');
+        el.replaceChildren();
+        for (const d of defs) {
+          const div = document.createElement('div');
+          div.className = 'card' + (d.rank[0] === GOLD ? ' ok' : '');
+          div.innerHTML =
+            `<h4>${d.title}</h4><div class="pick">选 ${d.rank[0]}</div>` +
+            `<p class="rank">${d.note}<br>排名 ${d.rank.join(' > ')}</p>`;
+          el.append(div);
+        }
+        return defs;
+      }
+
+      function draw() {
+        drawTable();
+        const defs = drawCards();
+        const picks = defs.map((d) => d.rank[0]);
+        const uniq = [...new Set(picks)];
+        const right = picks.filter((p) => p === GOLD).length;
+        let msg: string;
+        if (uniq.length === 1) {
+          msg =
+            `三种打分法都选了 ${uniq[0]}，` +
+            (uniq[0] === GOLD ? '而且都对。' : '而且都错了 —— 正确答案是 C。');
+        } else {
+          msg =
+            `同一个模型、同一道题，三种打分法给出了 ${uniq.length} 个不同的答案（` +
+            `${picks.join(' / ')}），其中 ${right} 个是对的。` +
+            `模型本身一个字都没变，变的只是「怎么从模型里读出答案」这条规则。`;
+        }
+        $('[data-verdict]').textContent = msg;
+      }
+
+      $('[data-reset]').addEventListener('click', () => {
+        DEFAULT.forEach((d, i) => Object.assign(opts[i], d));
+        draw();
+      });
+
+      buildTable();
+      draw();
+    });
+  }
+
+  setupL12McScoring();
+  document.addEventListener('astro:page-load', setupL12McScoring);
+</script>

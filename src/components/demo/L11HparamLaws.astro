@@ -1,0 +1,469 @@
+---
+// 超参数 scaling law 对照器。
+// 同一组 (N, D)，让课件第 33 页那张表上的几条「最优学习率 / 最优批大小」定律各报一个数，
+// 直观看出它们连自变量都不统一（有的看参数量、有的看算力、有的看终端损失、有的看数据量），
+// 报出来的数也可以差好几倍。
+// 终端损失 L 由 Chinchilla 的参数化曲面 L = 1.69 + 406.4/N^0.34 + 410.7/D^0.28 估计，
+// 因为 OpenAI 和 MiniCPM 那两条批大小定律的自变量是损失。
+// 所有数字都是当场按公式算的。
+---
+
+<div class="demo" data-demo="l11-hparam-laws">
+  <div class="ctrl">
+    <label>模型参数量 N <input type="range" data-n min="7.5" max="12" step="0.05" value="10.83" /></label>
+    <span class="val" data-n-v></span>
+  </div>
+  <div class="ctrl">
+    <label>训练 token 数 D <input type="range" data-d min="9" max="14" step="0.05" value="12.30" /></label>
+    <span class="val" data-d-v></span>
+  </div>
+  <div class="ctrl">
+    <button data-preset="deepseek67">DeepSeek 67B / 2T</button>
+    <button data-preset="deepseek7">DeepSeek 7B / 2T</button>
+    <button data-preset="chinchilla">Chinchilla 70B / 1.4T</button>
+    <button data-preset="small">小跑 100M / 2B</button>
+  </div>
+
+  <p class="derived" data-derived></p>
+
+  <table class="out" data-out>
+    <thead>
+      <tr>
+        <th>定律</th><th>自变量</th><th>最优学习率</th><th>最优批大小（token）</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <div class="two">
+    <div class="plot" data-plot-lr></div>
+    <div class="plot" data-plot-b></div>
+  </div>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.5rem;
+  }
+  .ctrl label {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+  }
+  .ctrl input[type='range'] {
+    width: 190px;
+    accent-color: var(--indigo);
+  }
+  .val {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--madder);
+    font-variant-numeric: tabular-nums;
+  }
+  .ctrl button {
+    padding: 0.26rem 0.65rem;
+    font: inherit;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .ctrl button:hover {
+    color: var(--indigo);
+    border-color: var(--indigo);
+  }
+
+  .derived {
+    margin: 0.8rem 0 0.2rem;
+    padding: 0.5rem 0.7rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.85;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+  }
+
+  .out {
+    width: 100%;
+    margin-top: 0.9rem;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+  }
+  .out :global(th) {
+    padding: 0.25rem 0.35rem;
+    text-align: right;
+    font-weight: 400;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(th:first-child),
+  .out :global(th:nth-child(2)) {
+    text-align: left;
+  }
+  .out :global(td) {
+    padding: 0.25rem 0.35rem;
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(td:first-child),
+  .out :global(td:nth-child(2)) {
+    text-align: left;
+  }
+  .out :global(td.dim) {
+    color: var(--ink-faint);
+  }
+  .out :global(td.bad) {
+    color: var(--madder);
+  }
+
+  .two {
+    display: grid;
+    gap: 0.8rem;
+    margin-top: 0.9rem;
+  }
+  @media (min-width: 700px) {
+    .two {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  .plot {
+    overflow-x: auto;
+  }
+  .plot :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 300px;
+    height: auto;
+  }
+  .plot :global(.axis) {
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .plot :global(.grid) {
+    stroke: var(--rule);
+    stroke-width: 0.6;
+    stroke-dasharray: 2 3;
+  }
+  .plot :global(.span) {
+    stroke: var(--weld);
+    stroke-width: 3;
+  }
+  .plot :global(.pt) {
+    fill: var(--indigo);
+  }
+  .plot :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 9px;
+  }
+  .plot :global(text.title) {
+    fill: var(--indigo);
+    font-size: 10.5px;
+    font-weight: 700;
+  }
+  .plot :global(text.lab) {
+    fill: var(--ink-muted);
+    font-size: 8.5px;
+  }
+  .plot :global(text.note) {
+    fill: var(--madder);
+    font-size: 9px;
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL11HparamLaws() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l11-hparam-laws"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+
+      const fmtSci = (x: number, d = 2) => {
+        if (!isFinite(x) || x <= 0) return '—';
+        const e = Math.floor(Math.log10(x));
+        return `${(x / Math.pow(10, e)).toFixed(d)}e${e}`;
+      };
+      const fmtTok = (x: number) => {
+        if (!isFinite(x) || x <= 0) return '—';
+        if (x >= 1e9) return (x / 1e9).toFixed(2) + 'B';
+        if (x >= 1e6) return (x / 1e6).toFixed(2) + 'M';
+        if (x >= 1e3) return (x / 1e3).toFixed(1) + 'K';
+        return x.toFixed(0);
+      };
+      const fmtParam = (x: number) => {
+        if (x >= 1e12) return (x / 1e12).toFixed(2) + 'T';
+        if (x >= 1e9) return (x / 1e9).toFixed(2) + 'B';
+        if (x >= 1e6) return (x / 1e6).toFixed(0) + 'M';
+        return x.toFixed(0);
+      };
+
+      // Chinchilla（Hoffmann+ 2022 方法三）的损失曲面，用来估一个终端损失
+      const lossOf = (N: number, D: number) =>
+        1.69 + 406.4 * Math.pow(N, -0.34) + 410.7 * Math.pow(D, -0.28);
+
+      type Law = {
+        name: string;
+        vars: string;
+        lr: (N: number, D: number, C: number, L: number) => number;
+        b: (N: number, D: number, C: number, L: number) => number;
+      };
+
+      const LAWS: Law[] = [
+        {
+          name: 'OpenAI（Kaplan 2020）',
+          vars: 'LR 看 N，批看损失 L',
+          lr: (N) => 3.239e-3 - 1.395e-4 * Math.log(N),
+          b: (_N, _D, _C, L) => 2.1e8 * Math.pow(L, -4.8),
+        },
+        {
+          name: 'DeepSeek（2024）',
+          vars: '两者都只看算力 C',
+          lr: (_N, _D, C) => 0.3188 * Math.pow(C, -0.125),
+          b: (_N, _D, C) => 0.292 * Math.pow(C, 0.3271),
+        },
+        {
+          name: 'Porian（2024）',
+          vars: '两者都只看 N',
+          lr: (N) => 3.7 * Math.pow(N, -0.36),
+          b: (N) => 0.7576 * Math.pow(N, 0.703),
+        },
+        {
+          name: 'MiniCPM（2024）',
+          vars: '批看损失 L；LR 交给 muP',
+          lr: () => NaN,
+          b: (_N, _D, _C, L) => Math.exp(20.91) * Math.pow(L, -6.24),
+        },
+        {
+          name: 'Step Law（StepFun 2025）',
+          vars: 'LR 看 N 和 D，批只看 D',
+          lr: (N, D) => 1.79 * Math.pow(N, -0.713) * Math.pow(D, 0.307),
+          b: (_N, D) => 0.58 * Math.pow(D, 0.571),
+        },
+      ];
+
+      const PRESETS: Record<string, [number, number]> = {
+        deepseek67: [Math.log10(67e9), Math.log10(2e12)],
+        deepseek7: [Math.log10(7e9), Math.log10(2e12)],
+        chinchilla: [Math.log10(70e9), Math.log10(1.4e12)],
+        small: [8, Math.log10(2e9)],
+      };
+
+      const W = 340,
+        H = 150,
+        ML = 16,
+        MR = 16,
+        MT = 26,
+        MB = 30;
+
+      function strip(
+        host: HTMLElement,
+        title: string,
+        lo: number,
+        hi: number,
+        vals: { name: string; v: number }[],
+        fmt: (x: number) => string,
+      ) {
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+        const px = (lx: number) => ML + ((lx - lo) / (hi - lo)) * (W - ML - MR);
+        for (let e = Math.ceil(lo); e <= Math.floor(hi); e++) {
+          const x = px(e);
+          svg.append(svgEl('line', { class: 'grid', x1: x, y1: MT, x2: x, y2: H - MB }));
+          svg.append(svgEl('text', { x, y: H - MB + 12, 'text-anchor': 'middle' }, `10^${e}`));
+        }
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: H - MB, x2: W - MR, y2: H - MB }));
+        svg.append(svgEl('text', { class: 'title', x: ML, y: 14 }, title));
+
+        const ok = vals.filter((v) => isFinite(v.v) && v.v > 0);
+        if (ok.length >= 2) {
+          const xs = ok.map((v) => Math.log10(v.v));
+          const a = Math.max(Math.min(...xs), lo),
+            b = Math.min(Math.max(...xs), hi);
+          svg.append(
+            svgEl('line', { class: 'span', x1: px(a), y1: H - MB - 6, x2: px(b), y2: H - MB - 6 }),
+          );
+          const spread = Math.pow(10, Math.max(...xs) - Math.min(...xs));
+          svg.append(
+            svgEl(
+              'text',
+              { class: 'note', x: W - MR, y: MT + 8, 'text-anchor': 'end' },
+              `最大 / 最小 = ${spread.toFixed(1)}×`,
+            ),
+          );
+        }
+
+        ok.forEach((v, i) => {
+          const lx = Math.min(Math.max(Math.log10(v.v), lo), hi);
+          const y = MT + 14 + (i % 4) * 12;
+          svg.append(svgEl('circle', { class: 'pt', cx: px(lx), cy: H - MB - 6, r: 3 }));
+          svg.append(
+            svgEl('line', { class: 'grid', x1: px(lx), y1: y, x2: px(lx), y2: H - MB - 8 }),
+          );
+          svg.append(
+            svgEl(
+              'text',
+              {
+                class: 'lab',
+                x: px(lx) + 3,
+                y: y + 3,
+                'text-anchor': px(lx) > W - 110 ? 'end' : 'start',
+              },
+              `${v.name.split('（')[0]} ${fmt(v.v)}`,
+            ),
+          );
+        });
+        host.replaceChildren(svg);
+      }
+
+      function draw() {
+        const lN = parseFloat($<HTMLInputElement>('[data-n]').value);
+        const lD = parseFloat($<HTMLInputElement>('[data-d]').value);
+        const N = Math.pow(10, lN),
+          D = Math.pow(10, lD);
+        const C = 6 * N * D;
+        const L = lossOf(N, D);
+
+        $('[data-n-v]').textContent = fmtParam(N);
+        $('[data-d-v]').textContent = fmtParam(D);
+
+        $('[data-derived]').textContent =
+          `N = ${fmtSci(N)}　D = ${fmtSci(D)}　token/参数 = ${(D / N).toFixed(1)}\n` +
+          `C = 6ND = ${fmtSci(C)} FLOPs\n` +
+          `估计终端损失 L = 1.69 + 406.4/N^0.34 + 410.7/D^0.28 = ${L.toFixed(3)}` +
+          `　（只是为了给「看损失」的那两条定律一个输入）`;
+
+        const rows = LAWS.map((law) => ({
+          name: law.name,
+          vars: law.vars,
+          lr: law.lr(N, D, C, L),
+          b: law.b(N, D, C, L),
+        }));
+
+        const tb = $('[data-out] tbody');
+        tb.replaceChildren();
+        rows.forEach((r) => {
+          const tr = document.createElement('tr');
+          const cells: [string, string][] = [
+            [r.name, ''],
+            [r.vars, ''],
+            [
+              isFinite(r.lr) ? (r.lr > 0 ? fmtSci(r.lr) : '负数 —— 定律在这个规模上失效') : '—',
+              isFinite(r.lr) ? (r.lr > 0 ? '' : 'bad') : 'dim',
+            ],
+            [isFinite(r.b) ? fmtTok(r.b) : '—', isFinite(r.b) ? '' : 'dim'],
+          ];
+          cells.forEach(([t, cls]) => {
+            const td = document.createElement('td');
+            td.textContent = t;
+            if (cls) td.className = cls;
+            tr.append(td);
+          });
+          tb.append(tr);
+        });
+
+        strip(
+          $('[data-plot-lr]'),
+          '各条定律报出来的学习率',
+          -5,
+          -2,
+          rows.map((r) => ({ name: r.name, v: r.lr })),
+          (x) => fmtSci(x, 1),
+        );
+        strip(
+          $('[data-plot-b]'),
+          '各条定律报出来的批大小（token）',
+          4,
+          9,
+          rows.map((r) => ({ name: r.name, v: r.b })),
+          fmtTok,
+        );
+
+        const lrs = rows.map((r) => r.lr).filter((x) => isFinite(x) && x > 0);
+        const bs = rows.map((r) => r.b).filter((x) => isFinite(x) && x > 0);
+        const lrSpread = lrs.length ? Math.max(...lrs) / Math.min(...lrs) : NaN;
+        const bSpread = bs.length ? Math.max(...bs) / Math.min(...bs) : NaN;
+
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        const s1 = document.createElement('strong');
+        s1.textContent = `${lrSpread.toFixed(1)}×`;
+        const s2 = document.createElement('strong');
+        s2.textContent = `${bSpread.toFixed(1)}×`;
+        const s3 = document.createElement('strong');
+        s3.textContent = '连自变量都不一样';
+        v.append(
+          document.createTextNode('在当前这组 (N, D) 上，几条定律给出的学习率最多差 '),
+          s1,
+          document.createTextNode('，批大小最多差 '),
+          s2,
+          document.createTextNode('。这就是 Tatsu 那句话的具体形状：这些公式'),
+          s3,
+          document.createTextNode(
+            ' —— ' +
+              'OpenAI 拿终端损失定批大小、DeepSeek 只看算力、Porian 只看参数量、Step Law 说批大小只跟数据量有关。' +
+              '点「DeepSeek 67B / 2T」看 DeepSeek 自己那条能不能报回它论文里的 3.2e-4 和 19.7M；' +
+              '再把 N 往右拖过 1e10.6，看 OpenAI 那条学习率定律怎么直接变成负数 —— ' +
+              '外推到人家没跑过的区间，公式是会字面意义上崩掉的。',
+          ),
+        );
+      }
+
+      root.querySelectorAll('input').forEach((el) => el.addEventListener('input', draw));
+      root.querySelectorAll<HTMLButtonElement>('[data-preset]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const p = PRESETS[btn.dataset.preset!];
+          if (!p) return;
+          $<HTMLInputElement>('[data-n]').value = String(p[0]);
+          $<HTMLInputElement>('[data-d]').value = String(p[1]);
+          draw();
+        });
+      });
+      draw();
+    });
+  }
+
+  setupL11HparamLaws();
+  document.addEventListener('astro:page-load', setupL11HparamLaws);
+</script>

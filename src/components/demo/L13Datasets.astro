@@ -1,0 +1,743 @@
+---
+// 主流预训练数据集对照器。
+// 按年份排开，横条长度是 token 量（对数刻度），点一行看它的来源、筛选方法、备注。
+// 课件给了来源构成的（The Pile / Dolma / OLMo 2），额外画一条构成条。
+// 所有数字都来自 lecture_13.py 和课件里的表格；课上没给的一律标「课上没给」，不猜。
+---
+
+<div class="demo" data-demo="l13-datasets">
+  <div class="ctrl">
+    <span class="tag">排序</span>
+    <button data-sort="year" class="on">按年份</button>
+    <button data-sort="size">按 token 量</button>
+    <span class="tag">显示</span>
+    <button data-ref class="on">参照线（Llama 3 / Qwen3）</button>
+  </div>
+
+  <div class="plot" data-plot></div>
+
+  <div class="detail" data-detail></div>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.6rem;
+  }
+  .tag {
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .ctrl button {
+    padding: 0.26rem 0.65rem;
+    font: inherit;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .ctrl button:hover {
+    color: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .ctrl button.on {
+    color: var(--bg);
+    background: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .ctrl button.on:hover {
+    color: var(--bg);
+  }
+
+  .plot {
+    overflow-x: auto;
+  }
+  .plot :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 460px;
+    height: auto;
+  }
+  .plot :global(.axis) {
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .plot :global(.grid) {
+    stroke: var(--rule);
+    stroke-width: 0.6;
+    stroke-dasharray: 2 3;
+  }
+  .plot :global(.bar) {
+    fill: var(--indigo);
+    opacity: 0.72;
+  }
+  .plot :global(.bar.sel) {
+    fill: var(--madder);
+    opacity: 1;
+  }
+  .plot :global(.hit) {
+    fill: transparent;
+    cursor: pointer;
+  }
+  .plot :global(.nod) {
+    stroke: var(--ink-faint);
+    stroke-width: 1;
+    stroke-dasharray: 2 2;
+  }
+  .plot :global(.refline) {
+    stroke: var(--weld);
+    stroke-width: 1;
+    stroke-dasharray: 4 3;
+  }
+  .plot :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 9px;
+  }
+  .plot :global(text.name) {
+    fill: var(--ink-muted);
+    font-size: 9.5px;
+  }
+  .plot :global(text.name.sel) {
+    fill: var(--madder);
+    font-weight: 700;
+  }
+  .plot :global(text.val) {
+    fill: var(--ink);
+    font-size: 9px;
+  }
+  .plot :global(text.gold) {
+    fill: var(--weld);
+    font-size: 9px;
+    font-weight: 700;
+  }
+  .plot :global(text.title) {
+    fill: var(--indigo);
+    font-size: 10.5px;
+    font-weight: 700;
+  }
+
+  .detail {
+    margin-top: 1rem;
+    padding: 0.7rem 0.9rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    font-size: 0.84rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .detail :global(h4) {
+    margin: 0 0 0.4rem;
+    font-size: 0.95rem;
+    color: var(--indigo);
+  }
+  .detail :global(h4 span) {
+    margin-left: 0.5rem;
+    font-size: 0.75rem;
+    font-weight: 400;
+    color: var(--ink-faint);
+  }
+  .detail :global(dl) {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 0.15rem 0.7rem;
+    margin: 0 0 0.5rem;
+  }
+  .detail :global(dt) {
+    font-size: 0.75rem;
+    color: var(--ink-faint);
+  }
+  .detail :global(dd) {
+    margin: 0;
+    color: var(--ink);
+  }
+  .detail :global(ul) {
+    margin: 0.3rem 0 0;
+    padding-left: 1.1rem;
+  }
+  .detail :global(li) {
+    margin: 0.1rem 0;
+  }
+  .detail :global(.comp) {
+    margin-top: 0.7rem;
+  }
+  .detail :global(.compbar) {
+    display: flex;
+    width: 100%;
+    height: 16px;
+    margin: 0.3rem 0 0.5rem;
+    overflow: hidden;
+    border-radius: 3px;
+  }
+  .detail :global(.compbar i) {
+    display: block;
+    height: 100%;
+  }
+  .detail :global(table) {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+  }
+  .detail :global(td) {
+    padding: 0.16rem 0.3rem;
+    border-bottom: 1px solid var(--rule);
+  }
+  .detail :global(td.v) {
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    white-space: nowrap;
+  }
+  .detail :global(td.sw) {
+    width: 12px;
+    padding-right: 0;
+  }
+  .detail :global(td.sw i) {
+    display: block;
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
+  }
+</style>
+
+<script>
+  function setupL13Datasets() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l13-datasets"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      type Comp = { label: string; v: number };
+      type DS = {
+        id: string;
+        name: string;
+        year: number;
+        org: string;
+        tok: number | null; // token 数，null = 课上没给
+        tokNote: string;
+        size: string;
+        kind: string;
+        method: string;
+        notes: string[];
+        compUnit?: string;
+        comp?: Comp[];
+      };
+
+      // ── 全部数字来自 lecture_13.py 与课件图表 ──
+      const DATA: DS[] = [
+        {
+          id: 'bookscorpus',
+          name: 'BooksCorpus（BERT 用）',
+          year: 2015,
+          org: 'Zhu 等 / 后被 BERT 采用',
+          tok: null,
+          tokNote: '课上没给 token 数：7000 本书、9.85 亿词',
+          size: '7K 本书，985M 词',
+          kind: '自出版电子书（Smashwords 上标价 0 元的那些）',
+          method: '抓取 Smashwords 上免费的自出版书',
+          notes: [
+            'BERT 的训练数据 = Wikipedia + 这批书。',
+            '重要的一点：BERT 把序列当成「文档」而不是「句子」，和之前的十亿词基准（Chelba 等 2013，句子来自机器翻译语料）相反。',
+            '后来因为违反 Smashwords 的服务条款被下架。',
+          ],
+        },
+        {
+          id: 'webtext',
+          name: 'WebText（GPT-2 用）',
+          year: 2019,
+          org: 'OpenAI',
+          tok: null,
+          tokNote: '课上没给 token 数：800 万网页、40 GB 文本',
+          size: '8M 网页，40 GB 文本',
+          kind: '网页（Reddit 出链）',
+          method: '取 karma ≥ 3 的 Reddit 帖子里的出站链接作为质量代理',
+          notes: [
+            '当时大家已经知道 Common Crawl，但觉得它太脏，于是用 Reddit 的赞数当质量信号。',
+            '从未公开发布；OpenWebTextCorpus 是它的开放复现（抽 Reddit 提交数据集里的 URL、用 fastText 过滤非英语、去近重复）。',
+          ],
+        },
+        {
+          id: 'c4',
+          name: 'C4（T5 用）',
+          year: 2019,
+          org: 'Google',
+          tok: 156e9,
+          tokNote: '1560 亿 token',
+          size: '806 GB 文本',
+          kind: 'Common Crawl 单个快照（2019 年 4 月，1.4 万亿 token）',
+          method: '纯人工规则过滤',
+          notes: [
+            '只留以标点结尾且 ≥ 5 个词的行；删掉少于 3 句话的页面。',
+            '删掉含「脏词表」里任何词的页面；删掉含花括号（等于滤掉代码）、含 lorem ipsum、含 terms of use 之类样板文字的页面。',
+            '用 langdetect 过滤非英语（英语概率要 ≥ 0.99）。',
+            '比 GPT-2 的 40 GB 大了一个量级。',
+          ],
+        },
+        {
+          id: 'gpt3',
+          name: 'GPT-3 数据集',
+          year: 2020,
+          org: 'OpenAI',
+          tok: 400e9,
+          tokNote: '4000 亿 token',
+          size: '570 GB',
+          kind: 'Common Crawl + WebText2 + Books1/Books2 + Wikipedia',
+          method: '训练质量分类器 + 模糊去重',
+          notes: [
+            '质量分类器的任务是把 {WebText, Wikipedia, Books1, Books2} 和其余部分区分开 —— 即「像这几个就是好的」。',
+            '对文档做模糊去重，包括和 WebText、和各个 benchmark 之间的去重。',
+            'Books1 / Books2 在论文里只写了「基于互联网的书籍语料」，到今天仍是个谜。',
+          ],
+        },
+        {
+          id: 'pile',
+          name: 'The Pile',
+          year: 2021,
+          org: 'EleutherAI（草根志愿者）',
+          tok: 275e9,
+          tokNote: '约 2750 亿 token',
+          size: '825 GB 文本',
+          kind: '22 个精选高质量领域',
+          method: '按领域人工策展，各自处理',
+          notes: [
+            'GPT-3 出来之后的开源反击，一群志愿者在 Discord 上边聊边攒出来的。',
+            'Pile-CC 用的是 WARC 而不是 WET，再用 jusText 转文本 —— 比直接用 WET 好。',
+            'PubMed Central：500 万篇论文，NIH 资助的工作被要求公开。',
+            'Enron 邮件：安然调查（2002）时公开的 150 位高管的 50 万封邮件 —— 少数几个能拿到的邮件数据集之一，分布很怪但没得挑。',
+            'Books3 后来因侵权被下架。',
+          ],
+          compUnit: '论文表 1 的采样权重（%）',
+          comp: [
+            { label: 'Pile-CC', v: 18.11 },
+            { label: 'PubMed Central', v: 14.4 },
+            { label: 'Books3', v: 12.07 },
+            { label: 'OpenWebText2', v: 10.01 },
+            { label: 'arXiv', v: 8.96 },
+            { label: 'GitHub', v: 7.59 },
+            { label: 'FreeLaw', v: 6.12 },
+            { label: 'Stack Exchange', v: 5.13 },
+            { label: 'USPTO Backgrounds', v: 3.65 },
+            { label: 'PubMed Abstracts', v: 3.07 },
+            { label: 'Gutenberg (PG-19)', v: 2.17 },
+            { label: 'OpenSubtitles', v: 1.55 },
+            { label: 'Wikipedia (en)', v: 1.53 },
+            { label: 'DM Mathematics', v: 1.24 },
+            { label: 'Ubuntu IRC', v: 0.88 },
+            { label: 'BookCorpus2', v: 0.75 },
+            { label: 'EuroParl', v: 0.73 },
+            { label: 'HackerNews', v: 0.62 },
+            { label: 'YoutubeSubtitles', v: 0.6 },
+            { label: 'PhilPapers', v: 0.38 },
+            { label: 'NIH ExPorter', v: 0.3 },
+            { label: 'Enron Emails', v: 0.14 },
+          ],
+        },
+        {
+          id: 'massivetext',
+          name: 'MassiveText（Gopher 用）',
+          year: 2021,
+          org: 'DeepMind',
+          tok: null,
+          tokNote: '课上没给总 token 数：10.5 TB 文本；Gopher 只训了 3000 亿 token（约 12%）',
+          size: '10.5 TB 文本',
+          kind: 'MassiveWeb + C4 + 书 + 新闻 + GitHub + Wikipedia',
+          method: '人工规则质量过滤（不用分类器）+ Google SafeSearch 判有害内容',
+          notes: [
+            '模型本身被 Chinchilla 取代了，也从未发布，但数据处理写得非常细，值得读。',
+            '除了 MassiveWeb，其余几路（书、新闻、GitHub、Wikipedia）论文里什么都没说。',
+            'MassiveWeb 的规则举例：要求 80% 的词里至少含一个字母字符。',
+            '有害内容不用词表，改用 Google SafeSearch。',
+          ],
+        },
+        {
+          id: 'stack',
+          name: 'The Stack（v1）',
+          year: 2022,
+          org: 'BigCode',
+          tok: null,
+          tokNote: '课上没给 token 数：3.1 TB 代码',
+          size: '3.1 TB 代码',
+          kind: 'GitHub 代码仓库',
+          method: '许可证检测（只留宽松许可）+ MinHash / Jaccard 去近重复',
+          notes: [
+            '仓库名来自 GitHub Archive（2015–2022），git clone 了 1.37 亿个仓库、510 亿个文件 —— 其中只有 50 亿个是唯一的，重复率之高可见一斑。',
+            '用 go-license-detector 只保留 MIT / Apache 这类宽松许可的仓库。',
+          ],
+        },
+        {
+          id: 'llama',
+          name: 'LLaMA 数据集',
+          year: 2023,
+          org: 'Meta',
+          tok: 1.2e12,
+          tokNote: '1.2 万亿 token',
+          size: '—',
+          kind: 'CommonCrawl + C4 + GitHub + Wikipedia + 书 + arXiv + Stack Exchange',
+          method: '每一路各用各的：CCNet 分类器、C4 规则、许可证过滤、人工规则',
+          notes: [
+            'CommonCrawl 用 CCNet 处理，但分类目标换成了「这个页面是不是被 Wikipedia 引用过」，而不是「它像不像 Wikipedia 文章」—— Wikipedia 文章本身文体太特殊，它引用的那些站点反而更像好网页。',
+            'Wikipedia 取 2022 年 6–8 月、20 种语言，人工过滤。',
+            'arXiv 去掉注释、展开内联宏、删参考文献。',
+            'Stack Exchange 取最大的 28 个站点，答案按分数排序。',
+            '训练数据里有 Books3 和 Project Gutenberg —— 而 Books3 来自影子图书馆，等于向全世界宣布自己训了什么。这也是后来大家都不肯谈数据的原因之一。',
+            'Together 的 RedPajama v1 按论文描述做了复现；Cerebras 的 SlimPajama 是它去重（MinHashLSH）后的 6270 亿 token 子集。',
+          ],
+        },
+        {
+          id: 'refinedweb',
+          name: 'RefinedWeb（Falcon 用）',
+          year: 2023,
+          org: 'TII',
+          tok: 5e12,
+          tokNote: '5 万亿 token（只公开了其中 6000 亿）',
+          size: '—',
+          kind: '纯 Common Crawl',
+          method: 'Gopher 规则 + MinHash 模糊去重，刻意不用模型过滤',
+          notes: [
+            '论点是「光靠网页数据就够了」—— 不需要 GitHub / arXiv / Stack Exchange 这些专门来源。',
+            '用 trafilatura 从 WARC 抽正文，而不是用 Common Crawl 现成的 WET。',
+            '刻意避开基于机器学习的过滤，怕引入偏差、把网页窄化成某个子集。',
+            '模糊去重在 5-gram 上做 MinHash。',
+          ],
+        },
+        {
+          id: 'finweb',
+          name: 'FineWeb',
+          year: 2024,
+          org: 'Hugging Face',
+          tok: 15e12,
+          tokNote: '15 万亿 token',
+          size: '—',
+          kind: '95 个 Common Crawl dump',
+          method: 'URL 过滤 + 语言 ID + Gopher/C4 规则 + MinHash 去重 + PII 匿名化',
+          notes: [
+            '一开始是 RefinedWeb 的复现，后来做得更好。',
+            '语言 ID 的阈值是英语概率 > 0.65。',
+            '对邮箱和公网 IP 做匿名化（个人可识别信息，PII）。',
+          ],
+        },
+        {
+          id: 'dolma',
+          name: 'Dolma（OLMo 用）',
+          year: 2024,
+          org: 'AI2',
+          tok: 3e12,
+          tokNote: '3 万亿 token',
+          size: '11,519 GB（UTF-8 字节）',
+          kind: 'Common Crawl + The Stack + C4 + Reddit + peS2o + Gutenberg + Wikipedia',
+          method: '语言 ID 用模型，质量过滤仍用规则（Gopher / C4），有害内容用规则 + Jigsaw 分类器，Bloom filter 去重',
+          notes: [
+            'Reddit 来自 Pushshift 项目（2005–2023），提交和评论分开收；那时候还拿得到，后来被锁了。',
+            'peS2o 是 AI2 自己从 Semantic Scholar 攒的 4000 万篇学术论文。',
+            '注意它在质量过滤这一步仍然刻意避开模型过滤。',
+          ],
+          compUnit: 'Llama token 数（十亿）',
+          comp: [
+            { label: 'Common Crawl（网页）', v: 2281 },
+            { label: 'The Stack（代码）', v: 411 },
+            { label: 'C4（网页）', v: 198 },
+            { label: 'Reddit（社交媒体）', v: 89 },
+            { label: 'peS2o（STEM 论文）', v: 70 },
+            { label: 'Project Gutenberg（书）', v: 6.0 },
+            { label: 'Wikipedia / Wikibooks', v: 4.3 },
+          ],
+        },
+        {
+          id: 'dclmpool',
+          name: 'DCLM-pool',
+          year: 2024,
+          org: 'DataComp-LM',
+          tok: 240e12,
+          tokNote: '240 万亿 token（完全未过滤）',
+          size: '—',
+          kind: 'Common Crawl 全量（用 resiliparse 抽正文）',
+          method: '不过滤 —— 它是给别人做过滤实验的原料池',
+          notes: [
+            'DataComp-LM 的初衷是定义一套标准流程，让大家能在同一个池子上比不同的数据处理算法。',
+            '240 万亿 token 比任何人真正会训的量都多得多，而且大部分质量很差。',
+          ],
+        },
+        {
+          id: 'dclmbaseline',
+          name: 'DCLM-baseline',
+          year: 2024,
+          org: 'DataComp-LM',
+          tok: 3.8e12,
+          tokNote: '3.8 万亿 token',
+          size: '—',
+          kind: 'DCLM-pool 过滤而来',
+          method: '规则清洗 + Bloom filter 去重 + fastText 质量分类器',
+          notes: [
+            '分类器的正例（20 万条）：OpenHermes-2.5（主要是 GPT-4 生成的指令数据）和 ELI5（那个「像我五岁一样解释」的 subreddit）。',
+            '负例（20 万条）：RefinedWeb —— 也就是「大致就是网页本身」。',
+            '这个看起来有点怪的配方效果出奇地好，在论文的对照里胜过 PageRank 前 20%、SemDedup、AskLLM、困惑度过滤等一堆方法。',
+            '有一阵子它是开放社区里质量过滤的事实标准。',
+          ],
+        },
+        {
+          id: 'nemotron',
+          name: 'Nemotron-CC',
+          year: 2024,
+          org: 'NVIDIA',
+          tok: 6.3e12,
+          tokNote: '6.3 万亿 token（高质量子集 1.1 万亿）',
+          size: '—',
+          kind: 'Common Crawl + 合成改写',
+          method: '分类器集成 + 合成数据改写',
+          notes: [
+            '出发点：FineWeb-Edu 和 DCLM 过滤得太狠，扔掉了 90% 的数据，而我们需要更多 token。',
+            'HTML 转文本用 jusText 而不是 trafilatura，因为它留下的 token 更多。',
+            '分类器一：让 Nemotron-340B-instruct 给 FineWeb 文档的「教育价值」打分，再把它蒸馏成一个更快的模型。分类器二：直接用 DCLM 的分类器。',
+            '低质量数据交给语言模型改写，让它更像 Wikipedia；高质量数据则让语言模型据此生成任务（问答对、摘要、抽取要点等）。',
+            '这是最早大规模把合成数据用进预训练的数据集之一。',
+          ],
+        },
+        {
+          id: 'stackv2',
+          name: 'The Stack v2',
+          year: 2024,
+          org: 'BigCode',
+          tok: null,
+          tokNote: '课上没给 token 数',
+          size: '—',
+          kind: 'Software Heritage 的仓库 + GitHub Archive 的 issue/PR/评论 + 爬来的文档',
+          method: '去二进制/恶意软件/机器人活动、去重、PII 脱敏、对 PR 下采样',
+          notes: [
+            '仓库不再直接从 GitHub 拿，而是走 Software Heritage；元数据（issue、评论、PR）走 GitHub Archive。',
+            '文档来自爬取 PyPI、npm、devdocs.io 等站点。',
+            '把 Nim 这类低资源语言的源码，和它编译出来的 LLVM 中间表示配对放在一起 —— 因为 LLVM 这一层数据很多，模型能借它学到映射关系。',
+            '还塞进了一批现成数据集：GSM8K、code contests、StackOverflow、arXiv、Wikipedia、OpenWebMath。',
+          ],
+        },
+        {
+          id: 'commonpile',
+          name: 'CommonPile',
+          year: 2025,
+          org: '多机构合作',
+          tok: null,
+          tokNote: '课上没给 token 数：8 TB 数据',
+          size: '8 TB',
+          kind: '只收宽松许可 / 公有领域的数据',
+          method: '按许可证筛选（难点全在判定许可证是否可信）',
+          notes: [
+            '要回答的问题：只用宽松许可的数据，能训出多好的模型？',
+            '来源包括 Stack V2 代码、政府与法律文书（USPTO、CAP、USGPO、UK Hansard、Regulations.gov）、维基类站点、部分网页与新闻、学术论文、在线论坛、公有领域书籍、教育资源。',
+            '坑一：许可证洗白 —— 有人把受版权保护的东西随手打上 CC-BY，很难查。',
+            '坑二：集合的许可证（比如 Dolma 是 ODC-By）不会自动传递到集合里的每一份作品。',
+            '坑三：他们干脆不用任何合成数据 —— 因为生成它的语言模型本身多半训过没授权的数据，那就成了另一种洗白。',
+            '结论：能做到不错，但要真正竞争还是缺 token。',
+          ],
+        },
+      ];
+
+      const REFS = [
+        { label: 'Llama 3 训练量 15T', v: 15e12 },
+        { label: 'Qwen3 训练量 36T', v: 36e12 },
+      ];
+
+      const PAL = ['--indigo', '--madder', '--weld', '--indigo-soft', '--ink-faint'];
+
+      let sortKey: 'year' | 'size' = 'year';
+      let showRef = true;
+      let sel = 'dclmbaseline';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+      const fmtTok = (t: number) => {
+        if (t >= 1e12) return (t / 1e12).toFixed(t >= 1e13 ? 0 : 1) + 'T';
+        if (t >= 1e9) return (t / 1e9).toFixed(0) + 'B';
+        return t.toExponential(1);
+      };
+      const cssColor = (name: string) => getComputedStyle(root).getPropertyValue(name).trim() || '#888';
+
+      const LO = Math.log10(5e8); // 轴左端
+      const HI = Math.log10(3e14); // 轴右端，留出 240T 的位置
+
+      function draw() {
+        const rows = DATA.slice().sort((a, b) => {
+          if (sortKey === 'year') return a.year - b.year; // 同年保持 DATA 里的顺序（= 讲义里的讲述顺序）
+          return (b.tok ?? -1) - (a.tok ?? -1);
+        });
+
+        const RH = 21,
+          ML = 150,
+          MR = 46,
+          MT = 30,
+          MB = 26,
+          W = 620;
+        const H = MT + rows.length * RH + MB;
+        const px = (t: number) => ML + ((Math.log10(t) - LO) / (HI - LO)) * (W - ML - MR);
+
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+        svg.append(svgEl('text', { class: 'title', x: 4, y: 13 }, '横条长度 = token 量（对数刻度）·点任意一行看细节'));
+
+        // 竖网格线 + 刻度
+        for (let e = 9; e <= 14; e++) {
+          const x = px(Math.pow(10, e));
+          svg.append(svgEl('line', { class: 'grid', x1: x, y1: MT - 6, x2: x, y2: H - MB }));
+          const lbl = e === 9 ? '1B' : e === 10 ? '10B' : e === 11 ? '100B' : e === 12 ? '1T' : e === 13 ? '10T' : '100T';
+          svg.append(svgEl('text', { x, y: H - MB + 12, 'text-anchor': 'middle' }, lbl));
+        }
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: MT - 6, x2: ML, y2: H - MB }));
+
+        if (showRef) {
+          REFS.forEach((r, i) => {
+            const x = px(r.v);
+            svg.append(svgEl('line', { class: 'refline', x1: x, y1: MT - 6, x2: x, y2: H - MB }));
+            svg.append(
+              svgEl('text', { class: 'gold', x: x + 2, y: MT - 8 + i * 10, 'text-anchor': 'start' }, r.label),
+            );
+          });
+        }
+
+        rows.forEach((d, i) => {
+          const y = MT + i * RH;
+          const isSel = d.id === sel;
+          svg.append(
+            svgEl(
+              'text',
+              { class: 'name' + (isSel ? ' sel' : ''), x: ML - 6, y: y + 12, 'text-anchor': 'end' },
+              `${d.year}　${d.name}`,
+            ),
+          );
+          if (d.tok === null) {
+            svg.append(svgEl('line', { class: 'nod', x1: ML, y1: y + 9, x2: ML + 24, y2: y + 9 }));
+            svg.append(svgEl('text', { x: ML + 28, y: y + 12 }, '课上没给 token 数'));
+          } else {
+            const w = Math.max(2, px(d.tok) - ML);
+            svg.append(svgEl('rect', { class: 'bar' + (isSel ? ' sel' : ''), x: ML, y: y + 3, width: w, height: 12, rx: 2 }));
+            svg.append(svgEl('text', { class: 'val', x: ML + w + 4, y: y + 12 }, fmtTok(d.tok)));
+          }
+          const hit = svgEl('rect', { class: 'hit', x: 0, y, width: W, height: RH });
+          hit.addEventListener('click', () => {
+            sel = d.id;
+            draw();
+          });
+          svg.append(hit);
+        });
+
+        $('[data-plot]').replaceChildren(svg);
+        detail(DATA.find((d) => d.id === sel)!);
+      }
+
+      function detail(d: DS) {
+        const box = $('[data-detail]');
+        box.replaceChildren();
+
+        const h = document.createElement('h4');
+        h.textContent = d.name;
+        const sp = document.createElement('span');
+        sp.textContent = `${d.year} · ${d.org}`;
+        h.append(sp);
+        box.append(h);
+
+        const dl = document.createElement('dl');
+        const put = (k: string, v: string) => {
+          const dt = document.createElement('dt');
+          dt.textContent = k;
+          const dd = document.createElement('dd');
+          dd.textContent = v;
+          dl.append(dt, dd);
+        };
+        put('规模', d.tok === null ? d.tokNote : `${d.tokNote}${d.size !== '—' ? '，' + d.size : ''}`);
+        put('来源', d.kind);
+        put('筛选方法', d.method);
+        box.append(dl);
+
+        const ul = document.createElement('ul');
+        d.notes.forEach((n) => {
+          const li = document.createElement('li');
+          li.textContent = n;
+          ul.append(li);
+        });
+        box.append(ul);
+
+        if (d.comp) {
+          const wrap = document.createElement('div');
+          wrap.className = 'comp';
+          const cap = document.createElement('dt');
+          cap.textContent = `来源构成（${d.compUnit}）`;
+          wrap.append(cap);
+
+          const total = d.comp.reduce((s, c) => s + c.v, 0);
+          const bar = document.createElement('div');
+          bar.className = 'compbar';
+          d.comp.forEach((c, i) => {
+            const seg = document.createElement('i');
+            seg.style.width = (c.v / total) * 100 + '%';
+            seg.style.background = cssColor(PAL[i % PAL.length]);
+            seg.style.opacity = String(1 - 0.16 * Math.floor(i / PAL.length));
+            seg.title = c.label;
+            bar.append(seg);
+          });
+          wrap.append(bar);
+
+          const tb = document.createElement('table');
+          d.comp.forEach((c, i) => {
+            const tr = document.createElement('tr');
+            const t0 = document.createElement('td');
+            t0.className = 'sw';
+            const chip = document.createElement('i');
+            chip.style.background = cssColor(PAL[i % PAL.length]);
+            chip.style.opacity = String(1 - 0.16 * Math.floor(i / PAL.length));
+            t0.append(chip);
+            const t1 = document.createElement('td');
+            t1.textContent = c.label;
+            const t2 = document.createElement('td');
+            t2.className = 'v';
+            t2.textContent = c.v.toLocaleString('en-US');
+            tr.append(t0, t1, t2);
+            // 单位本身就是百分比时，再算一遍占比是多余的
+            if (!(d.compUnit || '').includes('%')) {
+              const t3 = document.createElement('td');
+              t3.className = 'v';
+              t3.textContent = ((c.v / total) * 100).toFixed(2) + '%';
+              tr.append(t3);
+            }
+            tb.append(tr);
+          });
+          wrap.append(tb);
+          box.append(wrap);
+        }
+      }
+
+      root.querySelectorAll<HTMLButtonElement>('[data-sort]').forEach((b) => {
+        b.addEventListener('click', () => {
+          sortKey = b.dataset.sort as 'year' | 'size';
+          root.querySelectorAll('[data-sort]').forEach((x) => x.classList.toggle('on', x === b));
+          draw();
+        });
+      });
+      $('[data-ref]').addEventListener('click', () => {
+        showRef = !showRef;
+        $('[data-ref]').classList.toggle('on', showRef);
+        draw();
+      });
+
+      draw();
+    });
+  }
+
+  setupL13Datasets();
+  document.addEventListener('astro:page-load', setupL13Datasets);
+</script>

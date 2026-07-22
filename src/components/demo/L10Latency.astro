@@ -1,0 +1,373 @@
+---
+// CS336 第 10 讲演示 2：Llama 2 13B 的显存、延迟、吞吐随批大小怎么变。
+// 完全照课件 compute_transformer_performance_stats() 的式子：
+//   num_params = 2·V·D + D·F·3·L + (2·D·N·H + 2·D·K·H)·L
+//   参数字节   = 2 · num_params                      （bf16）
+//   每条序列的 KV cache = S · (K·H) · L · 2 · 2      （key+value 各一份，bf16）
+//   memory  = B · kv_per_seq + 参数字节
+//   latency = memory / 显存带宽                       （推理是内存受限的）
+//   throughput = B / latency
+// 默认配置 = llama2_13b_config()：S=1024 D=5120 F=13824 N=40 K=40 H=128 L=40 V=32000
+---
+
+<div class="demo" data-demo="l10-latency">
+  <div class="row">
+    <span class="plabel">KV 头数 K：</span>
+    <button data-k="40" class="on">40（MHA，K=N）</button>
+    <button data-k="8">8（GQA 1:5）</button>
+    <button data-k="1">1（MQA）</button>
+    <span class="plabel">硬件：</span>
+    <button data-hw="h100" class="on">H100（3.35 TB/s，80 GB）</button>
+    <button data-hw="b200">B200（8 TB/s，192 GB）</button>
+  </div>
+
+  <div class="row">
+    <label class="sld">
+      批大小 B = <span data-b-val>1</span>
+      <input type="range" data-b min="0" max="10" step="1" value="0" />
+    </label>
+    <label class="sld">
+      序列长度 S = <span data-s-val>1024</span>
+      <input type="range" data-s min="9" max="14" step="1" value="10" />
+    </label>
+  </div>
+
+  <div class="two">
+    <div>
+      <canvas data-canvas width="720" height="300"></canvas>
+      <p class="axis">
+        横轴 = 批大小 B（对数）。靛蓝 = 延迟（秒/token，左轴），茜红 = 吞吐（token/秒，右轴），
+        两轴都是对数。灰色阴影 = 显存装不下的区域。竖直虚线是当前的 B。
+      </p>
+    </div>
+    <div>
+      <table><tbody data-stats></tbody></table>
+      <p class="hint" data-hint></p>
+    </div>
+  </div>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1.1rem;
+    margin-bottom: 0.7rem;
+  }
+  .plabel {
+    font-size: 0.8rem;
+    color: var(--ink-faint);
+  }
+  button {
+    font: inherit;
+    font-size: 0.79rem;
+    padding: 0.22rem 0.6rem;
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    background: var(--bg-raised);
+    color: var(--ink-muted);
+    cursor: pointer;
+    transition: all 0.15s var(--ease);
+  }
+  button.on {
+    border-color: var(--indigo);
+    color: var(--indigo);
+    font-weight: 600;
+  }
+  .sld {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.83rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .sld input[type='range'] {
+    width: 150px;
+    accent-color: var(--indigo);
+  }
+  .two {
+    display: grid;
+    gap: 1.2rem;
+    align-items: start;
+  }
+  @media (min-width: 860px) {
+    .two {
+      grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+    }
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .axis {
+    margin: 0.45rem 0 0;
+    font-size: 0.76rem;
+    color: var(--ink-faint);
+    line-height: 1.7;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.81rem;
+    font-variant-numeric: tabular-nums;
+  }
+  table :global(td) {
+    padding: 0.28rem 0.4rem;
+    color: var(--ink-muted);
+    border-bottom: 1px solid var(--rule);
+  }
+  table :global(td.k) {
+    color: var(--ink-faint);
+  }
+  table :global(td.v) {
+    text-align: right;
+    font-family: var(--font-mono);
+    color: var(--ink);
+  }
+  table :global(tr.hi td.v) {
+    color: var(--indigo);
+    font-weight: 700;
+  }
+  table :global(tr.oom td.v) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+  .hint {
+    margin: 0.9rem 0 0;
+    font-size: 0.83rem;
+    line-height: 1.8;
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupL10Latency() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l10-latency"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const cv = $<HTMLCanvasElement>('[data-canvas]');
+      const ctx = cv.getContext('2d')!;
+      const css = (n: string) =>
+        getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+      const D = 5120,
+        F = 13824,
+        N = 40,
+        Hd = 128,
+        L = 40,
+        V = 32000;
+      const HW: Record<string, { name: string; bw: number; cap: number }> = {
+        h100: { name: 'H100', bw: 3.35e12, cap: 80e9 },
+        b200: { name: 'B200', bw: 8e12, cap: 192e9 },
+      };
+      let K = 40;
+      let hw = 'h100';
+
+      const numParams = (k: number) =>
+        2 * V * D + D * F * 3 * L + (2 * D * N * Hd + 2 * D * k * Hd) * L;
+      const kvPerSeq = (k: number, S: number) => S * (k * Hd) * L * 2 * 2;
+
+      const fmtG = (x: number) => (x / 1e9).toFixed(2) + ' GB';
+
+      function draw() {
+        const B = Math.pow(2, parseInt($<HTMLInputElement>('[data-b]').value, 10));
+        const S = Math.pow(2, parseInt($<HTMLInputElement>('[data-s]').value, 10));
+        $('[data-b-val]').textContent = String(B);
+        $('[data-s-val]').textContent = String(S);
+
+        const bw = HW[hw].bw;
+        const cap = HW[hw].cap;
+        const np = numParams(K);
+        const pbytes = 2 * np;
+        const kv = kvPerSeq(K, S);
+        const memOf = (b: number) => b * kv + pbytes;
+        const latOf = (b: number) => memOf(b) / bw;
+        const tpOf = (b: number) => b / latOf(b);
+
+        const indigo = css('--indigo');
+        const madder = css('--madder');
+        const rule = css('--rule');
+        const faint = css('--ink-faint');
+
+        const padL = 50,
+          padR = 52,
+          padT = 12,
+          padB = 26;
+        const W = cv.width - padL - padR;
+        const Hh = cv.height - padT - padB;
+        const xOf = (b: number) => padL + (Math.log2(b) / 10) * W;
+        // 左轴：延迟 1e-3 .. 1e0
+        const yL = (v: number) =>
+          padT + Hh - ((Math.log10(v) - -3) / 3) * Hh;
+        // 右轴：吞吐 1e1 .. 1e5
+        const yR = (v: number) => padT + Hh - ((Math.log10(v) - 1) / 4) * Hh;
+
+        ctx.clearRect(0, 0, cv.width, cv.height);
+        ctx.font = '11px ui-monospace, monospace';
+        ctx.textBaseline = 'middle';
+
+        // 显存超限区域
+        let bOom = Infinity;
+        for (let k = 0; k <= 10; k++) {
+          if (memOf(Math.pow(2, k)) > cap) {
+            bOom = Math.pow(2, k);
+            break;
+          }
+        }
+        if (bOom <= 1024) {
+          ctx.fillStyle = faint;
+          ctx.globalAlpha = 0.13;
+          ctx.fillRect(xOf(bOom), padT, padL + W - xOf(bOom), Hh);
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = faint;
+          ctx.textAlign = 'left';
+          ctx.fillText(`装不下（>${(cap / 1e9).toFixed(0)} GB）`, xOf(bOom) + 4, padT + 10);
+        }
+
+        ctx.strokeStyle = rule;
+        ctx.lineWidth = 1;
+        ctx.fillStyle = faint;
+        for (let e = -3; e <= 0; e++) {
+          const y = yL(Math.pow(10, e));
+          ctx.beginPath();
+          ctx.moveTo(padL, y + 0.5);
+          ctx.lineTo(padL + W, y + 0.5);
+          ctx.stroke();
+          ctx.textAlign = 'right';
+          ctx.fillText(`1e${e}`, padL - 5, y);
+        }
+        for (let e = 1; e <= 5; e++) {
+          ctx.textAlign = 'left';
+          ctx.fillText(`1e${e}`, padL + W + 5, yR(Math.pow(10, e)));
+        }
+        ctx.textAlign = 'center';
+        for (let k = 0; k <= 10; k += 2) {
+          ctx.fillText(String(Math.pow(2, k)), xOf(Math.pow(2, k)), padT + Hh + 12);
+        }
+
+        const curve = (fn: (b: number) => number, map: (v: number) => number, color: string) => {
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2.2;
+          ctx.beginPath();
+          for (let i = 0; i <= 200; i++) {
+            const b = Math.pow(2, (i / 200) * 10);
+            const x = xOf(b);
+            const y = map(fn(b));
+            i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+        };
+        curve(latOf, yL, indigo);
+        curve(tpOf, yR, madder);
+
+        ctx.strokeStyle = faint;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.moveTo(xOf(B), padT);
+        ctx.lineTo(xOf(B), padT + Hh);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = indigo;
+        ctx.beginPath();
+        ctx.arc(xOf(B), yL(latOf(B)), 4, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = madder;
+        ctx.beginPath();
+        ctx.arc(xOf(B), yR(tpOf(B)), 4, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.fillStyle = indigo;
+        ctx.textAlign = 'left';
+        ctx.fillText('延迟 秒/token', padL + 6, padT + Hh - 8);
+        ctx.fillStyle = madder;
+        ctx.fillText('吞吐 token/秒', padL + 6, padT + Hh - 22);
+
+        const mem = memOf(B);
+        const lat = latOf(B);
+        const tp = tpOf(B);
+        const rows: [string, string, string][] = [
+          ['参数量', (np / 1e9).toFixed(2) + ' B', ''],
+          ['参数占用（bf16）', fmtG(pbytes), ''],
+          ['每条序列的 KV cache', (kv / 1e6).toFixed(1) + ' MB', ''],
+          [`B = ${B} 条序列的 KV cache`, fmtG(B * kv), ''],
+          ['总显存', fmtG(mem), mem > cap ? 'oom' : ''],
+          [`${HW[hw].name} 显存上限`, (cap / 1e9).toFixed(0) + ' GB', ''],
+          ['延迟', lat.toFixed(5) + ' 秒/token', 'hi'],
+          ['吞吐', tp.toFixed(0) + ' token/秒', 'hi'],
+        ];
+        const tb = $('[data-stats]');
+        tb.replaceChildren();
+        for (const [k, v, cls] of rows) {
+          const tr = document.createElement('tr');
+          if (cls) tr.className = cls;
+          const a = document.createElement('td');
+          a.className = 'k';
+          a.textContent = k;
+          const b = document.createElement('td');
+          b.className = 'v';
+          b.textContent = v;
+          tr.append(a, b);
+          tb.append(tr);
+        }
+
+        let hint: string;
+        if (mem > cap) {
+          hint =
+            `装不下：${fmtG(mem)} 超过了 ${(cap / 1e9).toFixed(0)} GB。` +
+            `注意超出来的几乎全是 KV cache（${fmtG(B * kv)}），参数才 ${fmtG(pbytes)}。` +
+            `把 K 调成 8 试试 —— KV cache 直接砍成五分之一，同样的 B 就塞进去了。`;
+        } else if (B * kv > pbytes) {
+          hint =
+            `注意此刻 KV cache（${fmtG(B * kv)}）已经**超过了参数本身**（${fmtG(pbytes)}）。` +
+            `这就是为什么后面所有的招数都在打 KV cache 的主意，而不是打参数的主意。`;
+        } else {
+          hint =
+            `B = ${B} 时 KV cache 只有 ${fmtG(B * kv)}，参数 ${fmtG(pbytes)} 是大头，` +
+            `所以延迟几乎不随 B 变；而吞吐随 B 近似线性上涨 —— 参数只读一遍，摊给了 ${B} 条序列。` +
+            `继续往右拖，等 KV cache 追上参数，延迟就开始明显变差了。`;
+        }
+        $('[data-hint]').textContent = hint;
+      }
+
+      root.querySelectorAll<HTMLButtonElement>('[data-k]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          K = parseInt(btn.dataset.k!, 10);
+          root.querySelectorAll('[data-k]').forEach((b) => b.classList.toggle('on', b === btn));
+          draw();
+        });
+      });
+      root.querySelectorAll<HTMLButtonElement>('[data-hw]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          hw = btn.dataset.hw!;
+          root.querySelectorAll('[data-hw]').forEach((b) => b.classList.toggle('on', b === btn));
+          draw();
+        });
+      });
+      root.querySelectorAll('input').forEach((el) => el.addEventListener('input', draw));
+      new MutationObserver(draw).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-theme'],
+      });
+      draw();
+    });
+  }
+
+  setupL10Latency();
+  document.addEventListener('astro:page-load', setupL10Latency);
+</script>

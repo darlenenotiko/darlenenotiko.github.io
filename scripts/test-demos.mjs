@@ -102,6 +102,30 @@ for (const lec of lectures) {
     continue;
   }
 
+  // 拖一下每个滑块 / 勾一下每个复选框，控件本身必须还留在文档里。
+  // 有的组件在 input 事件里 replaceChildren 重建整块 DOM，把控件自己也换掉了 ——
+  // 表现是「拖到一半失去焦点、根本拖不动」，只看初始渲染发现不了。
+  for (const ctl of doc.querySelectorAll('[data-demo] input[type="range"], [data-demo] input[type="checkbox"]')) {
+    const demo = ctl.closest('[data-demo]').dataset.demo;
+    try {
+      if (ctl.type === 'range') {
+        const min = Number(ctl.min || 0);
+        const max = Number(ctl.max || 100);
+        ctl.value = String(min + Math.round((max - min) * 0.7));
+      } else {
+        ctl.checked = !ctl.checked;
+      }
+      ctl.dispatchEvent(new window.Event('input', { bubbles: true }));
+      ctl.dispatchEvent(new window.Event('change', { bubbles: true }));
+    } catch (e) {
+      fail(`${lec} 的 ${demo} 控件事件抛错: ${e.message}`);
+      continue;
+    }
+    if (!doc.contains(ctl)) {
+      fail(`${lec} 的 ${demo}：交互后控件自己被重建掉了（拖不动的那种 bug）`);
+    }
+  }
+
   const empty = demos.filter((d) => d.textContent.trim().length < 20);
   if (empty.length) {
     for (const d of empty) fail(`${lec} 的 [data-demo="${d.dataset.demo}"] 初始化后是空的`);

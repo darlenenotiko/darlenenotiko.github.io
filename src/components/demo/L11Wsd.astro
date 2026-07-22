@@ -1,0 +1,403 @@
+---
+// WSD（warmup–stable–decay）学习率调度 vs 余弦调度，以及它对「拟合一条数据 scaling law」的成本影响。
+// 左图画调度曲线本身：余弦必须在开跑前就知道总长度，所以每个训练长度都是一条独立的曲线；
+// WSD 共享同一段 stable 相位，只在不同的分叉点各衰减一次。
+// 右图/表把成本算出来：余弦要重训 k 次（Σ Tᵢ），WSD 只要跑满一次 + k 段衰减（T_max + f·Σ Tᵢ）。
+// 所有数字都是当场按公式算的，没有写死。
+---
+
+<div class="demo" data-demo="l11-wsd">
+  <div class="ctrl">
+    <label>最长的那次跑（步数） <input type="range" data-total min="4000" max="24000" step="1000" value="12000" /></label>
+    <span class="val" data-total-v></span>
+  </div>
+  <div class="ctrl">
+    <label>衰减相位占比 f <input type="range" data-decay min="5" max="30" step="1" value="10" /></label>
+    <span class="val" data-decay-v></span>
+    <label>末端 LR / 峰值 LR <input type="range" data-floor min="0" max="30" step="1" value="10" /></label>
+    <span class="val" data-floor-v></span>
+  </div>
+  <div class="ctrl">
+    <label>要在数据轴上取几个点 k <input type="range" data-k min="2" max="10" step="1" value="6" /></label>
+    <span class="val" data-k-v></span>
+    <label>warmup 步数（固定，不随训练长度变） <input type="range" data-warm min="0" max="3000" step="200" value="2000" /></label>
+    <span class="val" data-warm-v></span>
+  </div>
+
+  <div class="two">
+    <div class="plot" data-plot-cos></div>
+    <div class="plot" data-plot-wsd></div>
+  </div>
+
+  <p class="formula" data-formula></p>
+
+  <table class="out" data-out>
+    <thead>
+      <tr>
+        <th>第 i 个数据点</th><th>训练长度 Tᵢ</th><th>余弦：从头训</th><th>WSD：只补衰减</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.5rem;
+  }
+  .ctrl label {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+  }
+  .ctrl input[type='range'] {
+    width: 140px;
+    accent-color: var(--indigo);
+  }
+  .val {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--madder);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .two {
+    display: grid;
+    gap: 0.8rem;
+    margin-top: 0.8rem;
+  }
+  @media (min-width: 700px) {
+    .two {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  .plot {
+    overflow-x: auto;
+  }
+  .plot :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 300px;
+    height: auto;
+  }
+  .plot :global(.axis) {
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .plot :global(.grid) {
+    stroke: var(--rule);
+    stroke-width: 0.6;
+    stroke-dasharray: 2 3;
+  }
+  .plot :global(.cos) {
+    fill: none;
+    stroke: var(--madder);
+    stroke-width: 1.4;
+  }
+  .plot :global(.stable) {
+    fill: none;
+    stroke: var(--indigo);
+    stroke-width: 2;
+  }
+  .plot :global(.branch) {
+    fill: none;
+    stroke: var(--weld);
+    stroke-width: 1.5;
+  }
+  .plot :global(.mark) {
+    fill: var(--weld);
+  }
+  .plot :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 9px;
+  }
+  .plot :global(text.title) {
+    fill: var(--indigo);
+    font-size: 10.5px;
+    font-weight: 700;
+  }
+  .plot :global(text.note) {
+    fill: var(--madder);
+    font-size: 9px;
+  }
+
+  .formula {
+    margin: 0.9rem 0 0.2rem;
+    padding: 0.5rem 0.7rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.85;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+  }
+
+  .out {
+    width: 100%;
+    margin-top: 0.9rem;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+  }
+  .out :global(th) {
+    padding: 0.25rem 0.35rem;
+    text-align: right;
+    font-weight: 400;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(th:first-child) {
+    text-align: left;
+  }
+  .out :global(td) {
+    padding: 0.25rem 0.35rem;
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(td:first-child) {
+    text-align: left;
+  }
+  .out :global(tr.sum td) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL11Wsd() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l11-wsd"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+
+      const W = 340,
+        H = 230,
+        ML = 40,
+        MR = 12,
+        MT = 24,
+        MB = 32;
+
+      const fmtK = (x: number) => (x >= 1000 ? (x / 1000).toFixed(1) + 'k' : x.toFixed(0));
+
+      function draw() {
+        const total = parseInt($<HTMLInputElement>('[data-total]').value, 10);
+        const f = parseInt($<HTMLInputElement>('[data-decay]').value, 10) / 100;
+        const floor = parseInt($<HTMLInputElement>('[data-floor]').value, 10) / 100;
+        const k = parseInt($<HTMLInputElement>('[data-k]').value, 10);
+        const warm = parseInt($<HTMLInputElement>('[data-warm]').value, 10);
+
+        $('[data-total-v]').textContent = `${fmtK(total)} 步`;
+        $('[data-decay-v]').textContent = `f = ${(f * 100).toFixed(0)}%`;
+        $('[data-floor-v]').textContent = `${(floor * 100).toFixed(0)}%`;
+        $('[data-k-v]').textContent = `k = ${k}`;
+        $('[data-warm-v]').textContent = `${fmtK(warm)} 步`;
+
+        // 数据轴上的 k 个训练长度：均匀铺在 (1/k)·total … total 上
+        const Ts: number[] = [];
+        for (let i = 1; i <= k; i++) Ts.push(Math.round((i / k) * total));
+
+        const xmax = total * 1.04;
+        const px = (t: number) => ML + (t / xmax) * (W - ML - MR);
+        const py = (lr: number) => H - MB - lr * (H - MT - MB);
+
+        function frame(svg: SVGElement, title: string) {
+          for (let i = 0; i <= 4; i++) {
+            const t = (i / 4) * xmax;
+            const x = px(t);
+            svg.append(svgEl('line', { class: 'grid', x1: x, y1: MT, x2: x, y2: H - MB }));
+            svg.append(svgEl('text', { x, y: H - MB + 12, 'text-anchor': 'middle' }, fmtK(t)));
+          }
+          for (let i = 0; i <= 2; i++) {
+            const v = i / 2;
+            const y = py(v);
+            svg.append(svgEl('line', { class: 'grid', x1: ML, y1: y, x2: W - MR, y2: y }));
+            svg.append(
+              svgEl('text', { x: ML - 4, y: y + 3, 'text-anchor': 'end' }, v.toFixed(1)),
+            );
+          }
+          svg.append(svgEl('line', { class: 'axis', x1: ML, y1: H - MB, x2: W - MR, y2: H - MB }));
+          svg.append(svgEl('line', { class: 'axis', x1: ML, y1: MT, x2: ML, y2: H - MB }));
+          svg.append(svgEl('text', { class: 'title', x: ML, y: 14 }, title));
+          svg.append(
+            svgEl('text', { x: (ML + W - MR) / 2, y: H - 3, 'text-anchor': 'middle' }, '训练步数'),
+          );
+          svg.append(
+            svgEl(
+              'text',
+              {
+                x: 9,
+                y: (MT + H - MB) / 2,
+                'text-anchor': 'middle',
+                transform: `rotate(-90 9 ${(MT + H - MB) / 2})`,
+              },
+              'LR / 峰值 LR',
+            ),
+          );
+        }
+
+        // ── 左图：余弦。每个训练长度一条完全不同的曲线 ──
+        {
+          const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+          frame(svg, '余弦：k 条互不相容的曲线');
+          Ts.forEach((T, i) => {
+            const pts: string[] = [];
+            const steps = 120;
+            for (let s = 0; s <= steps; s++) {
+              const t = (s / steps) * T;
+              let lr: number;
+              if (t < warm) lr = warm === 0 ? 1 : t / warm;
+              else {
+                const u = (t - warm) / Math.max(T - warm, 1);
+                lr = floor + (1 - floor) * 0.5 * (1 + Math.cos(Math.PI * u));
+              }
+              pts.push(`${px(t)},${py(lr)}`);
+            }
+            const op = 0.3 + (0.7 * (i + 1)) / k;
+            svg.append(
+              svgEl('polyline', { class: 'cos', 'stroke-opacity': op.toFixed(2), points: pts.join(' ') }),
+            );
+          });
+          svg.append(
+            svgEl(
+              'text',
+              { class: 'note', x: W - MR - 2, y: MT + 10, 'text-anchor': 'end' },
+              '每条都得从头训',
+            ),
+          );
+          $('[data-plot-cos]').replaceChildren(svg);
+        }
+
+        // ── 右图：WSD。一条共享的 stable 相位 + k 个衰减分叉 ──
+        {
+          const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+          frame(svg, 'WSD：一条主干 + k 段衰减');
+
+          // 主干：warmup + stable，一直画到最长那次跑的衰减起点
+          const trunkEnd = total - f * total;
+          const trunk: string[] = [];
+          for (let s = 0; s <= 120; s++) {
+            const t = (s / 120) * trunkEnd;
+            const lr = t < warm ? (warm === 0 ? 1 : t / warm) : 1;
+            trunk.push(`${px(t)},${py(lr)}`);
+          }
+          svg.append(svgEl('polyline', { class: 'stable', points: trunk.join(' ') }));
+
+          // 每个训练长度：从 Tᵢ(1-f) 处分叉，线性衰减到 floor
+          Ts.forEach((T) => {
+            const b = T - f * T;
+            const pts: string[] = [];
+            for (let s = 0; s <= 24; s++) {
+              const t = b + (s / 24) * (T - b);
+              const u = (t - b) / Math.max(T - b, 1);
+              pts.push(`${px(t)},${py(1 - (1 - floor) * u)}`);
+            }
+            svg.append(svgEl('polyline', { class: 'branch', points: pts.join(' ') }));
+            svg.append(svgEl('circle', { class: 'mark', cx: px(b), cy: py(1), r: 2.4 }));
+          });
+          svg.append(
+            svgEl(
+              'text',
+              { class: 'note', x: W - MR - 2, y: MT + 10, 'text-anchor': 'end' },
+              '黄点 = 回滚到的检查点',
+            ),
+          );
+          $('[data-plot-wsd]').replaceChildren(svg);
+        }
+
+        // ── 成本 ──
+        const cosCost = Ts.reduce((a, b) => a + b, 0);
+        const wsdCost = total + f * cosCost;
+        const ratio = cosCost / wsdCost;
+
+        $('[data-formula]').textContent =
+          `余弦：k 个数据点 = k 次独立的从头训练，总成本 Σᵢ Tᵢ = ${fmtK(cosCost)} 步\n` +
+          `　　　（Tᵢ 均匀取在 total/k … total 上，所以 Σᵢ Tᵢ = total·(k+1)/2 = ${fmtK(total)}×${((k + 1) / 2).toFixed(1)}）\n` +
+          `WSD ：跑满一次主干 total，再对每个 Tᵢ 补一段长 f·Tᵢ 的衰减\n` +
+          `　　　总成本 total + f·Σᵢ Tᵢ = ${fmtK(total)} + ${(f * 100).toFixed(0)}%×${fmtK(cosCost)} = ${fmtK(wsdCost)} 步\n` +
+          `省下的倍数 = ${cosCost} / ${Math.round(wsdCost)} = ${ratio.toFixed(2)}×`;
+
+        const tb = $('[data-out] tbody');
+        tb.replaceChildren();
+        Ts.forEach((T, i) => {
+          const tr = document.createElement('tr');
+          [`#${i + 1}`, fmtK(T), fmtK(T), fmtK(f * T)].forEach((t) => {
+            const td = document.createElement('td');
+            td.textContent = t;
+            tr.append(td);
+          });
+          tb.append(tr);
+        });
+        const tr = document.createElement('tr');
+        tr.className = 'sum';
+        ['合计', '—', fmtK(cosCost), `${fmtK(total)} + ${fmtK(f * cosCost)} = ${fmtK(wsdCost)}`].forEach(
+          (t) => {
+            const td = document.createElement('td');
+            td.textContent = t;
+            tr.append(td);
+          },
+        );
+        tb.append(tr);
+
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        const s = document.createElement('strong');
+        s.textContent = `${ratio.toFixed(2)}×`;
+        v.append(
+          document.createTextNode('当前设置下，WSD 比余弦省 '),
+          s,
+          document.createTextNode(
+            `。把 k 从 2 拖到 10 看看：余弦的成本按 (k+1)/2 线性往上爬（这就是 Tatsu 说的「从 n 变成 n²」——` +
+              `每多一个数据点就多一次完整训练），而 WSD 的主干成本是固定的，只多付 ${(f * 100).toFixed(0)}% 的衰减。` +
+              `k 越大、f 越小，省得越多。左图请注意：余弦曲线在同一个训练步上取值都不一样，` +
+              `所以你根本没法把一次短跑的检查点接着往下训。`,
+          ),
+        );
+      }
+
+      root.querySelectorAll('input').forEach((el) => el.addEventListener('input', draw));
+      draw();
+    });
+  }
+
+  setupL11Wsd();
+  document.addEventListener('astro:page-load', setupL11Wsd);
+</script>

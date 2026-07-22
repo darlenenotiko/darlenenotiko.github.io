@@ -1,0 +1,412 @@
+---
+// 合理使用（fair use）四要素判定器。
+// 场景全部取自课上举的例子，每个要素的倾向和理由也照课上的说法写。
+// 这是课程内容的复述，不是法律意见。
+---
+
+<div class="demo" data-demo="l13-fairuse">
+  <div class="ctrl">
+    <span class="tag">场景（都是课上举的）</span>
+  </div>
+  <div class="cases" data-cases></div>
+
+  <div class="factors" data-factors></div>
+
+  <div class="meter">
+    <div class="bar"><i data-bar></i></div>
+    <p class="verdict" data-verdict></p>
+  </div>
+
+  <p class="outcome" data-outcome></p>
+
+  <p class="disclaim">
+    这四要素没有一条是硬性规则，全都只是「倾向」，真打起官司要由法院综合权衡 ——
+    所以上面这个格子可以自己点着改。本演示复述的是课上讲的内容，不构成法律意见。
+  </p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    margin-bottom: 0.45rem;
+  }
+  .tag {
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .cases {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-bottom: 0.9rem;
+  }
+  .cases :global(button) {
+    padding: 0.24rem 0.6rem;
+    font: inherit;
+    font-size: 0.76rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .cases :global(button:hover) {
+    color: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .cases :global(button.on) {
+    color: var(--bg);
+    background: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .cases :global(button.on:hover) {
+    color: var(--bg);
+  }
+
+  .factors :global(.f) {
+    padding: 0.5rem 0;
+    border-top: 1px solid var(--rule);
+  }
+  .factors :global(.fh) {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.2rem;
+  }
+  .factors :global(.fn) {
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--ink);
+  }
+  .factors :global(.seg) {
+    display: flex;
+    gap: 2px;
+    margin-left: auto;
+  }
+  .factors :global(.seg button) {
+    padding: 0.12rem 0.45rem;
+    font: inherit;
+    font-size: 0.72rem;
+    color: var(--ink-faint);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    cursor: pointer;
+  }
+  .factors :global(.seg button:first-child) {
+    border-radius: 4px 0 0 4px;
+  }
+  .factors :global(.seg button:last-child) {
+    border-radius: 0 4px 4px 0;
+  }
+  .factors :global(.seg button.on.pos) {
+    color: var(--bg);
+    background: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .factors :global(.seg button.on.mid) {
+    color: var(--bg);
+    background: var(--ink-faint);
+    border-color: var(--ink-faint);
+  }
+  .factors :global(.seg button.on.neg) {
+    color: var(--bg);
+    background: var(--madder);
+    border-color: var(--madder);
+  }
+  .factors :global(.rule) {
+    font-size: 0.76rem;
+    color: var(--ink-faint);
+  }
+  .factors :global(.why) {
+    margin: 0.15rem 0 0;
+    font-size: 0.82rem;
+    line-height: 1.7;
+    color: var(--ink-muted);
+  }
+
+  .meter {
+    margin-top: 1rem;
+    padding-top: 0.7rem;
+    border-top: 1px solid var(--rule);
+  }
+  .bar {
+    position: relative;
+    height: 12px;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    overflow: hidden;
+  }
+  .bar :global(i) {
+    position: absolute;
+    top: 0;
+    height: 100%;
+    transition: all 0.25s var(--ease);
+  }
+  .verdict {
+    margin: 0.5rem 0 0;
+    font-size: 0.88rem;
+    line-height: 1.7;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--indigo);
+  }
+  .outcome {
+    margin: 0.7rem 0 0;
+    padding: 0.5rem 0.7rem;
+    font-size: 0.82rem;
+    line-height: 1.7;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .outcome :global(strong) {
+    color: var(--weld);
+  }
+  .disclaim {
+    margin: 0.8rem 0 0;
+    font-size: 0.76rem;
+    line-height: 1.65;
+    color: var(--ink-faint);
+  }
+</style>
+
+<script>
+  function setupL13FairUse() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l13-fairuse"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+
+      const FACTORS = [
+        { n: '一、使用的目的与性质', r: '教育用途优于商业用途；转化性使用优于原样复制' },
+        { n: '二、被使用作品的性质', r: '事实性作品优于虚构作品；非创造性优于创造性' },
+        { n: '三、使用了多少、用的是不是核心', r: '只用片段优于用整部作品' },
+        { n: '四、对原作（现有或潜在）市场的影响', r: '这一条最贴近版权立法的初衷：对齐经济激励' },
+      ];
+
+      type Case = { id: string; label: string; f: number[]; why: string[]; out: string };
+      const CASES: Case[] = [
+        {
+          id: 'summary',
+          label: '看完一部电影，写一篇摘要',
+          f: [1, -1, 1, 1],
+          why: [
+            '你产出的是自己的评述，不是把电影重放一遍 —— 转化性很强。',
+            '电影是虚构的创造性作品，这一条对你不利。',
+            '摘要只用到极小一部分，而且用的是情节这个层面，不是具体镜头。',
+            '看了摘要的人该看电影还是会看，不构成替代品。',
+          ],
+          out: '课上直接把它列为合理使用的标准例子。',
+        },
+        {
+          id: 'quicksort',
+          label: '照着思路重新实现快速排序',
+          f: [1, 1, 1, 0],
+          why: [
+            '你实现的是「思想」（算法），不是「表达」（那段具体代码）。',
+            '版权保护表达不保护思想 —— 快速排序这个算法本身根本不可版权。',
+            '你没有抄任何一行具体表达。',
+            '课上没有展开这一条。',
+          ],
+          out: '课上举的另一个标准例子：可以重新实现一个算法，但不能照抄代码。',
+        },
+        {
+          id: 'googlebooks',
+          label: 'Google Books：索引整本书、只展示片段',
+          f: [1, -1, 0, 1],
+          why: [
+            '建索引、提供检索是典型的转化性使用 —— 它做的事和原书做的事不一样。',
+            '被索引的书里有大量受版权保护的虚构作品。',
+            '为了建索引，整本书都被复制了；但对外只展示片段。这一条两头拉扯。',
+            '法院最终认为片段不构成原书的替代品。',
+          ],
+          out: '<strong>Authors Guild v. Google</strong>：2002 年打到 2013 年，整整 11 年，最后判 Google 胜。这就是今天你还能在 Google Books 里看到片段的原因，也为后来讨论「语言模型训练算不算合理使用」立下了先例。',
+        },
+        {
+          id: 'parody',
+          label: '戏仿（parody）：模仿一部作品来取笑它',
+          f: [1, -1, 0, 1],
+          why: [
+            '戏仿是在评论原作，转化性很强 —— 这是它区别于普通改编的地方。',
+            '被戏仿的通常正是创造性作品。',
+            '要让人认出你在戏仿谁，往往必须用到相当多的原作元素。',
+            '戏仿一般不会替代原作的市场，看戏仿的人不会因此不看原作。',
+          ],
+          out: '课上的说法是：戏仿「很可能」属于合理使用 —— 哪怕它看起来像个衍生作品。',
+        },
+        {
+          id: 'rehost',
+          label: '把一份一模一样的拷贝重新挂到网上',
+          f: [-1, 0, -1, -1],
+          why: [
+            '完全没有转化，你就是在重新托管别人的东西。',
+            '取决于原作是什么，但对结论影响不大。',
+            '用的是整部作品。',
+            '直接替代原作 —— 别人来你这儿看，就不去原处了。',
+          ],
+          out: '课上用它当反面对照：语言模型训练之所以「感觉不一样」，正是因为它显然不是这件事。',
+        },
+        {
+          id: 'pirate',
+          label: '从影子图书馆下几百万本书（哪怕不训练）',
+          f: [-1, 0, -1, -1],
+          why: [
+            '复制本身就是「copyright」这个词里的那个 copy —— 训练的第一步就已经可能构成侵权了。',
+            '书籍作者真要上法庭，比一个普通网站主更容易证明自己的权利。',
+            '拿的是整本书。',
+            '盗版直接冲击销售市场。',
+          ],
+          out: '<strong>Bartz、Graeber 等 v. Anthropic（2024）</strong>：2025 年的简易判决认定「在原告作品上训练」属于合理使用，<strong>但盗版拷贝不是</strong>，哪怕你拿到之后什么都不做。最终 Anthropic 付了 15 亿美元和解 —— 按书本数摊算，大约每本 3000 美元。',
+        },
+        {
+          id: 'scan',
+          label: '买书、拆掉装订、扫描成数字版自用',
+          f: [1, 0, -1, 1],
+          why: [
+            '格式转换、自己用，法院认为这是可以的。',
+            '取决于书本身。',
+            '扫的是整本。',
+            '你已经付过钱了，没有从作者那里抢走任何市场。',
+          ],
+          out: 'Anthropic 其实也买了书并扫描数字化，<strong>法院认定这一部分同样是合理使用</strong> —— 但这洗不掉之前盗版的账。用课上的话说：你不能先盗版，再补一句「刚才那个不算」。',
+        },
+        {
+          id: 'train',
+          label: '在受版权保护的语料上训练语言模型',
+          f: [1, 0, -1, -1],
+          why: [
+            '训练直观上带有转化性 —— 它显然不等同于把别人的作品重新托管一遍。模型学的是「一般性的想法」和世界怎么运作，数据是手段而不是目的。',
+            '语料包罗万象，事实性的和创造性的都有。',
+            '训练的第一步是把整份作品复制进来，这一条不好看。',
+            '语言模型确实可能冲击作家、艺术家的市场 —— 而且这一点和版权本身无关，它就是会发生。',
+          ],
+          out: '<strong>Bartz 等 v. Anthropic</strong> 和 <strong>Kadrey、Silverman 等 v. Meta</strong> 的 2025 年简易判决都认定「这一次的训练」属于合理使用。但判得很窄 —— 只能说这几个具体案子里没被判为「不是合理使用」，不能推广成「在任何受版权内容上训练都是合理使用」。（Meta 案里的种子下载书籍那部分指控仍未了结。）',
+        },
+        {
+          id: 'verbatim',
+          label: '把模型 prompt 到几乎逐字吐出报纸文章',
+          f: [-1, -1, -1, -1],
+          why: [
+            '输出就是原文，谈不上转化。',
+            '新闻报道虽然偏事实，但写出来的那篇文章仍然是受保护的表达。',
+            '几乎是整篇。',
+            '读者拿这个看就不去订阅了，直接替代原作市场。',
+          ],
+          out: '<strong>纽约时报 v. OpenAI（2023）</strong> 的核心指控就是这个：他们证明可以把 ChatGPT prompt 到几乎逐字生成一篇报道。这个案子到讲课时仍未了结。',
+        },
+      ];
+
+      let cur = 0;
+      let f = CASES[0].f.slice();
+      let custom = false;
+
+      const casesWrap = $('[data-cases]');
+      CASES.forEach((c, i) => {
+        const b = document.createElement('button');
+        b.textContent = c.label;
+        b.addEventListener('click', () => {
+          cur = i;
+          f = CASES[i].f.slice();
+          custom = false;
+          casesWrap.querySelectorAll('button').forEach((x, j) => x.classList.toggle('on', j === i));
+          render();
+        });
+        casesWrap.append(b);
+      });
+      casesWrap.querySelectorAll('button')[0].classList.add('on');
+
+      function render() {
+        const c = CASES[cur];
+        const box = $('[data-factors]');
+        box.replaceChildren();
+
+        FACTORS.forEach((F, i) => {
+          const d = document.createElement('div');
+          d.className = 'f';
+          const h = document.createElement('div');
+          h.className = 'fh';
+          const n = document.createElement('span');
+          n.className = 'fn';
+          n.textContent = F.n;
+          const r = document.createElement('span');
+          r.className = 'rule';
+          r.textContent = F.r;
+          const seg = document.createElement('span');
+          seg.className = 'seg';
+          const opts: [number, string, string][] = [
+            [1, '偏合理使用', 'pos'],
+            [0, '中间 / 两头拉扯', 'mid'],
+            [-1, '偏不利', 'neg'],
+          ];
+          opts.forEach(([v, lbl, cls]) => {
+            const b = document.createElement('button');
+            b.textContent = lbl;
+            b.className = cls + (f[i] === v ? ' on' : '');
+            b.addEventListener('click', () => {
+              f[i] = v;
+              custom = true;
+              render();
+            });
+            seg.append(b);
+          });
+          h.append(n, r, seg);
+
+          const w = document.createElement('p');
+          w.className = 'why';
+          w.textContent = c.why[i];
+          d.append(h, w);
+          box.append(d);
+        });
+
+        // 汇总条：把四个倾向摆在 −4 … +4 这条线上
+        const score = f.reduce((a, b) => a + b, 0);
+        const bar = $('[data-bar]');
+        const pct = ((score + 4) / 8) * 100;
+        if (score >= 0) {
+          bar.style.left = '50%';
+          bar.style.width = pct - 50 + '%';
+          bar.style.background = 'var(--indigo)';
+        } else {
+          bar.style.left = pct + '%';
+          bar.style.width = 50 - pct + '%';
+          bar.style.background = 'var(--madder)';
+        }
+
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        const s = document.createElement('strong');
+        s.textContent = (score > 0 ? '+' : '') + score;
+        const word =
+          score >= 3 ? '四要素基本一边倒地偏向合理使用' : score >= 1 ? '略微偏向合理使用' : score === 0 ? '四要素打平，这正是最难判的情形' : score >= -2 ? '略微偏向不利' : '四要素基本一边倒地偏向不利';
+        v.append(
+          document.createTextNode('四要素合计 '),
+          s,
+          document.createTextNode(`（范围 −4 到 +4）：${word}。`),
+          document.createTextNode(
+            custom ? '（你手动改过了 —— 注意法院是「权衡」不是「数数」，这个和加起来完全不是一回事。）' : '',
+          ),
+        );
+
+        $('[data-outcome]').innerHTML = '课上讲到的实际结果：' + c.out;
+      }
+
+      render();
+    });
+  }
+
+  setupL13FairUse();
+  document.addEventListener('astro:page-load', setupL13FairUse);
+</script>

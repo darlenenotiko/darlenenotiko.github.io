@@ -1,0 +1,320 @@
+---
+// 污染演示：测试题混进训练集之后，报告出来的分数会虚高多少，
+// 以及两个模型的排名会不会因此翻过来。
+---
+
+<div class="demo" data-demo="l12-contamination">
+  <p class="lead">
+    假设一个 100 题的 benchmark。模型对<strong>没见过</strong>的题有一个真实正确率
+    <em>a</em>；对<strong>训练时见过</strong>的题，就当它背下来了、必对。
+    于是报告出来的分数是
+  </p>
+  <p class="formula">报告准确率 = c + (1 − c) × a　（c 是被污染的题目比例）</p>
+
+  <div class="models" data-models></div>
+
+  <div class="verdict" data-verdict></div>
+
+  <div class="ctrl">
+    <button data-reset class="ghost">回到默认值</button>
+  </div>
+
+  <p class="hint">
+    注意这里没有任何人「作弊」—— 没人把测试集拿去训练。题目只是从网上别的地方
+    渗进了训练语料，而模型开发者自己也不知道渗进去了多少。
+  </p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .lead {
+    margin: 0 0 0.6rem;
+    font-size: 0.88rem;
+    line-height: 1.7;
+    color: var(--ink-muted);
+  }
+  .formula {
+    margin: 0 0 1rem;
+    padding: 0.45rem 0.7rem;
+    font-family: var(--font-mono);
+    font-size: 0.83rem;
+    color: var(--indigo);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+
+  .models {
+    display: grid;
+    gap: 0.9rem;
+  }
+  @media (min-width: 640px) {
+    .models {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  .models :global(.m) {
+    padding: 0.7rem 0.9rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+  }
+  .models :global(.m h4) {
+    margin: 0 0 0.5rem;
+    font-size: 0.8rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--indigo);
+  }
+  .models :global(.row) {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.35rem;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+  }
+  .models :global(.row span.k) {
+    flex: 0 0 6.5rem;
+  }
+  .models :global(.row span.v) {
+    flex: 0 0 3rem;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+  .models :global(input[type='range']) {
+    flex: 1 1 auto;
+    min-width: 0;
+    accent-color: var(--indigo);
+  }
+  .models :global(.bars) {
+    margin-top: 0.6rem;
+  }
+  .models :global(.barline) {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin-top: 0.3rem;
+    font-size: 0.75rem;
+    color: var(--ink-faint);
+  }
+  .models :global(.barline .track) {
+    position: relative;
+    flex: 1 1 auto;
+    height: 13px;
+    background: var(--bg-sunken);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .models :global(.barline .fill) {
+    display: block;
+    height: 100%;
+    background: var(--indigo-soft);
+  }
+  .models :global(.barline.rep .fill) {
+    background: var(--madder);
+  }
+  .models :global(.barline .num) {
+    flex: 0 0 3.4rem;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+
+  .verdict {
+    margin-top: 1rem;
+    padding: 0.65rem 0.85rem;
+    font-size: 0.84rem;
+    line-height: 1.75;
+    border-radius: 0 6px 6px 0;
+  }
+  .verdict.flip {
+    color: var(--ink);
+    background: color-mix(in srgb, var(--madder) 14%, transparent);
+    border-left: 3px solid var(--madder);
+  }
+  .verdict.same {
+    color: var(--ink-muted);
+    background: color-mix(in srgb, var(--indigo) 10%, transparent);
+    border-left: 3px solid var(--indigo);
+  }
+
+  .ctrl {
+    margin-top: 0.8rem;
+  }
+  .ctrl button {
+    padding: 0.26rem 0.7rem;
+    font: inherit;
+    font-size: 0.82rem;
+    color: var(--ink-muted);
+    background: transparent;
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+  }
+  .hint {
+    margin: 0.8rem 0 0;
+    font-size: 0.8rem;
+    line-height: 1.7;
+    color: var(--ink-faint);
+  }
+</style>
+
+<script>
+  function setupL12Contamination() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l12-contamination"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+
+      type M = { name: string; a: number; c: number };
+      // 默认：模型甲真本事更强但语料干净，模型乙真本事更弱但污染更重 —— 榜上乙赢。
+      const DEFAULT: M[] = [
+        { name: '模型甲', a: 0.62, c: 0.05 },
+        { name: '模型乙', a: 0.55, c: 0.25 },
+      ];
+      let ms: M[] = DEFAULT.map((m) => ({ ...m }));
+
+      // 报告分数 = 背下来的那部分（必对）+ 剩下的部分按真实能力答对
+      const reported = (m: M) => m.c + (1 - m.c) * m.a;
+
+      // DOM 只建一次：滑块要一直存在，否则每次 input 都重建，拖不动。
+      type Slider = { inp: HTMLInputElement; v: HTMLElement; get: () => number };
+      type Bar = { fill: HTMLElement; num: HTMLElement; get: () => number };
+      const sliders: Slider[] = [];
+      const bars: Bar[] = [];
+
+      function build() {
+        const box = $('[data-models]');
+        box.replaceChildren();
+
+        ms.forEach((m, i) => {
+          const div = document.createElement('div');
+          div.className = 'm';
+
+          const h = document.createElement('h4');
+          h.textContent = m.name;
+          div.append(h);
+
+          const mkRow = (
+            key: string,
+            get: () => number,
+            min: number,
+            max: number,
+            set: (v: number) => void,
+          ) => {
+            const row = document.createElement('div');
+            row.className = 'row';
+            const k = document.createElement('span');
+            k.className = 'k';
+            k.textContent = key;
+            const inp = document.createElement('input');
+            inp.type = 'range';
+            inp.min = String(min);
+            inp.max = String(max);
+            inp.step = '0.01';
+            inp.value = String(get());
+            const v = document.createElement('span');
+            v.className = 'v';
+            inp.addEventListener('input', () => {
+              set(Number(inp.value));
+              draw();
+            });
+            row.append(k, inp, v);
+            sliders.push({ inp, v, get });
+            return row;
+          };
+
+          div.append(
+            mkRow('真实能力 a', () => ms[i].a, 0, 1, (v) => (ms[i].a = v)),
+            mkRow('污染率 c', () => ms[i].c, 0, 1, (v) => (ms[i].c = v)),
+          );
+
+          const barBox = document.createElement('div');
+          barBox.className = 'bars';
+          const mkBar = (label: string, get: () => number, cls: string) => {
+            const line = document.createElement('div');
+            line.className = 'barline ' + cls;
+            const lb = document.createElement('span');
+            lb.style.flex = '0 0 4.6rem';
+            lb.textContent = label;
+            const track = document.createElement('span');
+            track.className = 'track';
+            const fill = document.createElement('span');
+            fill.className = 'fill';
+            track.append(fill);
+            const num = document.createElement('span');
+            num.className = 'num';
+            line.append(lb, track, num);
+            bars.push({ fill, num, get });
+            return line;
+          };
+          barBox.append(
+            mkBar('真实水平', () => ms[i].a, 'true'),
+            mkBar('榜上分数', () => reported(ms[i]), 'rep'),
+          );
+          div.append(barBox);
+          box.append(div);
+        });
+      }
+
+      function draw() {
+        for (const s of sliders) {
+          const val = s.get();
+          s.v.textContent = (val * 100).toFixed(0) + '%';
+          if (s.inp.value !== String(val)) s.inp.value = String(val);
+        }
+        for (const b of bars) {
+          const val = b.get();
+          b.fill.style.width = (val * 100).toFixed(1) + '%';
+          b.num.textContent = (val * 100).toFixed(1) + '%';
+        }
+
+        const [A, B] = ms;
+        const rA = reported(A);
+        const rB = reported(B);
+        const trueWin = A.a === B.a ? null : A.a > B.a ? A : B;
+        const repWin = Math.abs(rA - rB) < 1e-9 ? null : rA > rB ? A : B;
+        const v = $('[data-verdict]');
+        const gapA = ((rA - A.a) * 100).toFixed(1);
+        const gapB = ((rB - B.a) * 100).toFixed(1);
+        const head =
+          `虚高幅度：${A.name} +${gapA} 分，${B.name} +${gapB} 分。`;
+        if (trueWin && repWin && trueWin !== repWin) {
+          v.className = 'verdict flip';
+          v.textContent =
+            head +
+            `排名翻了 —— 真本事更强的是 ${trueWin.name}（${(trueWin.a * 100).toFixed(0)}% vs ` +
+            `${((trueWin === A ? B : A).a * 100).toFixed(0)}%），但榜上赢的是 ${repWin.name}。` +
+            `只看榜单，你会挑错模型。`;
+        } else {
+          v.className = 'verdict same';
+          v.textContent =
+            head +
+            (repWin
+              ? `排名没有翻，榜上和真实水平都是 ${repWin.name} 领先 —— 但两个分数都不是真实水平。`
+              : `两个模型榜上打平 —— 但这个平局是污染凑出来的，不代表真实水平相同。`);
+        }
+      }
+
+      $('[data-reset]').addEventListener('click', () => {
+        DEFAULT.forEach((d, i) => Object.assign(ms[i], d));
+        draw();
+      });
+
+      build();
+      draw();
+    });
+  }
+
+  setupL12Contamination();
+  document.addEventListener('astro:page-load', setupL12Contamination);
+</script>

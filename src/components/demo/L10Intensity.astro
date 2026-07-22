@@ -1,0 +1,358 @@
+---
+// CS336 第 10 讲演示 1：prefill 与 decode 的算术强度对比。
+// 课件 arithmetic_intensity_of_inference()：
+//   MLP：  flops = 6·B·T·D·F，bytes = 4·B·T·D + 4·B·T·F + 6·D·F
+//          B·T 远小于 D、F 时 → 强度 ≈ B·T
+//   注意力：flops = 4·B·S·T·D，bytes = 4·B·S·D + 4·B·T·D
+//          → 强度 = S·T/(S+T)，精确式，和 B 无关
+// prefill 取 T = S，decode 取 T = 1。
+---
+
+<div class="demo" data-demo="l10-intensity">
+  <div class="row">
+    <span class="plabel">阶段：</span>
+    <button data-mode="prefill" class="on">Prefill（T = S）</button>
+    <button data-mode="decode">Decode（T = 1）</button>
+    <span class="plabel">硬件：</span>
+    <button data-hw="h100" class="on">H100</button>
+    <button data-hw="b200">B200</button>
+  </div>
+
+  <div class="row">
+    <label class="sld">
+      批大小 B = <span data-b-val>1</span>
+      <input type="range" data-b min="0" max="10" step="1" value="0" />
+    </label>
+    <label class="sld">
+      已有 token 数 S = <span data-s-val>1024</span>
+      <input type="range" data-s min="6" max="15" step="1" value="10" />
+    </label>
+  </div>
+
+  <div class="two">
+    <div>
+      <canvas data-canvas width="720" height="330"></canvas>
+      <p class="axis">
+        横轴 = 批大小 B（对数），纵轴 = 算术强度（对数）。靛蓝 = MLP 层，茜红 = 注意力层，
+        黄色横线 = 加速器强度（跨过它才算力受限）。竖直虚线是当前的 B。
+      </p>
+    </div>
+    <div>
+      <table><tbody data-stats></tbody></table>
+      <p class="hint" data-hint></p>
+    </div>
+  </div>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem 1.1rem;
+    margin-bottom: 0.7rem;
+  }
+  .plabel {
+    font-size: 0.8rem;
+    color: var(--ink-faint);
+  }
+  button {
+    font: inherit;
+    font-size: 0.79rem;
+    padding: 0.22rem 0.6rem;
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    background: var(--bg-raised);
+    color: var(--ink-muted);
+    cursor: pointer;
+    transition: all 0.15s var(--ease);
+  }
+  button.on {
+    border-color: var(--indigo);
+    color: var(--indigo);
+    font-weight: 600;
+  }
+  .sld {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.83rem;
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .sld input[type='range'] {
+    width: 150px;
+    accent-color: var(--indigo);
+  }
+  .two {
+    display: grid;
+    gap: 1.2rem;
+    align-items: start;
+  }
+  @media (min-width: 860px) {
+    .two {
+      grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr);
+    }
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .axis {
+    margin: 0.45rem 0 0;
+    font-size: 0.76rem;
+    color: var(--ink-faint);
+    line-height: 1.7;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.81rem;
+    font-variant-numeric: tabular-nums;
+  }
+  table :global(td) {
+    padding: 0.28rem 0.4rem;
+    color: var(--ink-muted);
+    border-bottom: 1px solid var(--rule);
+  }
+  table :global(td.k) {
+    color: var(--ink-faint);
+  }
+  table :global(td.v) {
+    text-align: right;
+    font-family: var(--font-mono);
+    color: var(--ink);
+  }
+  table :global(tr.bad td.v) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+  table :global(tr.good td.v) {
+    color: var(--indigo);
+    font-weight: 700;
+  }
+  .hint {
+    margin: 0.9rem 0 0;
+    font-size: 0.83rem;
+    line-height: 1.8;
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupL10Intensity() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l10-intensity"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const cv = $<HTMLCanvasElement>('[data-canvas]');
+      const ctx = cv.getContext('2d')!;
+      const css = (n: string) =>
+        getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+      // Llama 2 13B 的形状，用来算「精确」的 MLP 强度
+      const D = 5120;
+      const F = 13824;
+      const HW: Record<string, { name: string; flops: number; bw: number }> = {
+        h100: { name: 'H100', flops: 989e12, bw: 3.35e12 },
+        b200: { name: 'B200', flops: 2.25e15, bw: 8e12 },
+      };
+
+      let mode = 'prefill';
+      let hw = 'h100';
+
+      // MLP 精确强度：6BTDF / (4BTD + 4BTF + 6DF)
+      const mlpExact = (B: number, T: number) =>
+        (6 * B * T * D * F) / (4 * B * T * D + 4 * B * T * F + 6 * D * F);
+      // 注意力精确强度：ST/(S+T)，与 B 无关
+      const attnExact = (S: number, T: number) => (S * T) / (S + T);
+
+      function draw() {
+        const B = Math.pow(2, parseInt($<HTMLInputElement>('[data-b]').value, 10));
+        const S = Math.pow(2, parseInt($<HTMLInputElement>('[data-s]').value, 10));
+        const T = mode === 'prefill' ? S : 1;
+        $('[data-b-val]').textContent = String(B);
+        $('[data-s-val]').textContent = String(S);
+
+        const acc = HW[hw].flops / HW[hw].bw;
+
+        const indigo = css('--indigo');
+        const madder = css('--madder');
+        const weld = css('--weld');
+        const rule = css('--rule');
+        const faint = css('--ink-faint');
+
+        // ── 画图 ──
+        const padL = 46;
+        const padR = 10;
+        const padT = 12;
+        const padB = 26;
+        const W = cv.width - padL - padR;
+        const Hh = cv.height - padT - padB;
+        const yMin = Math.log10(0.1);
+        const yMax = Math.log10(1e7);
+        const xOf = (b: number) => padL + (Math.log2(b) / 10) * W;
+        const yOf = (v: number) =>
+          padT + Hh - ((Math.log10(Math.max(v, 0.1)) - yMin) / (yMax - yMin)) * Hh;
+
+        ctx.clearRect(0, 0, cv.width, cv.height);
+        ctx.font = '11px ui-monospace, monospace';
+        ctx.textBaseline = 'middle';
+
+        // 网格
+        ctx.strokeStyle = rule;
+        ctx.lineWidth = 1;
+        ctx.fillStyle = faint;
+        ctx.textAlign = 'right';
+        for (let e = -1; e <= 7; e++) {
+          const y = yOf(Math.pow(10, e));
+          ctx.beginPath();
+          ctx.moveTo(padL, y + 0.5);
+          ctx.lineTo(padL + W, y + 0.5);
+          ctx.stroke();
+          ctx.fillText(e === 0 ? '1' : `1e${e}`, padL - 5, y);
+        }
+        ctx.textAlign = 'center';
+        for (let k = 0; k <= 10; k += 2) {
+          const b = Math.pow(2, k);
+          ctx.fillText(String(b), xOf(b), padT + Hh + 12);
+        }
+
+        // 加速器强度线
+        ctx.strokeStyle = weld;
+        ctx.lineWidth = 2;
+        ctx.setLineDash([5, 4]);
+        ctx.beginPath();
+        ctx.moveTo(padL, yOf(acc));
+        ctx.lineTo(padL + W, yOf(acc));
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = weld;
+        ctx.textAlign = 'left';
+        ctx.fillText(`加速器强度 ${acc.toFixed(0)}`, padL + 6, yOf(acc) - 9);
+
+        // 两条曲线
+        const curve = (fn: (b: number) => number, color: string) => {
+          ctx.strokeStyle = color;
+          ctx.lineWidth = 2.2;
+          ctx.beginPath();
+          for (let i = 0; i <= 200; i++) {
+            const b = Math.pow(2, (i / 200) * 10);
+            const x = xOf(b);
+            const y = yOf(fn(b));
+            i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+        };
+        curve((b) => mlpExact(b, T), indigo);
+        curve(() => attnExact(S, T), madder);
+
+        // 当前 B
+        ctx.strokeStyle = faint;
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.moveTo(xOf(B), padT);
+        ctx.lineTo(xOf(B), padT + Hh);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        for (const [v, c] of [
+          [mlpExact(B, T), indigo],
+          [attnExact(S, T), madder],
+        ] as [number, string][]) {
+          ctx.fillStyle = c;
+          ctx.beginPath();
+          ctx.arc(xOf(B), yOf(v), 4, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        ctx.fillStyle = indigo;
+        ctx.textAlign = 'left';
+        ctx.fillText('MLP', padL + 6, padT + 10);
+        ctx.fillStyle = madder;
+        ctx.fillText('注意力', padL + 46, padT + 10);
+
+        // ── 表 ──
+        const mi = mlpExact(B, T);
+        const ai = attnExact(S, T);
+        const rows: [string, string, string][] = [
+          ['当前 (B, S, T)', `${B}, ${S}, ${T}`, ''],
+          ['MLP 渐近强度 = B·T', (B * T).toLocaleString('en-US'), ''],
+          ['MLP 精确强度（D=5120, F=13824）', mi.toFixed(1), mi > acc ? 'good' : 'bad'],
+          ['注意力精确强度 = S·T/(S+T)', ai.toFixed(2), ai > acc ? 'good' : 'bad'],
+          [`加速器强度（${HW[hw].name}）`, acc.toFixed(0), ''],
+        ];
+        const tb = $('[data-stats]');
+        tb.replaceChildren();
+        for (const [k, v, cls] of rows) {
+          const tr = document.createElement('tr');
+          if (cls) tr.className = cls;
+          const a = document.createElement('td');
+          a.className = 'k';
+          a.textContent = k;
+          const b = document.createElement('td');
+          b.className = 'v';
+          b.textContent = v;
+          tr.append(a, b);
+          tb.append(tr);
+        }
+
+        let hint: string;
+        if (mode === 'prefill') {
+          hint =
+            `Prefill：两条曲线都在黄线上方或很容易被推上去。注意力那条恰好等于 S/2 = ${(S / 2).toFixed(0)}，` +
+            `只要序列够长就够用；MLP 那条随 B 一起涨。所以 prefill 是算力受限的，这是好事。`;
+        } else if (mi > acc) {
+          hint =
+            `Decode：MLP 已经靠 B = ${B} 爬过黄线了（${mi.toFixed(0)} > ${acc.toFixed(0)}），` +
+            `但注意力那条**纹丝不动**停在 ${ai.toFixed(2)} —— 它是 S·T/(S+T)，式子里根本没有 B。` +
+            `原因是每条序列有自己的一份 KV cache，多来一条序列就多搬一份，摊不掉。`;
+        } else {
+          hint =
+            `Decode：MLP 强度 ${mi.toFixed(1)}、注意力强度 ${ai.toFixed(2)}，都远低于 ${acc.toFixed(0)}。` +
+            `把 B 往右拖，你会看到靛蓝那条线一路爬升，而茜红那条**完全是水平的** —— ` +
+            `这就是「batching 救得了 MLP，救不了注意力」。`;
+        }
+        $('[data-hint]').textContent = hint;
+      }
+
+      root.querySelectorAll<HTMLButtonElement>('[data-mode]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          mode = btn.dataset.mode!;
+          root
+            .querySelectorAll('[data-mode]')
+            .forEach((b) => b.classList.toggle('on', b === btn));
+          draw();
+        });
+      });
+      root.querySelectorAll<HTMLButtonElement>('[data-hw]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          hw = btn.dataset.hw!;
+          root.querySelectorAll('[data-hw]').forEach((b) => b.classList.toggle('on', b === btn));
+          draw();
+        });
+      });
+      root.querySelectorAll('input').forEach((el) => el.addEventListener('input', draw));
+      new MutationObserver(draw).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['data-theme'],
+      });
+      draw();
+    });
+  }
+
+  setupL10Intensity();
+  document.addEventListener('astro:page-load', setupL10Intensity);
+</script>

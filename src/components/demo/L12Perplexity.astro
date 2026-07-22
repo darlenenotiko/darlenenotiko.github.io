@@ -1,0 +1,372 @@
+---
+// 困惑度计算器。用课上那句 "Stanford was founded in 1885"：
+// 每个 token 给一个模型概率，逐 token 看 -log p 怎么累积成困惑度；
+// 再把 prompt / response 的分界线拖一拖，看条件困惑度和全句困惑度差多少。
+---
+
+<div class="demo" data-demo="l12-perplexity">
+  <p class="lead">
+    模型对每个位置输出「下一个 token 是什么」的概率。下面六个滑块就是模型给
+    <strong>真实出现的那个 token</strong> 的概率 —— 拖动它们，看困惑度怎么动。
+  </p>
+
+  <div class="toks" data-toks></div>
+
+  <div class="ctrl">
+    <span class="lab">prompt / response 分界：</span>
+    <button data-bshift="-1">←</button>
+    <span class="cut" data-cut></span>
+    <button data-bshift="1">→</button>
+    <button data-reset class="ghost">重置</button>
+  </div>
+
+  <table data-table>
+    <thead>
+      <tr>
+        <th>token</th>
+        <th class="n">概率 p</th>
+        <th class="n">−ln p</th>
+        <th>贡献</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <div class="cards">
+    <div class="card">
+      <h4>全句困惑度</h4>
+      <div class="big" data-ppl-all></div>
+      <p class="sub" data-sub-all></p>
+    </div>
+    <div class="card hot">
+      <h4>条件困惑度（只算 response）</h4>
+      <div class="big" data-ppl-cond></div>
+      <p class="sub" data-sub-cond></p>
+    </div>
+  </div>
+
+  <p class="hint" data-hint></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 1rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .lead {
+    margin: 0 0 1rem;
+    font-size: 0.88rem;
+    color: var(--ink-muted);
+  }
+
+  .toks {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 0.6rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+  }
+  .toks :global(.tok) {
+    padding: 3px 7px;
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    white-space: pre;
+    border-radius: 4px;
+    background: color-mix(in srgb, var(--indigo) 12%, transparent);
+    border: 1px solid transparent;
+  }
+  .toks :global(.tok.resp) {
+    background: color-mix(in srgb, var(--madder) 26%, transparent);
+    border-color: color-mix(in srgb, var(--madder) 45%, transparent);
+  }
+
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin: 0.9rem 0 0.4rem;
+  }
+  .ctrl button {
+    padding: 0.24rem 0.6rem;
+    font: inherit;
+    font-size: 0.83rem;
+    color: var(--bg);
+    background: var(--indigo);
+    border: 1px solid var(--indigo);
+    border-radius: 5px;
+    cursor: pointer;
+  }
+  .ctrl button:hover {
+    opacity: 0.85;
+  }
+  .ctrl button:disabled {
+    opacity: 0.35;
+    cursor: default;
+  }
+  .ctrl button.ghost {
+    color: var(--ink-muted);
+    background: transparent;
+    border-color: var(--rule);
+  }
+  .lab,
+  .cut {
+    font-size: 0.82rem;
+    color: var(--ink-muted);
+  }
+  .cut {
+    font-family: var(--font-mono);
+    color: var(--madder);
+  }
+
+  table {
+    width: 100%;
+    margin-top: 0.8rem;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+  }
+  table :global(th) {
+    padding: 0.25rem 0.4rem;
+    text-align: left;
+    font-size: 0.75rem;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+  }
+  table :global(td) {
+    padding: 0.28rem 0.4rem;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-muted);
+    vertical-align: middle;
+  }
+  table :global(th.n),
+  table :global(td.n) {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  table :global(td.name) {
+    font-family: var(--font-mono);
+    white-space: pre;
+    color: var(--ink);
+  }
+  table :global(tr.resp td.name) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+  table :global(input[type='range']) {
+    width: 100%;
+    max-width: 150px;
+    accent-color: var(--indigo);
+    vertical-align: middle;
+  }
+  table :global(.bar) {
+    display: block;
+    height: 9px;
+    border-radius: 2px;
+    background: var(--indigo);
+  }
+  table :global(tr.resp .bar) {
+    background: var(--madder);
+  }
+
+  .cards {
+    display: grid;
+    gap: 0.8rem;
+    margin-top: 1rem;
+  }
+  @media (min-width: 560px) {
+    .cards {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  .card {
+    padding: 0.7rem 0.9rem;
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 8px;
+  }
+  .card h4 {
+    margin: 0 0 0.3rem;
+    font-size: 0.76rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+  .big {
+    font-size: 1.5rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--indigo);
+  }
+  .card.hot .big {
+    color: var(--madder);
+  }
+  .sub {
+    margin: 0.25rem 0 0;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+  }
+  .hint {
+    margin: 0.9rem 0 0;
+    font-size: 0.82rem;
+    line-height: 1.7;
+    color: var(--ink-muted);
+  }
+</style>
+
+<script>
+  function setupL12Perplexity() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l12-perplexity"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+
+      // 课上那句话切成 6 个 token。p 是模型给「真实出现的那个 token」的概率。
+      const TOKENS = ['Stanford', ' was', ' founded', ' in', ' 18', '85'];
+      const DEFAULT_P = [0.02, 0.35, 0.08, 0.55, 0.3, 0.6];
+      const DEFAULT_CUT = 4; // 前 4 个 token 当 prompt，后 2 个当 response
+
+      let probs = [...DEFAULT_P];
+      let cut = DEFAULT_CUT;
+
+      // 困惑度 = exp(平均的 -ln p)。等价于 (1/∏p)^(1/N)。
+      const ppl = (idx: number[]) => {
+        if (!idx.length) return NaN;
+        const s = idx.reduce((a, i) => a - Math.log(probs[i]), 0);
+        return Math.exp(s / idx.length);
+      };
+      const range = (a: number, b: number) => {
+        const out: number[] = [];
+        for (let i = a; i < b; i++) out.push(i);
+        return out;
+      };
+
+      function drawToks() {
+        const el = $('[data-toks]');
+        el.replaceChildren();
+        TOKENS.forEach((t, i) => {
+          const sp = document.createElement('span');
+          sp.className = 'tok' + (i >= cut ? ' resp' : '');
+          sp.textContent = t.replace(/ /g, '␣');
+          el.append(sp);
+        });
+        $('[data-cut]').textContent =
+          cut >= TOKENS.length
+            ? 'response 为空'
+            : `prompt = 前 ${cut} 个 token，response = 后 ${TOKENS.length - cut} 个`;
+        $<HTMLButtonElement>('[data-bshift="-1"]').disabled = cut <= 0;
+        $<HTMLButtonElement>('[data-bshift="1"]').disabled = cut >= TOKENS.length;
+      }
+
+      // 表格只建一次：滑块元素必须保持存在，否则拖到一半就被替换掉，拖不动。
+      type Row = { tr: HTMLElement; val: HTMLElement; inp: HTMLInputElement; nll: HTMLElement; bar: HTMLElement };
+      const rows: Row[] = [];
+
+      function buildTable() {
+        const tbody = $('[data-table] tbody');
+        tbody.replaceChildren();
+        TOKENS.forEach((t, i) => {
+          const tr = document.createElement('tr');
+
+          const c1 = document.createElement('td');
+          c1.className = 'name';
+          c1.textContent = t.replace(/ /g, '␣');
+
+          const c2 = document.createElement('td');
+          c2.className = 'n';
+          const inp = document.createElement('input');
+          inp.type = 'range';
+          inp.min = '0.01';
+          inp.max = '0.99';
+          inp.step = '0.01';
+          inp.value = String(probs[i]);
+          inp.addEventListener('input', () => {
+            probs[i] = Number(inp.value);
+            draw();
+          });
+          const val = document.createElement('span');
+          c2.append(val, inp);
+
+          const c3 = document.createElement('td');
+          c3.className = 'n';
+
+          const c4 = document.createElement('td');
+          const bar = document.createElement('span');
+          bar.className = 'bar';
+          c4.append(bar);
+
+          tr.append(c1, c2, c3, c4);
+          tbody.append(tr);
+          rows.push({ tr, val, inp, nll: c3, bar });
+        });
+      }
+
+      function drawTable() {
+        const maxNll = Math.max(...probs.map((p) => -Math.log(p)));
+        rows.forEach((r, i) => {
+          const nll = -Math.log(probs[i]);
+          r.tr.className = i >= cut ? 'resp' : '';
+          r.val.textContent = probs[i].toFixed(2) + ' ';
+          if (r.inp.value !== String(probs[i])) r.inp.value = String(probs[i]);
+          r.nll.textContent = nll.toFixed(3);
+          r.bar.style.width = Math.max(2, (nll / maxNll) * 100) + '%';
+        });
+      }
+
+      function draw() {
+        drawToks();
+        drawTable();
+        const all = ppl(range(0, TOKENS.length));
+        const cond = ppl(range(cut, TOKENS.length));
+        const sumAll = range(0, TOKENS.length).reduce((a, i) => a - Math.log(probs[i]), 0);
+
+        $('[data-ppl-all]').textContent = all.toFixed(2);
+        $('[data-sub-all]').textContent =
+          `${TOKENS.length} 个 token，−ln p 总和 ${sumAll.toFixed(2)}，` +
+          `平均 ${(sumAll / TOKENS.length).toFixed(3)}`;
+
+        if (Number.isNaN(cond)) {
+          $('[data-ppl-cond]').textContent = '—';
+          $('[data-sub-cond]').textContent = 'response 里没有 token，算不出来。';
+        } else {
+          const idx = range(cut, TOKENS.length);
+          const s = idx.reduce((a, i) => a - Math.log(probs[i]), 0);
+          $('[data-ppl-cond]').textContent = cond.toFixed(2);
+          $('[data-sub-cond]').textContent =
+            `${idx.length} 个 token，−ln p 总和 ${s.toFixed(2)}，平均 ${(s / idx.length).toFixed(3)}`;
+        }
+
+        // 提示：指出当前哪个 token 最「贵」
+        let worst = 0;
+        for (let i = 1; i < probs.length; i++) if (probs[i] < probs[worst]) worst = i;
+        $('[data-hint]').textContent =
+          `现在最贵的是 ${JSON.stringify(TOKENS[worst])}（−ln p = ${(-Math.log(probs[worst])).toFixed(2)}）。` +
+          `全句困惑度对每个 token 一视同仁地收费；条件困惑度只对分界线右边收费。`;
+      }
+
+      root.querySelectorAll<HTMLButtonElement>('[data-bshift]').forEach((b) => {
+        b.addEventListener('click', () => {
+          cut = Math.min(TOKENS.length, Math.max(0, cut + Number(b.dataset.bshift)));
+          draw();
+        });
+      });
+      $('[data-reset]').addEventListener('click', () => {
+        probs = [...DEFAULT_P];
+        cut = DEFAULT_CUT;
+        draw();
+      });
+
+      buildTable();
+      draw();
+    });
+  }
+
+  setupL12Perplexity();
+  document.addEventListener('astro:page-load', setupL12Perplexity);
+</script>

@@ -1,0 +1,451 @@
+---
+// muP 的两件事，做成一个可动手的组件。
+//
+// 上半：最优学习率到底转不转移。左边这批数字不是我编的，是课件第 52 / 57 页那两张表里
+//       逐格抄下来的验证损失（宽度 128 / 512 / 2048 × 基准学习率 2^-10 … 2^-2）。
+//       切换 SP / muP 就能看到：SP 下最优学习率随宽度一路左移（每宽 4 倍就往左挪一格，
+//       也就是大约按 1/宽度 走），muP 下三条曲线的谷底都钉在 2^-6。
+//
+// 下半：把 muP 的处方（课件第 50 页）套到一个真实 Transformer 的各类张量上，
+//       按 fan-in / fan-out 当场算出初始化标准差和每张量的 Adam 学习率倍数。
+---
+
+<div class="demo" data-demo="l11-mup">
+  <div class="ctrl">
+    <span class="seg">
+      <button data-param="mup" class="on">muP</button><button data-param="sp">标准参数化 SP</button>
+    </span>
+    <span class="val">同一批实验，只换参数化方式</span>
+  </div>
+
+  <div class="plot" data-plot-lr></div>
+
+  <p class="formula" data-lr-note></p>
+
+  <hr />
+
+  <div class="ctrl">
+    <label>d_model（宽度） <input type="range" data-dm min="7" max="13" step="1" value="10" /></label>
+    <span class="val" data-dm-v></span>
+    <label>基准宽度 d_base <input type="range" data-db min="7" max="11" step="1" value="8" /></label>
+    <span class="val" data-db-v></span>
+  </div>
+
+  <table class="out" data-out>
+    <thead>
+      <tr>
+        <th>张量</th><th>fan-in</th><th>fan-out</th><th>SP 初始化 std</th><th>muP 初始化 std</th><th>muP 的 Adam LR 倍数</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .demo hr {
+    margin: 1.2rem 0 0.9rem;
+    border: 0;
+    border-top: 1px solid var(--rule);
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.5rem;
+  }
+  .ctrl label {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+  }
+  .ctrl input[type='range'] {
+    width: 150px;
+    accent-color: var(--indigo);
+  }
+  .val {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--madder);
+    font-variant-numeric: tabular-nums;
+  }
+  .seg {
+    display: inline-flex;
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    overflow: hidden;
+  }
+  .seg button {
+    padding: 0.26rem 0.7rem;
+    font: inherit;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 0;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .seg button + button {
+    border-left: 1px solid var(--rule);
+  }
+  .seg button.on {
+    color: var(--bg);
+    background: var(--indigo);
+  }
+
+  .plot {
+    overflow-x: auto;
+    margin-top: 0.7rem;
+  }
+  .plot :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 320px;
+    height: auto;
+  }
+  .plot :global(.axis) {
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .plot :global(.grid) {
+    stroke: var(--rule);
+    stroke-width: 0.6;
+    stroke-dasharray: 2 3;
+  }
+  .plot :global(.cv) {
+    fill: none;
+    stroke: var(--indigo);
+    stroke-width: 1.6;
+  }
+  .plot :global(.dot) {
+    fill: var(--indigo);
+  }
+  .plot :global(.best) {
+    fill: var(--madder);
+  }
+  .plot :global(.bestline) {
+    stroke: var(--madder);
+    stroke-width: 1;
+    stroke-dasharray: 3 3;
+  }
+  .plot :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 9px;
+  }
+  .plot :global(text.title) {
+    fill: var(--indigo);
+    font-size: 10.5px;
+    font-weight: 700;
+  }
+  .plot :global(text.note) {
+    fill: var(--madder);
+    font-size: 9px;
+  }
+  .plot :global(text.lab) {
+    fill: var(--ink-muted);
+    font-size: 8.5px;
+  }
+
+  .formula {
+    margin: 0.9rem 0 0.2rem;
+    padding: 0.5rem 0.7rem;
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    line-height: 1.85;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 6px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+  }
+
+  .out {
+    width: 100%;
+    margin-top: 0.5rem;
+    border-collapse: collapse;
+    font-size: 0.76rem;
+  }
+  .out :global(th) {
+    padding: 0.25rem 0.3rem;
+    text-align: right;
+    font-weight: 400;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(th:first-child) {
+    text-align: left;
+  }
+  .out :global(td) {
+    padding: 0.25rem 0.3rem;
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(td:first-child) {
+    text-align: left;
+  }
+  .out :global(td.hot) {
+    color: var(--madder);
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL11Mup() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l11-mup"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+
+      // 课件第 52 页（muP 基线）与第 57 页 Table 3（SP）的验证损失，逐格照抄
+      const EXPS = [-10, -8, -6, -4, -2];
+      const WIDTHS = [128, 512, 2048];
+      const DATA: Record<string, number[][]> = {
+        mup: [
+          [3.846, 3.743, 3.695, 3.884, 4.143],
+          [3.114, 2.993, 2.953, 3.221, 3.506],
+          [2.711, 2.553, 2.511, 2.563, 3.244],
+        ],
+        sp: [
+          [3.841, 3.757, 3.706, 3.879, 4.03],
+          [3.013, 2.967, 2.987, 3.383, 7.403],
+          [2.738, 2.902, 7.247, 7.477, 7.314],
+        ],
+      };
+
+      let mode: 'mup' | 'sp' = 'mup';
+
+      const W = 560,
+        H = 260,
+        ML = 42,
+        MR = 92,
+        MT = 26,
+        MB = 34;
+
+      function drawLr() {
+        const rows = DATA[mode];
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+
+        // 纵轴裁到 4.3，免得 SP 那几个 7.x 的爆炸值把图压扁
+        const Y0 = 2.4,
+          Y1 = 4.3;
+        const px = (e: number) => ML + ((e - EXPS[0]) / (EXPS[EXPS.length - 1] - EXPS[0])) * (W - ML - MR);
+        const py = (v: number) => H - MB - ((v - Y0) / (Y1 - Y0)) * (H - MT - MB);
+
+        EXPS.forEach((e) => {
+          const x = px(e);
+          svg.append(svgEl('line', { class: 'grid', x1: x, y1: MT, x2: x, y2: H - MB }));
+          svg.append(svgEl('text', { x, y: H - MB + 12, 'text-anchor': 'middle' }, `2^${e}`));
+        });
+        for (let v = 2.5; v <= 4.25; v += 0.5) {
+          const y = py(v);
+          svg.append(svgEl('line', { class: 'grid', x1: ML, y1: y, x2: W - MR, y2: y }));
+          svg.append(svgEl('text', { x: ML - 4, y: y + 3, 'text-anchor': 'end' }, v.toFixed(1)));
+        }
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: H - MB, x2: W - MR, y2: H - MB }));
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: MT, x2: ML, y2: H - MB }));
+        svg.append(
+          svgEl(
+            'text',
+            { class: 'title', x: ML, y: 14 },
+            mode === 'mup' ? 'muP：三条曲线的谷底都在 2^-6' : 'SP：谷底随宽度一路左移',
+          ),
+        );
+        svg.append(
+          svgEl('text', { x: (ML + W - MR) / 2, y: H - 3, 'text-anchor': 'middle' }, '基准学习率'),
+        );
+        svg.append(
+          svgEl(
+            'text',
+            {
+              x: 9,
+              y: (MT + H - MB) / 2,
+              'text-anchor': 'middle',
+              transform: `rotate(-90 9 ${(MT + H - MB) / 2})`,
+            },
+            '验证损失',
+          ),
+        );
+
+        const bests: number[] = [];
+        rows.forEach((vals, wi) => {
+          const op = 0.4 + (0.6 * (wi + 1)) / WIDTHS.length;
+          const pts = vals
+            .map((v, i) => `${px(EXPS[i])},${py(Math.min(v, Y1))}`)
+            .join(' ');
+          svg.append(svgEl('polyline', { class: 'cv', 'stroke-opacity': op.toFixed(2), points: pts }));
+          let bi = 0;
+          vals.forEach((v, i) => {
+            if (v < vals[bi]) bi = i;
+            svg.append(
+              svgEl('circle', {
+                class: 'dot',
+                'fill-opacity': op.toFixed(2),
+                cx: px(EXPS[i]),
+                cy: py(Math.min(v, Y1)),
+                r: 2.6,
+              }),
+            );
+          });
+          bests.push(EXPS[bi]);
+          svg.append(
+            svgEl('circle', { class: 'best', cx: px(EXPS[bi]), cy: py(Math.min(vals[bi], Y1)), r: 4 }),
+          );
+          svg.append(
+            svgEl(
+              'text',
+              { class: 'lab', x: W - MR + 6, y: py(Math.min(vals[vals.length - 1], Y1)) + 3 },
+              `宽度 ${WIDTHS[wi]}`,
+            ),
+          );
+        });
+
+        // 把每个宽度的最优学习率用竖虚线标出来
+        bests.forEach((e) => {
+          svg.append(svgEl('line', { class: 'bestline', x1: px(e), y1: MT, x2: px(e), y2: H - MB }));
+        });
+        svg.append(
+          svgEl(
+            'text',
+            { class: 'note', x: W - MR - 4, y: MT + 10, 'text-anchor': 'end' },
+            `最优点：${bests.map((e) => `2^${e}`).join(' / ')}`,
+          ),
+        );
+        svg.append(
+          svgEl(
+            'text',
+            { class: 'lab', x: ML, y: H - MB - 4 },
+            '（纵轴裁到 4.3；SP 在大宽度 + 大学习率处会冲到 7 以上）',
+          ),
+        );
+
+        $('[data-plot-lr]').replaceChildren(svg);
+
+        const shift = bests[2] - bests[0];
+        $('[data-lr-note]').textContent =
+          mode === 'mup'
+            ? `宽度 128 / 512 / 2048 的最优基准学习率：2^${bests[0]} / 2^${bests[1]} / 2^${bests[2]}　—— 一格没动。\n` +
+              `每一级宽度都是上一级的 4 倍（参数量 16 倍），最小那个模型上扫出来的最优学习率，直接就是大模型的最优学习率。\n` +
+              `课件第 57 页那张大规模表（2M/128、40M/512、600M/2048、10B/8192）也是同一个结论：四个规模的最优点全在 2^-6。`
+            : `宽度 128 / 512 / 2048 的最优基准学习率：2^${bests[0]} / 2^${bests[1]} / 2^${bests[2]}　—— 一共左移了 ${Math.abs(shift)} 格。\n` +
+              `宽度每乘 4，最优学习率就除以 4（2^-6 → 2^-8 → 2^-10），也就是大致按 1/宽度 走 —— 这正是那条老经验法则。\n` +
+              `更麻烦的是右上角：宽度 2048 在 2^-6 上的损失是 7.247，直接炸了。SP 下「大模型 + 沿用小模型的学习率」不是变差一点，是训不出来。`;
+      }
+
+      const VOCAB = 32000;
+
+      function drawTable() {
+        const dmE = parseInt($<HTMLInputElement>('[data-dm]').value, 10);
+        const dbE = parseInt($<HTMLInputElement>('[data-db]').value, 10);
+        const dm = Math.pow(2, dmE),
+          db = Math.pow(2, dbE);
+        const dff = 4 * dm;
+        $('[data-dm-v]').textContent = `d_model = ${dm}`;
+        $('[data-db-v]').textContent = `d_base = ${db}`;
+
+        // 张量：[名字, fan-in, fan-out]
+        const T: [string, number, number][] = [
+          ['嵌入 W^E', VOCAB, dm],
+          ['注意力 W^Q/K/V', dm, dm],
+          ['注意力输出 W^O', dm, dm],
+          ['MLP 上投影 W^FI', dm, dff],
+          ['MLP 下投影 W^FO', dff, dm],
+          ['输出 softmax W^U', dm, VOCAB],
+        ];
+
+        const tb = $('[data-out] tbody');
+        tb.replaceChildren();
+        T.forEach(([name, fin, fout]) => {
+          const spStd = 1 / Math.sqrt(fin);
+          const mupStd = (1 / Math.sqrt(fin)) * Math.min(1, Math.sqrt(fout / fin));
+          // baby muP 的 Adam 层学习率 ∝ 1 / fan-in，这里换算成「相对基准模型同一张量」的倍数
+          const finBase =
+            fin === VOCAB ? VOCAB : fin === dm ? db : fin === dff ? 4 * db : fin;
+          const lrMul = finBase / fin;
+          const tr = document.createElement('tr');
+          const cells: [string, string][] = [
+            [name, ''],
+            [String(fin), ''],
+            [String(fout), ''],
+            [spStd.toExponential(2), ''],
+            [mupStd.toExponential(2), mupStd < spStd * 0.999 ? 'hot' : ''],
+            [lrMul === 1 ? '1.00×' : `${lrMul.toFixed(3)}×`, lrMul < 0.999 ? 'hot' : ''],
+          ];
+          cells.forEach(([t, cls]) => {
+            const td = document.createElement('td');
+            td.textContent = t;
+            if (cls) td.className = cls;
+            tr.append(td);
+          });
+          tb.append(tr);
+        });
+
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        const s = document.createElement('strong');
+        s.textContent = `${(db / dm).toFixed(3)}×`;
+        v.append(
+          document.createTextNode(
+            '表里两件事值得盯：第一，muP 的初始化只在 fan-out < fan-in 的张量上（MLP 下投影）比 SP 小，' +
+              '别的地方和 SP 一模一样 —— 这就是课件那句「差别在于 Adam 的学习率，以及 fan-out 小于 fan-in 时的初始化」。' +
+              '第二，Adam 的层学习率按 1/fan-in 走，所以宽度从 d_base 涨到 d_model 时，' +
+              '所有以 d_model 为 fan-in 的矩阵的学习率要乘 ',
+          ),
+          s,
+          document.createTextNode(
+            '，而嵌入层（fan-in 是词表，不随宽度变）的学习率一动不动。' +
+              '这就是 Tatsu 说的「按每个参数张量分别设学习率」—— 如果你没见过，这确实是件很怪的事。',
+          ),
+        );
+      }
+
+      root.querySelectorAll<HTMLButtonElement>('[data-param]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          mode = btn.dataset.param as 'mup' | 'sp';
+          root.querySelectorAll('[data-param]').forEach((b) => b.classList.remove('on'));
+          btn.classList.add('on');
+          drawLr();
+        });
+      });
+      root.querySelectorAll('input').forEach((el) => el.addEventListener('input', drawTable));
+
+      drawLr();
+      drawTable();
+    });
+  }
+
+  setupL11Mup();
+  document.addEventListener('astro:page-load', setupL11Mup);
+</script>

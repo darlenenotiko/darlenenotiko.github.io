@@ -1,0 +1,318 @@
+---
+// 各家技术报告给出的「token 数 / 参数量」最优比放在同一个算力预算下做对照。
+// 固定预算 C，选定比值 r = D/N，由 C = 6ND 解出 N = sqrt(C / (6r))、D = r·N。
+// 注意：稠密模型这个比是对总参数（或非嵌入参数）算的，MoE 那两行是对激活参数算的，
+// 两者不能直接比大小 —— 表里分开标了。
+---
+
+<div class="demo" data-demo="l11-ratios">
+  <div class="ctrl">
+    <label>算力预算 C（FLOPs） <input type="range" data-c min="20" max="26" step="0.1" value="23.76" /></label>
+    <span class="val" data-c-v></span>
+    <button data-preset="gopher">Chinchilla 那次预算 5.76e23</button>
+    <button data-preset="l3">LLaMA 3 405B 量级 4e25</button>
+  </div>
+
+  <table class="out" data-out>
+    <thead>
+      <tr>
+        <th>配方</th><th>参数口径</th><th>D/N</th><th>参数量 N</th><th>token 数 D</th><th>模型大小 ÷ Chinchilla</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <div class="plot" data-plot></div>
+
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.5rem;
+  }
+  .ctrl label {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+    font-size: 0.8rem;
+    color: var(--ink-muted);
+  }
+  .ctrl input[type='range'] {
+    width: 190px;
+    accent-color: var(--indigo);
+  }
+  .val {
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--madder);
+    font-variant-numeric: tabular-nums;
+  }
+  .ctrl button {
+    padding: 0.26rem 0.65rem;
+    font: inherit;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .ctrl button:hover {
+    color: var(--indigo);
+    border-color: var(--indigo);
+  }
+
+  .out {
+    width: 100%;
+    margin-top: 0.9rem;
+    border-collapse: collapse;
+    font-size: 0.77rem;
+  }
+  .out :global(th) {
+    padding: 0.25rem 0.3rem;
+    text-align: right;
+    font-weight: 400;
+    color: var(--ink-faint);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(th:first-child),
+  .out :global(th:nth-child(2)) {
+    text-align: left;
+  }
+  .out :global(td) {
+    padding: 0.25rem 0.3rem;
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    border-bottom: 1px solid var(--rule);
+  }
+  .out :global(td:first-child),
+  .out :global(td:nth-child(2)) {
+    text-align: left;
+  }
+  .out :global(tr.moe td:nth-child(2)) {
+    color: var(--weld);
+  }
+  .out :global(tr.ref td) {
+    color: var(--madder);
+  }
+
+  .plot {
+    overflow-x: auto;
+    margin-top: 0.9rem;
+  }
+  .plot :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 320px;
+    height: auto;
+  }
+  .plot :global(.axis) {
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .plot :global(.grid) {
+    stroke: var(--rule);
+    stroke-width: 0.6;
+    stroke-dasharray: 2 3;
+  }
+  .plot :global(.bar) {
+    fill: var(--indigo);
+  }
+  .plot :global(.bar.ref) {
+    fill: var(--madder);
+  }
+  .plot :global(.bar.moe) {
+    fill: var(--weld);
+  }
+  .plot :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 9px;
+  }
+  .plot :global(text.title) {
+    fill: var(--indigo);
+    font-size: 10.5px;
+    font-weight: 700;
+  }
+  .plot :global(text.lab) {
+    fill: var(--ink-muted);
+    font-size: 8.5px;
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL11Ratios() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l11-ratios"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+
+      const fmtSci = (x: number, d = 2) => {
+        if (!isFinite(x) || x <= 0) return '—';
+        const e = Math.floor(Math.log10(x));
+        return `${(x / Math.pow(10, e)).toFixed(d)}e${e}`;
+      };
+      const fmtP = (x: number) => {
+        if (x >= 1e12) return (x / 1e12).toFixed(2) + 'T';
+        if (x >= 1e9) return (x / 1e9).toFixed(1) + 'B';
+        if (x >= 1e6) return (x / 1e6).toFixed(0) + 'M';
+        return x.toFixed(0);
+      };
+
+      type Row = { name: string; kind: '总参数' | '非嵌入参数' | '激活参数'; r: number; tag?: string };
+      const ROWS: Row[] = [
+        { name: 'GPT-3（训练不足）', kind: '总参数', r: 2 },
+        { name: 'Chinchilla 经验法则', kind: '总参数', r: 20, tag: 'ref' },
+        { name: 'LLaMA 3 的 IsoFLOP', kind: '总参数', r: 39 },
+        { name: 'MiniCPM 方法三（C = 1e21 处）', kind: '非嵌入参数', r: 95.6 },
+        { name: 'Hunyuan-Large 的 IsoFLOP', kind: '激活参数', r: 96, tag: 'moe' },
+        { name: 'Llama 3 70B 的实际训练量', kind: '总参数', r: 215 },
+      ];
+
+      const W = 560,
+        H = 210,
+        ML = 200,
+        MR = 60,
+        MT = 26,
+        MB = 30;
+
+      function draw() {
+        const lc = parseFloat($<HTMLInputElement>('[data-c]').value);
+        const C = Math.pow(10, lc);
+        $('[data-c-v]').textContent = `C = ${fmtSci(C)}`;
+
+        const solve = (r: number) => {
+          const N = Math.sqrt(C / (6 * r));
+          return { N, D: r * N };
+        };
+        const base = solve(20);
+
+        const tb = $('[data-out] tbody');
+        tb.replaceChildren();
+        ROWS.forEach((row) => {
+          const { N, D } = solve(row.r);
+          const tr = document.createElement('tr');
+          if (row.tag) tr.className = row.tag;
+          [
+            row.name,
+            row.kind,
+            row.r.toFixed(row.r < 10 ? 0 : 1),
+            fmtP(N),
+            fmtP(D),
+            `${(N / base.N).toFixed(2)}×`,
+          ].forEach((t) => {
+            const td = document.createElement('td');
+            td.textContent = t;
+            tr.append(td);
+          });
+          tb.append(tr);
+        });
+
+        // 条形图：模型大小（对数）
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+        const Ns = ROWS.map((r) => solve(r.r).N);
+        const lo = Math.floor(Math.log10(Math.min(...Ns))) ,
+          hi = Math.ceil(Math.log10(Math.max(...Ns)));
+        const px = (lx: number) => ML + ((lx - lo) / (hi - lo)) * (W - ML - MR);
+        for (let e = lo; e <= hi; e++) {
+          const x = px(e);
+          svg.append(svgEl('line', { class: 'grid', x1: x, y1: MT, x2: x, y2: H - MB }));
+          svg.append(svgEl('text', { x, y: H - MB + 12, 'text-anchor': 'middle' }, `10^${e}`));
+        }
+        svg.append(svgEl('line', { class: 'axis', x1: ML, y1: H - MB, x2: W - MR, y2: H - MB }));
+        svg.append(
+          svgEl('text', { class: 'title', x: 4, y: 14 }, '同一笔算力，这些配方各自会训多大的模型'),
+        );
+        svg.append(
+          svgEl('text', { x: (ML + W - MR) / 2, y: H - 3, 'text-anchor': 'middle' }, '参数量（对数）'),
+        );
+
+        const bh = (H - MT - MB) / ROWS.length;
+        ROWS.forEach((row, i) => {
+          const N = solve(row.r).N;
+          const y = MT + i * bh + 2;
+          svg.append(
+            svgEl('rect', {
+              class: `bar ${row.tag ?? ''}`,
+              x: ML,
+              y,
+              width: Math.max(px(Math.log10(N)) - ML, 1),
+              height: bh - 4,
+              rx: 2,
+            }),
+          );
+          svg.append(svgEl('text', { class: 'lab', x: ML - 5, y: y + bh / 2, 'text-anchor': 'end' }, row.name));
+          svg.append(
+            svgEl('text', { class: 'lab', x: px(Math.log10(N)) + 4, y: y + bh / 2 }, fmtP(N)),
+          );
+        });
+        $('[data-plot]').replaceChildren(svg);
+
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        const s = document.createElement('strong');
+        s.textContent = `${Math.sqrt(215 / 20).toFixed(1)} 倍`;
+        v.append(
+          document.createTextNode(
+            '注意两件事。第一，比值只影响模型大小的平方根 —— N ∝ 1/√r，所以从 20:1 走到 215:1，' +
+              '同样的算力下模型只缩小 ',
+          ),
+          s,
+          document.createTextNode(
+            '，但推理时每个 token 的成本也就跟着降这么多，这正是第 9 讲说的「为服务而过训练」。' +
+              '第二，黄色那行的口径不一样：Hunyuan 的 96:1 是对激活参数算的，' +
+              '一个稀疏度 8 的 MoE 总参数会是激活参数的 8 倍。' +
+              '所以把 MoE 的比值和稠密模型的比值直接放在一起比大小是没有意义的 —— ' +
+              '这就是第 9 讲那个「一个参数值多少钱」的问题在这一讲的回声。',
+          ),
+        );
+      }
+
+      const PRESETS: Record<string, number> = { gopher: Math.log10(5.76e23), l3: Math.log10(4e25) };
+      root.querySelectorAll<HTMLButtonElement>('[data-preset]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          $<HTMLInputElement>('[data-c]').value = String(PRESETS[btn.dataset.preset!]);
+          draw();
+        });
+      });
+      root.querySelectorAll('input').forEach((el) => el.addEventListener('input', draw));
+      draw();
+    });
+  }
+
+  setupL11Ratios();
+  document.addEventListener('astro:page-load', setupL11Ratios);
+</script>

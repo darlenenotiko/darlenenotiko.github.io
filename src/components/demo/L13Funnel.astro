@@ -1,0 +1,343 @@
+---
+// DCLM-pool → DCLM-baseline 的过滤漏斗。
+// 每一档的百分比来自 DCLM 论文图 4（DataComp-LM），口径是「占原始文档数的比例」。
+// 可以逐档开关，看活下来的比例怎么塌到 1.4%。
+---
+
+<div class="demo" data-demo="l13-funnel">
+  <div class="ctrl">
+    <span class="tag">开关每一道过滤</span>
+    <button data-all="1">全开</button>
+    <button data-all="0">全关</button>
+  </div>
+
+  <div class="stages" data-stages></div>
+
+  <div class="plot" data-plot></div>
+
+  <table class="out" data-out><tbody></tbody></table>
+  <p class="verdict" data-verdict></p>
+</div>
+
+<style>
+  .demo {
+    margin: 2rem 0;
+    padding: 0.9rem 1.2rem 1.2rem;
+    background: var(--bg-sunken);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+  }
+  .ctrl {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.6rem;
+  }
+  .tag {
+    font-size: 0.75rem;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .ctrl button {
+    padding: 0.26rem 0.65rem;
+    font: inherit;
+    font-size: 0.78rem;
+    color: var(--ink-muted);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .ctrl button:hover {
+    color: var(--indigo);
+    border-color: var(--indigo);
+  }
+
+  .stages {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    margin-bottom: 0.8rem;
+  }
+  .stages :global(button) {
+    padding: 0.24rem 0.6rem;
+    font: inherit;
+    font-size: 0.76rem;
+    color: var(--ink-faint);
+    background: var(--bg-raised);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: all 0.2s var(--ease);
+  }
+  .stages :global(button.on) {
+    color: var(--bg);
+    background: var(--indigo);
+    border-color: var(--indigo);
+  }
+  .stages :global(button.on.dedup) {
+    background: var(--indigo-soft);
+    border-color: var(--indigo-soft);
+  }
+  .stages :global(button.on.model) {
+    background: var(--weld);
+    border-color: var(--weld);
+  }
+
+  .plot {
+    overflow-x: auto;
+  }
+  .plot :global(svg) {
+    display: block;
+    width: 100%;
+    min-width: 420px;
+    height: auto;
+  }
+  .plot :global(.keep) {
+    fill: var(--indigo);
+  }
+  .plot :global(.keep.dedup) {
+    fill: var(--indigo-soft);
+  }
+  .plot :global(.keep.model) {
+    fill: var(--weld);
+  }
+  .plot :global(.gone) {
+    fill: var(--rule);
+  }
+  .plot :global(.link) {
+    fill: var(--indigo);
+    opacity: 0.18;
+  }
+  .plot :global(.axis) {
+    stroke: var(--rule);
+    stroke-width: 1;
+  }
+  .plot :global(text) {
+    fill: var(--ink-faint);
+    font-family: var(--font-mono);
+    font-size: 8.5px;
+  }
+  .plot :global(text.pct) {
+    fill: var(--madder);
+    font-size: 10px;
+    font-weight: 700;
+  }
+  .plot :global(text.title) {
+    fill: var(--indigo);
+    font-size: 10.5px;
+    font-weight: 700;
+  }
+
+  .out {
+    width: 100%;
+    margin-top: 0.9rem;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+  }
+  .out :global(td) {
+    padding: 0.28rem 0.35rem;
+    border-bottom: 1px solid var(--rule);
+    color: var(--ink-muted);
+  }
+  .out :global(td.v) {
+    text-align: right;
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+    white-space: nowrap;
+  }
+  .out :global(tr.hi td) {
+    color: var(--madder);
+    font-weight: 700;
+  }
+
+  .verdict {
+    margin: 0.9rem 0 0;
+    font-size: 0.85rem;
+    line-height: 1.75;
+    color: var(--ink-muted);
+  }
+  .verdict :global(strong) {
+    color: var(--madder);
+  }
+</style>
+
+<script>
+  function setupL13Funnel() {
+    document.querySelectorAll<HTMLElement>('[data-demo="l13-funnel"]').forEach((root) => {
+      if (root.dataset.ready) return;
+      root.dataset.ready = '1';
+
+      const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+      const svgEl = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+        const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+        if (text !== undefined) e.textContent = text;
+        return e;
+      };
+
+      // DCLM 论文图 4：百分比都是「占原始文档数」的比例
+      type Stage = { name: string; cut: number; group: 'rule' | 'dedup' | 'model'; on: boolean };
+      const ST: Stage[] = [
+        { name: 'URL 过滤', cut: 0.8, group: 'rule', on: true },
+        { name: '英语过滤', cut: 50.8, group: 'rule', on: true },
+        { name: '其它规则（词长 / 省略号 / 停用词）', cut: 9.0, group: 'rule', on: true },
+        { name: '页面长度过滤', cut: 7.9, group: 'rule', on: true },
+        { name: '重复度过滤', cut: 9.6, group: 'rule', on: true },
+        { name: '词删除比例过滤', cut: 2.0, group: 'rule', on: true },
+        { name: 'Bloom filter 去重', cut: 6.2, group: 'dedup', on: true },
+        { name: 'fastText 质量分类器', cut: 12.3, group: 'model', on: true },
+      ];
+
+      const POOL_TOK = 240e12; // DCLM-pool 的 token 数
+
+      function survivals() {
+        // 每一道过滤切掉的是「原始文档数」的固定比例，所以是逐项相减
+        const s = [100];
+        let cur = 100;
+        ST.forEach((st) => {
+          if (st.on) cur -= st.cut;
+          s.push(cur);
+        });
+        return s;
+      }
+
+      function draw() {
+        const s = survivals();
+        const final = s[s.length - 1];
+
+        // ── 漏斗图 ──
+        const W = 620,
+          H = 210,
+          ML = 14,
+          MR = 60,
+          MT = 26,
+          MB = 44;
+        const bw = (W - ML - MR) / (ST.length + 1);
+        const maxH = H - MT - MB;
+        const mid = MT + maxH / 2;
+        const hOf = (v: number) => (v / 100) * maxH;
+
+        const svg = svgEl('svg', { viewBox: `0 0 ${W} ${H}` });
+        svg.append(
+          svgEl('text', { class: 'title', x: 4, y: 12 }, '柱高 = 还剩多少比例的原始文档（DCLM 论文图 4，口径是文档数）'),
+        );
+
+        for (let i = 0; i < s.length; i++) {
+          const x = ML + i * bw;
+          const h = hOf(s[i]);
+          const cls = i === 0 ? '' : ST[i - 1].group === 'rule' ? '' : ' ' + ST[i - 1].group;
+          // 连接带
+          if (i > 0) {
+            const hp = hOf(s[i - 1]);
+            const xp = ML + (i - 1) * bw;
+            svg.append(
+              svgEl('polygon', {
+                class: 'link',
+                points: [
+                  `${xp + bw * 0.52},${mid - hp / 2}`,
+                  `${x},${mid - h / 2}`,
+                  `${x},${mid + h / 2}`,
+                  `${xp + bw * 0.52},${mid + hp / 2}`,
+                ].join(' '),
+              }),
+            );
+          }
+          svg.append(svgEl('rect', { class: 'gone', x, y: MT, width: bw * 0.52, height: maxH, rx: 1, opacity: 0.35 }));
+          svg.append(svgEl('rect', { class: 'keep' + cls, x, y: mid - h / 2, width: bw * 0.52, height: Math.max(h, 0.6), rx: 1 }));
+
+          const lab = i === 0 ? 'DCLM-pool' : ST[i - 1].name;
+          const on = i === 0 || ST[i - 1].on;
+          // 标签竖着排，免得挤在一起
+          const tx = x + bw * 0.26;
+          const t = svgEl(
+            'text',
+            {
+              x: tx,
+              y: H - MB + 8,
+              'text-anchor': 'end',
+              transform: `rotate(-32 ${tx} ${H - MB + 8})`,
+              opacity: on ? 1 : 0.4,
+            },
+            (on ? '' : '（关）') + lab,
+          );
+          svg.append(t);
+          svg.append(
+            svgEl(
+              'text',
+              { x: tx, y: mid - h / 2 - 4, 'text-anchor': 'middle', opacity: on ? 1 : 0.4 },
+              s[i].toFixed(1) + '%',
+            ),
+          );
+        }
+        svg.append(
+          svgEl('text', { class: 'pct', x: W - MR + 6, y: mid + 4 }, final.toFixed(1) + '%'),
+        );
+        svg.append(svgEl('text', { x: W - MR + 6, y: mid + 16 }, '活下来'));
+        $('[data-plot]').replaceChildren(svg);
+
+        // ── 读数表 ──
+        const tb = $('[data-out] tbody');
+        tb.replaceChildren();
+        const row = (k: string, v: string, cls = '') => {
+          const tr = document.createElement('tr');
+          if (cls) tr.className = cls;
+          const a = document.createElement('td');
+          a.textContent = k;
+          const b = document.createElement('td');
+          b.className = 'v';
+          b.textContent = v;
+          tr.append(a, b);
+          tb.append(tr);
+        };
+        const cutSum = ST.filter((x) => x.on).reduce((a, x) => a + x.cut, 0);
+        row('起点：DCLM-pool', '100.0% ｜ 240T token');
+        row('打开的过滤一共切掉', cutSum.toFixed(1) + '%');
+        row('剩下的文档比例', final.toFixed(1) + '%', 'hi');
+        row('按这个比例折算的 token 量', (POOL_TOK * final) / 100 >= 1e12 ? ((POOL_TOK * final) / 100 / 1e12).toFixed(2) + 'T' : ((POOL_TOK * final) / 100 / 1e9).toFixed(0) + 'B', 'hi');
+        row('论文实际发布的 DCLM-baseline', '1.4% 文档 ｜ 3.8T token');
+
+        const v = $('[data-verdict]');
+        v.replaceChildren();
+        const strong = document.createElement('strong');
+        strong.textContent = final.toFixed(1) + '%';
+        v.append(
+          document.createTextNode('全部打开时只剩 '),
+          strong,
+          document.createTextNode(
+            '。注意两件事。第一，切得最狠的是「英语过滤」一档，一下拿走 50.8% —— 一个只训英语的模型，光在语言这一关就扔掉了一半互联网。第二，最后那道 fastText 质量分类器从 13.7% 砍到 1.4%，也就是说这一道扔掉的量比前面所有规则加起来还多；它是 DCLM 效果好的关键，也是整条管线里最靠「感觉」的一步。另外注意口径：图上的百分比是按文档数算的（1.4%），而 token 口径是 3.8T ÷ 240T ≈ 1.58% —— 两个数不是一回事，因为被留下的文档普遍更长。',
+          ),
+        );
+      }
+
+      const btnWrap = $('[data-stages]');
+      ST.forEach((st, i) => {
+        const b = document.createElement('button');
+        b.className = 'on ' + st.group;
+        b.textContent = `${st.name} −${st.cut.toFixed(1)}%`;
+        b.addEventListener('click', () => {
+          ST[i].on = !ST[i].on;
+          b.classList.toggle('on', ST[i].on);
+          draw();
+        });
+        btnWrap.append(b);
+      });
+      root.querySelectorAll<HTMLButtonElement>('[data-all]').forEach((b) => {
+        b.addEventListener('click', () => {
+          const on = b.dataset.all === '1';
+          ST.forEach((st) => (st.on = on));
+          btnWrap.querySelectorAll('button').forEach((x) => x.classList.toggle('on', on));
+          draw();
+        });
+      });
+
+      draw();
+    });
+  }
+
+  setupL13Funnel();
+  document.addEventListener('astro:page-load', setupL13Funnel);
+</script>
