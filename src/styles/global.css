@@ -113,6 +113,10 @@
      想让宽图重新挣脱正文栏，把这里改成 100cqw（= .page 内容框，约 1000px）即可，
      正文里 263 处 wide 标记不用动。 */
   --fig-wide: 100%;
+  /* 左侧目录栏的宽度与它到正文的距离。两者加上 --measure 决定了分栏阈值：
+     15rem + 3.5rem + 552px ≈ 848px，所以阈值取 900px（见 .note-layout）。 */
+  --toc-w: 15rem;
+  --toc-gap: 3.5rem;
   --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
 }
 
@@ -400,6 +404,58 @@ thead th {
   max-width: var(--measure);
 }
 .prose > * + * { margin-top: 1.1em; }
+
+/* 点目录里的链接跳过去时，站点头（sticky，60px）会盖住标题 —— 留出让位。 */
+.prose :is(h1, h2, h3, h4) {
+  scroll-margin-top: calc(60px + 1rem);
+}
+
+/* ── 文章页分栏：左目录 + 正文 ───────────────────────────────
+   源码顺序固定是 header → aside.toc-rail → article.prose。
+   窄屏什么都不做，按源码顺序竖着排，正好是改版前的样子（标题、目录、正文）；
+   宽屏才把目录抓到左边一栏去。 */
+.note-layout {
+  display: grid;
+  grid-template-columns: minmax(0, var(--measure));
+}
+
+/* 阈值与 Toc.astro 里目录换形态的阈值是同一个 900px，改一个要改两个。
+   查的是 .page 的 inline-size（.page 设了 container-type），不是视口 ——
+   视口宽度含滚动条，而且这里真正关心的就是「内容框够不够放下两栏」。 */
+@container (min-width: 900px) {
+  /* 没有目录时（标题太少，Toc 整个不渲染）保持单列，别留一条空栏 */
+  .note-layout:has(> .toc-rail) {
+    grid-template-columns: var(--toc-w) minmax(0, var(--measure));
+    /* 右栏固定三块：标题 / 正文 / 底部导航。行数是写死的，因为目录那一栏要用
+       grid-row: 1 / -1 铺满，而 -1 只认显式行。以后右栏多一块，这里也要多一行，
+       否则新那块会被自动排版塞进左边的目录栏里。 */
+    grid-template-rows: auto 1fr auto;
+    column-gap: var(--toc-gap);
+    /* 正文原来是在 1000px 内容框里左对齐的，右边空一大片。
+       现在把「目录 + 正文」当一个整体居中，左边这一栏就是从那片空白里来的。 */
+    justify-content: center;
+  }
+  /* 让这一栏撑满整列高度 —— 里面的 .toc 是 sticky 的，
+     它能跟着滚多远，取决于这个格子有多高。写 align-self: start 会让格子
+     缩到目录自身的高度，sticky 立刻失效。 */
+  .note-layout:has(> .toc-rail) > .toc-rail {
+    grid-column: 1;
+    grid-row: 1 / -1;
+    min-width: 0;
+  }
+  .note-layout:has(> .toc-rail) > .post-head {
+    grid-column: 2;
+    grid-row: 1;
+  }
+  .note-layout:has(> .toc-rail) > .prose {
+    grid-column: 2;
+    grid-row: 2;
+  }
+  .note-layout:has(> .toc-rail) > :is(.pager, .back) {
+    grid-column: 2;
+    grid-row: 3;
+  }
+}
 
 /* 文章里的 section 标题：左挂一枚 indigo 织结，下压一条茜红细线 —— loom.cls 的签名 */
 .prose h2 {

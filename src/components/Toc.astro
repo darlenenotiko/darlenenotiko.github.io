@@ -1,0 +1,108 @@
+---
+// 文章目录。两种形态，由 .page 的容器查询切换（见 global.css 的 .note-layout）：
+//   窄屏 —— 正文上方的一张卡片（原来的样子）
+//   宽屏 —— 正文左侧的常驻栏，随页面滚动吸顶
+// 布局（grid 分栏、sticky 的定位）在 global.css 里，这里只管目录自己长什么样。
+import type { MarkdownHeading } from 'astro';
+
+interface Props {
+  headings: MarkdownHeading[];
+}
+
+const { headings } = Astro.props;
+const items = headings.filter((h) => h.depth <= 3);
+---
+
+{
+  /* 只有两三个标题时目录没有意义，直接不渲染 —— 这一步在组件里做，
+     省得两个渲染页各写一遍同样的判断。注意：不渲染时连 <aside> 都没有，
+     .note-layout 的 grid 会自动退回单列（见 :has(.toc-rail) 选择器）。 */
+  items.length > 2 && (
+    <aside class="toc-rail">
+      <nav class="toc" aria-label="目录" data-reveal>
+        <span class="toc-title">目录</span>
+        <ul>
+          {items.map((h) => (
+            <li data-depth={h.depth}>
+              <a href={`#${h.slug}`}>{h.text}</a>
+            </li>
+          ))}
+        </ul>
+      </nav>
+    </aside>
+  )
+}
+
+<style>
+  /* ── 窄屏：正文上方的卡片（与改版前完全一致） ───────────────── */
+  .toc {
+    margin: 0 0 2.5rem;
+    padding: 1rem 1.2rem;
+    background: var(--bg-sunken);
+    border-radius: 10px;
+    font-size: 0.9rem;
+  }
+  .toc-title {
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--ink-faint);
+    text-transform: uppercase;
+  }
+  .toc ul {
+    margin: 0.6rem 0 0;
+    padding: 0;
+    list-style: none;
+  }
+  .toc li {
+    padding: 0.16rem 0;
+  }
+  .toc li[data-depth='3'] {
+    padding-left: 1.1rem;
+    font-size: 0.86rem;
+  }
+  .toc a {
+    color: var(--ink-muted);
+    text-decoration: none;
+  }
+  .toc a:hover {
+    color: var(--accent);
+  }
+
+  /* ── 宽屏：左侧常驻栏 ───────────────────────────────────────
+     阈值与 .note-layout 分栏的阈值必须是同一个值，否则会出现
+     「已经分栏了但目录还是卡片」这种中间态。改一个记得改另一个。 */
+  @container (min-width: 900px) {
+    .toc {
+      position: sticky;
+      /* 站点头是 sticky 的 60px，再留一点呼吸 */
+      top: calc(60px + 1.5rem);
+      /* 讲义动辄 40~60 条标题，不给高度上限的话目录会长过一屏，
+         底部那些永远够不着 —— 必须自己能滚。 */
+      max-height: calc(100vh - 60px - 3rem);
+      overflow-y: auto;
+      overscroll-behavior: contain;
+      scrollbar-width: thin;
+      margin: 0;
+      /* 卡片的底色和圆角在这里是噪音，换成一条竖线把它和正文分开 */
+      padding: 0 1rem 0 0;
+      background: none;
+      border-radius: 0;
+      border-right: 1px solid var(--rule);
+      font-size: 0.84rem;
+      line-height: 1.5;
+    }
+    .toc li {
+      padding: 0.3rem 0;
+    }
+    .toc li[data-depth='3'] {
+      padding-left: 0.9rem;
+      font-size: 0.8rem;
+      color: var(--ink-faint);
+    }
+    .toc a {
+      display: block;
+      text-wrap: pretty;
+    }
+  }
+</style>

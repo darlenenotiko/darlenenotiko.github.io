@@ -3,6 +3,7 @@ import { getCollection, render } from 'astro:content';
 import BaseLayout from '../../layouts/BaseLayout.astro';
 import * as MDX from '../../components/mdx';
 import Annotatable from '../../components/Annotatable.astro';
+import Toc from '../../components/Toc.astro';
 
 // 讲次显示名：客座讲座这类没有编号的用 lectureLabel 覆盖。
 //
@@ -42,7 +43,10 @@ const fmt = (d: Date) =>
 ---
 
 <BaseLayout title={note.data.title} description={note.data.description}>
-  <article class="prose">
+  {/* 源码顺序 header → aside(目录) → article 是布局的前提：
+      窄屏直接按这个顺序竖排，就是「标题 / 目录 / 正文」；宽屏才分成两栏。
+      分栏规则在 global.css 的 .note-layout。 */}
+  <div class="note-layout">
     <header class="post-head">
       <a href="/courses" class="course-name">{note.data.courseTitle}</a>
       <h1>{label(note.data)} · {note.data.title}</h1>
@@ -61,36 +65,24 @@ const fmt = (d: Date) =>
       </div>
     </header>
 
-    {
-      headings.filter((h) => h.depth <= 3).length > 2 && (
-        <nav class="toc" data-reveal>
-          <span class="toc-title">目录</span>
-          <ul>
-            {headings
-              .filter((h) => h.depth <= 3)
-              .map((h) => (
-                <li data-depth={h.depth}>
-                  <a href={`#${h.slug}`}>{h.text}</a>
-                </li>
-              ))}
-          </ul>
-        </nav>
-      )
-    }
+    <Toc headings={headings} />
 
-    {/* 组件在这里注入 —— MDX 文件内直接写 <Theorem> / <BpeTrainer> 即可，无需 import */}
-    <Annotatable docId={`courses/${note.id}`}>
-      <Content components={MDX} />
-    </Annotatable>
+    <article class="prose">
+      {/* 组件在这里注入 —— MDX 文件内直接写 <Theorem> / <BpeTrainer> 即可，无需 import */}
+      <Annotatable docId={`courses/${note.id}`}>
+        <Content components={MDX} />
+      </Annotatable>
 
-    {
-      note.data.slides && (
-        <p class="source">讲义据课件与课堂录音字幕整理，原始课件：{note.data.slides}</p>
-      )
-    }
-  </article>
+      {
+        note.data.slides && (
+          <p class="source">讲义据课件与课堂录音字幕整理，原始课件：{note.data.slides}</p>
+        )
+      }
+    </article>
 
-  <nav class="pager">
+    {/* pager 也放进 .note-layout：正文现在是居中那一栏，
+        pager 留在外面会以页面左边缘对齐，跟正文错开一大截。 */}
+    <nav class="pager">
     {
       prev ? (
         <a href={`/courses/${prev.id}`} class="pager-link prev">
@@ -113,7 +105,8 @@ const fmt = (d: Date) =>
         </a>
       )
     }
-  </nav>
+    </nav>
+  </div>
 </BaseLayout>
 
 <style>
@@ -158,39 +151,7 @@ const fmt = (d: Date) =>
     color: var(--ink-muted);
   }
 
-  .toc {
-    margin: 0 0 2.5rem;
-    padding: 1rem 1.2rem;
-    background: var(--bg-sunken);
-    border-radius: 10px;
-    font-size: 0.9rem;
-  }
-  .toc-title {
-    font-size: 0.78rem;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-    color: var(--ink-faint);
-    text-transform: uppercase;
-  }
-  .toc ul {
-    margin: 0.6rem 0 0;
-    padding: 0;
-    list-style: none;
-  }
-  .toc li {
-    padding: 0.16rem 0;
-  }
-  .toc li[data-depth='3'] {
-    padding-left: 1.1rem;
-    font-size: 0.86rem;
-  }
-  .toc a {
-    color: var(--ink-muted);
-    text-decoration: none;
-  }
-  .toc a:hover {
-    color: var(--accent);
-  }
+  /* 目录的样式都在 components/Toc.astro 里 */
 
   .source {
     margin-top: 3rem;

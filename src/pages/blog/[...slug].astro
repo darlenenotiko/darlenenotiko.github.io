@@ -3,6 +3,7 @@ import { getCollection, render } from 'astro:content';
 import BaseLayout from '../../layouts/BaseLayout.astro';
 import * as MDX from '../../components/mdx';
 import Annotatable from '../../components/Annotatable.astro';
+import Toc from '../../components/Toc.astro';
 
 export async function getStaticPaths() {
   const posts = await getCollection('blog', ({ data }) => !data.draft);
@@ -17,7 +18,8 @@ const fmt = (d: Date) =>
 ---
 
 <BaseLayout title={post.data.title} description={post.data.description}>
-  <article class="prose">
+  {/* 源码顺序 header → aside(目录) → article 是布局的前提，见 courses/[...slug].astro 的注释 */}
+  <div class="note-layout">
     <header class="post-head">
       <h1>{post.data.title}</h1>
       <div class="meta">
@@ -36,30 +38,18 @@ const fmt = (d: Date) =>
       </div>
     </header>
 
-    {
-      headings.filter((h) => h.depth <= 3).length > 2 && (
-        <nav class="toc" data-reveal>
-          <span class="toc-title">目录</span>
-          <ul>
-            {headings
-              .filter((h) => h.depth <= 3)
-              .map((h) => (
-                <li data-depth={h.depth}>
-                  <a href={`#${h.slug}`}>{h.text}</a>
-                </li>
-              ))}
-          </ul>
-        </nav>
-      )
-    }
+    <Toc headings={headings} />
 
-    {/* 组件在这里注入 —— MDX 文件内直接写 <Theorem> 即可，无需 import */}
-    <Annotatable docId={`blog/${post.id}`}>
-      <Content components={MDX} />
-    </Annotatable>
-  </article>
+    <article class="prose">
+      {/* 组件在这里注入 —— MDX 文件内直接写 <Theorem> 即可，无需 import */}
+      <Annotatable docId={`blog/${post.id}`}>
+        <Content components={MDX} />
+      </Annotatable>
+    </article>
 
-  <a href="/blog" class="back">← 回到博客</a>
+    {/* 同 courses：放进 .note-layout 才能跟正文对齐 */}
+    <a href="/blog" class="back">← 回到博客</a>
+  </div>
 </BaseLayout>
 
 <style>
@@ -100,39 +90,7 @@ const fmt = (d: Date) =>
     border-color: var(--accent);
   }
 
-  .toc {
-    margin: 0 0 2.5rem;
-    padding: 1rem 1.2rem;
-    background: var(--bg-sunken);
-    border-radius: 10px;
-    font-size: 0.9rem;
-  }
-  .toc-title {
-    font-size: 0.78rem;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-    color: var(--ink-faint);
-    text-transform: uppercase;
-  }
-  .toc ul {
-    margin: 0.6rem 0 0;
-    padding: 0;
-    list-style: none;
-  }
-  .toc li {
-    padding: 0.16rem 0;
-  }
-  .toc li[data-depth='3'] {
-    padding-left: 1.1rem;
-    font-size: 0.86rem;
-  }
-  .toc a {
-    color: var(--ink-muted);
-    text-decoration: none;
-  }
-  .toc a:hover {
-    color: var(--accent);
-  }
+  /* 目录的样式都在 components/Toc.astro 里 */
 
   .back {
     display: inline-block;
