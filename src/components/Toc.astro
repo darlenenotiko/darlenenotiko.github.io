@@ -130,56 +130,79 @@ const items = headings.filter((h) => h.depth <= 3);
     }
     .toc-title {
       display: block;
-      padding-left: 0.95rem;
+      /* 与条目文字左端对齐：.toc-body 的 0.6rem + <a> 自己的 0.55rem */
+      padding-left: 1.15rem;
       margin-bottom: 0.2rem;
     }
-    /* 滑块的滑轨 */
+    /* 只留一条窄过道给滑块站，不再画竖线当滑轨 ——
+       滑块已经挪到紧贴条目了，再来一条远处的竖线就是两条平行线，很乱。 */
     .toc-body {
-      border-left: 1px solid var(--rule);
-      padding-left: 0.95rem;
+      padding-left: 0.6rem;
     }
     .toc ul {
       margin: 0;
     }
+    /* 间距从 li 挪到 a 上：底色块是铺在 <a> 上的，垂直内距得算进色块里，
+       否则色块只有文字那么高，看着像贴纸。 */
     .toc li {
-      padding: 0.3rem 0;
+      padding: 0;
     }
     .toc li[data-depth='3'] {
-      padding-left: 0.9rem;
       font-size: 0.8rem;
     }
     .toc a {
       display: block;
+      padding: 0.3rem 0.55rem;
+      border-radius: 4px;
       text-wrap: pretty;
-      transition: color 0.2s var(--ease), transform 0.2s var(--ease);
+      transition: color 0.2s var(--ease), opacity 0.25s var(--ease),
+        background-color 0.2s var(--ease), transform 0.2s var(--ease);
+    }
+    /* h3 的缩进走 margin 而不是 padding，好让底色块也跟着缩进 */
+    .toc li[data-depth='3'] a {
+      margin-left: 0.85rem;
+      color: var(--ink-faint);
     }
     .toc a:hover {
       transform: translateX(2px);
     }
-    .toc li[data-depth='3'] a {
-      color: var(--ink-faint);
-    }
 
-    /* 当前所在的那一条 */
+    /* 当前所在的那一条。用茜红而不是靛蓝：靛蓝是这个站的结构色（标题、链接、
+       目录本身都是它的近亲），当前项染成靛蓝就淹没在同色系里；茜红是系统里
+       专门用来强调的那支染料（h2 下划线、表格高亮行用的都是它），
+       在奶油底上跳得出来。 */
     .toc a.is-active {
-      color: var(--accent);
-      font-weight: 500;
+      color: var(--madder);
+      font-weight: 600;
+      background: color-mix(in srgb, var(--madder) 9%, transparent);
     }
-    /* 当前 h3 所属的那个 h2：比正常亮、比 active 淡，用来交代「在哪一章」 */
+    /* 当前 h3 所属的那个 h2：交代「在哪一章」。
+       原来只是把 --ink-muted 换成 --ink，实测肉眼分辨不出，等于没做，所以加粗。 */
     .toc a.is-section {
       color: var(--ink);
+      font-weight: 600;
+    }
+    /* 不属于当前章节的条目淡出，把视线收到当前这一段。
+       鼠标移进目录时全部恢复 —— 想找一个远处的条目时不该是淡的。 */
+    .toc a.is-far {
+      opacity: 0.45;
+    }
+    .toc:hover a.is-far {
+      opacity: 1;
     }
 
-    /* 沿滑轨滑动的那一小段。位置和高度由 JS 写在 style 上。 */
+    /* 滑到当前条目左边的那一小段竖条。x / y / 高度都由 JS 写在 style 上 ——
+       x 也得算，因为 h3 比 h2 缩进，滑块要跟着挪，才一直贴着条目而不是
+       停在远处的某条固定线上（原来就是停在 29px 外，看着像边框刻度）。 */
     .toc-marker {
       display: block;
       position: absolute;
-      left: -1px;
+      left: 0;
       top: 0;
-      width: 2px;
+      width: 3px;
       height: 0;
-      border-radius: 1px;
-      background: var(--accent);
+      border-radius: 2px;
+      background: var(--madder);
       opacity: 0;
       transition: transform 0.28s var(--ease), height 0.28s var(--ease),
         opacity 0.2s var(--ease);
@@ -246,12 +269,15 @@ const items = headings.filter((h) => h.depth <= 3);
         marker.style.opacity = '0';
         return;
       }
-      const li = a.parentElement as HTMLElement;
-      // 用 rect 之差而不是 offsetTop：offsetTop 依赖 offsetParent 是谁，
+      // 量 <a> 而不是 <li>：底色块和缩进都在 <a> 上，滑块要跟色块对齐。
+      // 用 rect 之差而不是 offsetTop/offsetLeft：那两个依赖 offsetParent 是谁，
       // 而 .toc 只有在栏形态下才是 positioned，卡片形态下会算到别处去。
-      const top = li.getBoundingClientRect().top - body.getBoundingClientRect().top;
-      marker.style.height = `${li.offsetHeight}px`;
-      marker.style.transform = `translateY(${top}px)`;
+      const ra = a.getBoundingClientRect();
+      const rb = body.getBoundingClientRect();
+      // 往左让开 7px，滑块就落在色块左缘外面一点，看着是「挂」在这一条上
+      const x = Math.max(0, ra.left - rb.left - 7);
+      marker.style.height = `${Math.round(ra.height)}px`;
+      marker.style.transform = `translate(${Math.round(x)}px, ${Math.round(ra.top - rb.top)}px)`;
       marker.style.opacity = '1';
     };
 
@@ -273,14 +299,21 @@ const items = headings.filter((h) => h.depth <= 3);
     const setActive = (id: string | null) => {
       if (id === active) return;
       active = id;
-      for (const a of links) a.classList.remove('is-active', 'is-section');
+      for (const a of links) a.classList.remove('is-active', 'is-section', 'is-far');
       const a = id ? byId.get(id) : undefined;
       if (!a) {
+        // 还没滚到第一个标题：不点亮也不淡化，整份目录保持原样
         moveMarker(null);
         return;
       }
       a.classList.add('is-active');
-      sectionOf.get(a)?.classList.add('is-section');
+      // h2 条目自己就是自己的章
+      const section = sectionOf.get(a) ?? a;
+      section.classList.add('is-section');
+      for (const l of links) {
+        if (l !== a && l !== section && (sectionOf.get(l) ?? l) !== section)
+          l.classList.add('is-far');
+      }
       moveMarker(a);
       revealInRail(a);
     };
