@@ -15,6 +15,8 @@ const dates: Date[] = [
   ...(await getCollection('blog', ({ data }) => !data.draft)).map((p) => p.data.date),
   ...(await getCollection('logs')).map((p) => p.data.date),
   ...(await getCollection('projects', ({ data }) => !data.draft)).map((p) => p.data.date),
+  // 讲义是站里更新量最大的一类，漏掉它这块布几乎是空的
+  ...(await getCollection('courses', ({ data }) => !data.draft)).map((p) => p.data.date),
 ];
 
 const key = (d: Date) => d.toISOString().slice(0, 10);

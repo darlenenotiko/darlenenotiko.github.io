@@ -39,7 +39,7 @@ const path = Astro.url.pathname;
 
     {/* 社交分享卡：Open Graph + Twitter，绝对图地址 */}
     <meta property="og:type" content="website" />
-    <meta property="og:site_name" content="个人主页" />
+    <meta property="og:site_name" content="笔记" />
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
     <meta property="og:url" content={canonicalURL} />
@@ -70,7 +70,7 @@ const path = Astro.url.pathname;
       <div class="page header-inner">
         <a href="/" class="brand">
           <span class="loomtile brand-tile" aria-hidden="true"></span>
-          姓名
+          笔记
         </a>
         <nav>
           {
@@ -107,7 +107,7 @@ const path = Astro.url.pathname;
       {/* selvage：布匹的织边，一条极淡的平纹条 */}
       <div class="selvage" aria-hidden="true"></div>
       <div class="page footer-inner">
-        <span>© {new Date().getFullYear()} 姓名</span>
+        <span>© {new Date().getFullYear()}</span>
         <span class="dot">·</span>
         <a href="/rss.xml">RSS</a>
         <span class="dot">·</span>
