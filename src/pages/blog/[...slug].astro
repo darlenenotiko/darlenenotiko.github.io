@@ -81,6 +81,9 @@ const fmt = (d: Date) =>
   }
   .tags {
     display: flex;
+    /* 同 courses：标签行必须能折行，否则窄屏会把整页撑出横向滚动条 */
+    flex-wrap: wrap;
+    min-width: 0;
     gap: 0.45rem;
   }
   .tag {

@@ -32,6 +32,9 @@
     background: var(--bg-sunken);
     border: 1px solid var(--rule);
     border-radius: 10px;
+    /* 两列/一列要按「这个 demo 实际有多宽」来决定，不是按视口宽度 ——
+       demo 装在 66ch 的正文栏里，视口 700px 时正文只有 552px。 */
+    container-type: inline-size;
   }
   .lead {
     margin: 0 0 0.6rem;
@@ -54,12 +57,15 @@
     display: grid;
     gap: 0.9rem;
   }
-  @media (min-width: 640px) {
+  @container (min-width: 480px) {
     .models {
       grid-template-columns: 1fr 1fr;
     }
   }
   .models :global(.m) {
+    /* 网格项默认 min-width:auto，会被内容的 min-content 撑到 332px，
+       两列合计超出正文栏。允许它收缩，卡片内部自己会换行。 */
+    min-width: 0;
     padding: 0.7rem 0.9rem;
     background: var(--bg-raised);
     border: 1px solid var(--rule);

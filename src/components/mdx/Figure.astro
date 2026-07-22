@@ -39,13 +39,22 @@ const isVideo = video || /\.(mp4|webm|mov)$/i.test(src);
     margin: 2rem 0;
   }
   .figure.wide {
-    /* 挣脱正文测量宽度，最宽到页面容器 */
-    width: min(var(--page), 92vw);
-    margin-inline: calc(50% - min(var(--page), 92vw) / 2);
+    /* 宽度由 --fig-wide 一处控制（见 global.css），上限是 .page 的内容框。
+       曾经写的是 margin-inline: calc(50% - min(var(--page), 92vw) / 2)，那是错的：
+       那个 50% 解析的是包含块 .prose 的宽度（66ch ≈ 552px）而不是页面宽度，
+       而 .prose 在 .page 里是左对齐、不是居中，于是算出 -264px，
+       把图整体往左拽出页面（实测 left: -51px，左边被视口裁掉）。
+       上限用容器查询单位 cqw（相对 .page 的内容框），比 vw 准 —— vw 含滚动条，
+       窄屏上会溢出。 */
+    width: min(var(--fig-wide), 100cqw);
   }
   .figure :global(img),
   .figure :global(video) {
     display: block;
+    /* 必须是 width:100%，不能用 width:auto ——
+       <img> 没有 width/height 属性又是 loading="lazy"，auto 会让未加载的图
+       塌成 2px（实测整页 12 张图全部 2px），页面高度跟着塌，
+       图片反而永远进不了懒加载的视口阈值。 */
     width: 100%;
     border-radius: 3px;
     border: 1px solid var(--rule);

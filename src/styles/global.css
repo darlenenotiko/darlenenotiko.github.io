@@ -108,6 +108,11 @@
 
   --measure: 66ch;
   --page: 1080px;
+  --page-pad: clamp(1.2rem, 5vw, 2.5rem); /* .page 的左右留白，宽图算宽度时要用到 */
+  /* <Figure wide> 的宽度。100% = 与正文栏同宽（当前选择）；
+     想让宽图重新挣脱正文栏，把这里改成 100cqw（= .page 内容框，约 1000px）即可，
+     正文里 263 处 wide 标记不用动。 */
+  --fig-wide: 100%;
   --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
 }
 
@@ -386,7 +391,10 @@ thead th {
 .page {
   max-width: var(--page);
   margin: 0 auto;
-  padding: 0 clamp(1.2rem, 5vw, 2.5rem);
+  padding: 0 var(--page-pad);
+  /* 让 .page 成为容器查询的容器，好让正文里的宽图（.figure.wide）能用 cqw
+     精确拿到「页面内容框宽度」。用 vw 算不准 —— vw 含滚动条，窄屏上会溢出。 */
+  container-type: inline-size;
 }
 .prose {
   max-width: var(--measure);

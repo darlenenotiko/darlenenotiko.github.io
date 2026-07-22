@@ -144,6 +144,10 @@ const fmt = (d: Date) =>
   }
   .tags {
     display: flex;
+    /* 手机宽度下标签多了要能折行 —— 外层 .meta 会 wrap，但这里不 wrap 的话
+       这一排标签就是一个不可断的整体，会把整页撑出横向滚动条。 */
+    flex-wrap: wrap;
+    min-width: 0;
     gap: 0.45rem;
   }
   .tag {
