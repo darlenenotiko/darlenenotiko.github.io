@@ -1,0 +1,280 @@
+---
+title: 反向传播：每个节点只回答一个问题
+date: 2026-07-24
+description: 把反向传播看成「每个节点回答一个局部问题」，而不是一大串链式法则。
+tags: [deep-learning, autodiff]
+---
+
+你大概已经会链式法则了。那反向传播到底新在哪儿？
+
+新在两件事：**顺序**和**复用**。链式法则告诉你「一个复合函数的导数怎么拆」，
+但它没说该按什么顺序算、怎么才能不重复算。反向传播就是把链式法则组织成
+**一个不做任何重复计算的具体算法** —— 一次前向算出所有中间值，一次反向算出
+所有参数的梯度，代价和一次前向差不多。
+
+先划清一条界线，免得从头混到尾：**反向传播只负责「算出」梯度**，
+把梯度拿去更新参数（$w \leftarrow w - \eta\,\nabla_w L$）是**优化器**的事。
+这篇只讲前半段。
+
+## 一、一个节点的本分
+
+把整个计算 —— 从输入、经过每一层、一直到最后那个标量损失 $L$ —— 画成一张图：
+每个运算是一个节点，箭头表示「谁的输出喂给了谁」。这张图叫**计算图**。
+
+现在盯住图里任意一个节点。它做的事无非是拿几个输入，算出一个输出。
+反向传播里，它只需要回答**一个局部问题**：
+
+<Theorem type="definition" name="每个节点的唯一职责">
+  已知「损失有多在乎我的输出」（即上游传来的梯度 $\dfrac{\partial L}{\partial\,\text{输出}}$），
+  求「损失有多在乎我的每一个输入」（$\dfrac{\partial L}{\partial\,\text{输入}}$）。
+</Theorem>
+
+答案永远是同一个乘法：
+
+$$
+\underbrace{\frac{\partial L}{\partial\,\text{输入}}}_{\text{要传给上游的}}
+\;=\;
+\underbrace{\frac{\partial L}{\partial\,\text{输出}}}_{\text{上游传下来的}}
+\;\times\;
+\underbrace{\frac{\partial\,\text{输出}}{\partial\,\text{输入}}}_{\text{只跟这个节点自己有关}}.
+$$
+
+最后那个因子 —— **局部导数** —— 是关键：它只跟这个节点自己的运算有关，
+跟整张图长什么样、有多大，完全无关。加法节点的局部导数是 $1$，乘法节点
+$y = u\cdot v$ 对 $u$ 的局部导数是 $v$，平方节点 $y=u^2$ 的是 $2u$。
+每个节点只要事先知道怎么把「关于输出的梯度」翻译成「关于输入的梯度」，
+就够了。整个反向传播，就是每个节点各自回答这一个问题，然后把答案往上游递。
+
+<Callout type="insight" title="这就是所谓的「向量-雅可比积」（VJP）">
+  「上游梯度 × 局部导数」的严格版本，是拿上游梯度去乘这个节点的**雅可比矩阵**。
+  自动微分框架（PyTorch、JAX）里每个算子登记的 `backward`，本质就是一个 VJP：
+  给我关于输出的梯度，我还你关于输入的梯度。别的都不用管。
+</Callout>
+
+## 二、为什么要「倒着」算
+
+局部问题定了，还剩一个选择：从哪头开始算？
+
+**从输入往输出推**（前向模式）：固定一个输入 $x_i$，一路往前推出「每个中间值对
+$x_i$ 的导数」。问题是，一趟只能伺候一个输入。你有一百万个参数，就得推一百万趟。
+
+**从输出往输入推**（反向模式，也就是反向传播）：固定那个标量损失 $L$，一路往回推出
+「$L$ 对每个中间值的导数」。一趟下来，图里**所有**节点、**所有**参数的梯度全有了。
+
+差别的根源是一个不对称：训练时，**输出只有一个**（标量损失 $L$），
+**输入却有千百万个**（所有参数）。从「少的那头」倒着推，一趟通吃；
+从「多的那头」正着推，有多少输入就得推多少趟。所以要倒着算。
+
+<Callout type="note">
+  代价的粗略结论：反向模式算出「一个标量对全部参数」的完整梯度，
+  时间大约是一次前向的 2～3 倍，**与参数个数无关**。这正是训练亿级参数网络
+  在计算上可行的根本原因。
+</Callout>
+
+## 三、一个能看见「复用」的例子
+
+只有一条直链的例子看不出反向传播的好处 —— 那就是链式法则本身。
+真正的好处要在**扇出**（一个值被多处用到）时才显出来。取两个输入 $a=3,\ b=2$：
+
+$$
+c = a + b, \qquad d = a \cdot b, \qquad L = c \cdot d.
+$$
+
+注意 $a$ 同时喂给了 $c$ 和 $d$，$b$ 也是 —— 这就是扇出。先前向算出所有值：
+
+```
+前向（算“值”）:   a = 3      b = 2
+                  c = a + b = 5
+                  d = a · b = 6
+                  L = c · d  = 30
+
+边（谁喂给谁）:   a → c,  a → d      ← a 扇出到两个节点
+                  b → c,  b → d      ← b 扇出到两个节点
+                  c → L,  d → L
+```
+
+现在倒着走，每个节点回答它的局部问题。从 $L$ 出发，$\partial L/\partial L = 1$：
+
+$$
+\frac{\partial L}{\partial c} = d = 6,
+\qquad
+\frac{\partial L}{\partial d} = c = 5.
+$$
+
+（$L = c\cdot d$，对 $c$ 的局部导数是 $d$，对 $d$ 的是 $c$。）
+接着轮到 $a$。麻烦来了：$a$ 有**两条**通往 $L$ 的路 —— 一条经 $c$，一条经 $d$。
+多元链式法则说，把两条路各自的贡献**加起来**：
+
+$$
+\frac{\partial L}{\partial a}
+= \underbrace{\frac{\partial L}{\partial c}\frac{\partial c}{\partial a}}_{\text{经 } c}
++ \underbrace{\frac{\partial L}{\partial d}\frac{\partial d}{\partial a}}_{\text{经 } d}
+= 6\cdot 1 + 5\cdot b = 6 + 10 = 16.
+$$
+
+$$
+\frac{\partial L}{\partial b}
+= \frac{\partial L}{\partial c}\frac{\partial c}{\partial b}
++ \frac{\partial L}{\partial d}\frac{\partial d}{\partial b}
+= 6\cdot 1 + 5\cdot a = 6 + 15 = 21.
+$$
+
+两处都对：$L=(a+b)(ab)=a^2b+ab^2$，直接求导 $\partial L/\partial a = 2ab+b^2 = 16$，
+$\partial L/\partial b = a^2+2ab = 21$。手算和倒推一致。
+
+这个小例子把两件事一次讲清了：
+
+<Callout type="insight" title="复用 + 扇出求和">
+  **复用**：$\partial L/\partial c=6$ 和 $\partial L/\partial d=5$ 各自只算了**一次**，
+  然后被 $a$ 和 $b$ 的反传**共用**。图越深，一个上游梯度被下游复用的次数越多 ——
+  这正是反向传播比「对每个参数单独求导」省下的东西。
+
+  **扇出求和**：一个值被用到几次，它的梯度就是那几条路径的梯度**之和**。
+  这是实现里最容易漏的一条 —— 漏了不会报错，只会悄悄算错梯度。
+</Callout>
+
+到这里，反向传播的核心已经讲完了：**每个节点回答一个局部问题（上游梯度 × 局部导数），
+按反向顺序走一遍，扇出处相加。** 下面是把它落到神经网络和代码上的两块，
+想更深一层再看。
+
+## 四、放进神经网络：一层的反传
+
+真实网络里，节点不是标量而是向量、矩阵。规则一模一样，只是「局部导数」变成了
+**雅可比矩阵**。先钉死一个约定并全程不变（这是这类推导最容易出错的地方）：
+**梯度都写成列向量**，记 $\delta = \dfrac{\partial L}{\partial z}$。
+
+一个线性层 $z = Wx + b$，上游给了 $\delta = \partial L/\partial z$，它要回答两个问题：
+
+$$
+\frac{\partial L}{\partial W} = \delta\, x^\top,
+\qquad
+\frac{\partial L}{\partial x} = W^\top \delta.
+$$
+
+那个 $W^\top$ 的转置从哪来？**不是**为了凑形状 —— 凑形状只是事后检查。真正的原因：
+$z = Wx+b$ 对 $x$ 的雅可比就是 $W$ 本身，而反向传播传的是**向量-雅可比积**，
+也就是拿上游梯度去乘雅可比的**转置**（第一节那个 VJP）。所以是 $W^\top\delta$，
+天经地义地带转置。至于激活函数，逐元素的 ReLU 局部导数是「正的地方为 1，
+其余为 0」，于是 $\delta_{\text{前}} = \delta_{\text{后}} \odot [\,z > 0\,]$ —— 一个逐元素乘。
+
+<Collapsible title="完整跑一遍：一个 2-层小网络（带真实数字）">
+  输入 $x = (1,\,-2)^\top$，目标 $t = 1.5$，损失 $L = \tfrac12 (z_2 - t)^2$。参数：
+
+  $$
+  W_1 = \begin{bmatrix} 0.5 & -0.3 \\ 0.8 & 0.2 \end{bmatrix},\;
+  b_1 = \begin{bmatrix} 0.1 \\ -0.1 \end{bmatrix},\quad
+  W_2 = \begin{bmatrix} 1.0 & -1.0 \end{bmatrix},\;
+  b_2 = 0.2.
+  $$
+
+  **前向**（$h = \text{ReLU}(z_1)$）：
+
+  $$
+  z_1 = W_1 x + b_1 = \begin{bmatrix} 1.2 \\ 0.3 \end{bmatrix},\quad
+  h = \begin{bmatrix} 1.2 \\ 0.3 \end{bmatrix},\quad
+  z_2 = W_2 h + b_2 = 1.1,\quad
+  L = \tfrac12(1.1-1.5)^2 = 0.08.
+  $$
+
+  **反向**，从损失起步 $\delta_2 = \partial L/\partial z_2 = z_2 - t = -0.4$：
+
+  $$
+  \begin{aligned}
+  \frac{\partial L}{\partial W_2} &= \delta_2\, h^\top = -0.4 \cdot (1.2,\,0.3) = (-0.48,\,-0.12), \\[4pt]
+  \delta_1 &= \big(W_2^\top \delta_2\big) \odot [\,z_1 > 0\,] = (-0.4,\,0.4)^\top, \\[4pt]
+  \frac{\partial L}{\partial W_1} &= \delta_1\, x^\top
+    = \begin{bmatrix} -0.4 \\ 0.4 \end{bmatrix}(1,\,-2)
+    = \begin{bmatrix} -0.4 & 0.8 \\ 0.4 & -0.8 \end{bmatrix}.
+  \end{aligned}
+  $$
+
+  注意 $\delta$ 是怎么**一层层往回传**的：$\delta_2$ 先算出 $W_2$ 的梯度，
+  再经 $W_2^\top$ 和 ReLU 变成 $\delta_1$，$\delta_1$ 又算出 $W_1$ 的梯度。
+  这就是「反向传播」这个名字的字面意思 —— 同一个 $\delta$ 沿着网络倒流。
+  （这些数字都用有限差分逐个核对过，见下一节。）
+</Collapsible>
+
+## 五、二十行的自动微分
+
+把第一节的想法直接写成代码，短得出奇：每个值记住「自己是怎么算出来的」，
+以及一个 `_backward()` —— 拿到自己的梯度后，怎么把梯度**累加**给它的输入
+（累加，正是为了实现「扇出求和」）。
+
+<Collapsible title="一个能跑的标量 autograd（micrograd 风格）">
+  ```python
+  class Value:
+      def __init__(self, data, _parents=()):
+          self.data = data
+          self.grad = 0.0            # ∂L/∂(自己)，初始为 0，靠 += 累加
+          self._parents = _parents
+          self._backward = lambda: None
+
+      def __add__(self, other):
+          out = Value(self.data + other.data, (self, other))
+          def _backward():           # 加法：局部导数都是 1
+              self.grad  += out.grad
+              other.grad += out.grad
+          out._backward = _backward
+          return out
+
+      def __mul__(self, other):
+          out = Value(self.data * other.data, (self, other))
+          def _backward():           # 乘法：对一方的局部导数 = 另一方
+              self.grad  += other.data * out.grad
+              other.grad += self.data  * out.grad
+          out._backward = _backward
+          return out
+
+      def backward(self):
+          topo, seen = [], set()     # 反向拓扑排序：先算下游，再算上游
+          def build(v):
+              if v not in seen:
+                  seen.add(v)
+                  for p in v._parents:
+                      build(p)
+                  topo.append(v)
+          build(self)
+          self.grad = 1.0            # ∂L/∂L = 1，种子
+          for v in reversed(topo):
+              v._backward()
+  ```
+
+  拿它跑第三节那个例子，梯度和手算分毫不差：
+
+  ```python
+  a, b = Value(3.0), Value(2.0)
+  L = (a + b) * (a * b)             # = 30
+  L.backward()
+  print(a.grad, b.grad)             # 16.0  21.0
+  ```
+
+  真实框架（PyTorch/JAX）无非把 `Value` 换成张量、把标量局部导数换成 VJP、
+  再加上一堆算子和 GPU kernel —— 骨架就是这二十行。
+</Collapsible>
+
+`grad` 用 `+=` 而不是 `=`，是整段代码里最该盯住的一处：它就是「扇出的梯度要相加」
+那条规则的代码化身。第三节里 $a$ 的两条路径之和，在这里就是两次 `+=`。
+
+## 六、几个常被搞混的点
+
+<Callout type="tip" title="反向传播 ≠ 数值微分">
+  数值微分是 $\big(f(x+\epsilon)-f(x-\epsilon)\big)/2\epsilon$，对**每个**参数都要重算一遍
+  前向，$N$ 个参数就 $O(N)$ 次前向，还有截断/舍入误差。它太慢，绝不用来训练 ——
+  但很适合当**对拍**：上面那个 2-层网络，反向传播算出的梯度和有限差分之差
+  最大只有 $3\times 10^{-11}$。写完自定义 `backward` 都该这么核一遍。
+</Callout>
+
+<Callout type="note" title="也不是符号微分">
+  符号微分（像 Mathematica 那样推出导数的闭式表达式）会遇到**表达式膨胀**：
+  深层复合函数的符号导数会指数级变长。反向传播不求表达式，只在**具体数值**上
+  沿图倒推一遍，天然避开了膨胀。
+</Callout>
+
+<Callout type="warning" title="它要吃内存">
+  反向要用到前向的中间值（比如乘法节点要用另一方的值、ReLU 要知道哪些位置为正）。
+  所以前向的**激活值必须缓存**到反向用完为止。这就是为什么训练比推理吃显存得多，
+  也是梯度检查点（gradient checkpointing）这类「拿重算换显存」技巧存在的理由。
+</Callout>
+
+一句话收尾：**反向传播不神秘，它就是链式法则被组织成了唯一不做重复计算的那个顺序 ——
+每个节点只回答一个局部问题，答案倒着流，扇出处相加。**
